@@ -1,0 +1,785 @@
+"""Solos Key Manager - v2
+
+Top bar + collapsible connection strip, generator panel (with permanent keys),
+stat cards, filterable key table with status pills, accent bars and per-row actions.
+Needs the matching api.py (talks to the Cloudflare worker).
+"""
+import json
+import os
+import queue
+import threading
+import time
+import tkinter as tk
+from tkinter import messagebox
+from api import ApiError, KeyApi
+import customtkinter as ctk
+
+ctk.set_appearance_mode("Dark")
+
+# ---- palette (unchanged) ----
+BG_MAIN = "#08070E"
+BG_SIDEBAR = "#100E1A"
+BG_WORKSPACE = "#0D0C15"
+CARD_SURFACE = "#151324"
+ACCENT_PURPLE = "#8B5CF6"
+ACCENT_HOVER = "#7C3AED"
+TEXT_WHITE = "#FFFFFF"
+TEXT_MUTED = "#6B6982"
+BORDER_TINT = "#1F1C36"
+RED_DANGER = "#EF4444"
+GREEN_ONLINE = "#10B981"
+AMBER_PROGRESS = "#F59E0B"
+INPUT_CANVAS = "#050408"
+
+# tinted extras used for pills / permanent keys
+PERM_LAVENDER = "#C4B5FD"
+PILL_GREEN = "#0E2A23"
+PILL_PURPLE = "#241B45"
+PILL_RED = "#341519"
+PILL_LAVENDER = "#2A2250"
+
+PRESETS = [("1h", 1), ("24h", 24), ("3d", 72), ("7d", 168), ("30d", 720)]
+FILTERS = ["All", "Available", "In use", "Permanent"]
+
+APP_NAME = "Solos Key Manager"
+DEFAULT_URL = "https://workers.dev"
+CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".solos_key_manager.json")
+AUTO_REFRESH_SECONDS = 30
+FONT = "Segoe UI"
+
+
+def fmt_left(hours):
+    if hours <= 0:
+        return "expired"
+    minutes = int(round(hours * 60))
+    if minutes >= 2880:
+        return "%dd %dh" % (minutes // 1440, (minutes % 1440) // 60)
+    return "%dh %02dm" % (minutes // 60, minutes % 60)
+
+
+def time_color(hours):
+    if hours <= 0:
+        return RED_DANGER
+    if hours < 1:
+        return AMBER_PROGRESS
+    return TEXT_WHITE
+
+
+def key_hours(k):
+    """Hours left. Worker sends 'hoursLeft' (null for permanent), older code used 'hours'."""
+    for name in ("hoursLeft", "hours"):
+        v = k.get(name)
+        if v is not None:
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                pass
+    return 0.0
+
+
+def key_used(k):
+    return bool(k.get("uid") or k.get("hwid"))
+
+
+def key_perm(k):
+    return bool(k.get("perm"))
+
+
+class App:
+
+    def __init__(self, root):
+        self.root = root
+        self.api = KeyApi()
+        self.q = queue.Queue()
+        self.cfg = self.load_config()
+        self.keys = []
+        self.fetched_at = 0.0
+        self.last_refresh = 0.0
+        self.connected = False
+        self.time_labels = {}
+        self.toast_frame = None
+        self.toast_job = None
+
+        self.root.title(APP_NAME)
+        self.root.geometry("1180x760")
+        self.root.minsize(1000, 640)
+        self.root.configure(bg=BG_MAIN)
+
+        self.build_ui()
+
+        self.root.protocol("WM_DELETE_WINDOW", self.close)
+        self.root.bind("<F5>", lambda e: self.refresh())
+        self.root.after(100, self.pump)
+        self.root.after(1000, self.tick)
+        if self.url_var.get().strip() and self.token_var.get().strip():
+            self.connect()
+
+    # ------------------------------------------------------------ config
+    def load_config(self):
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def save_config(self):
+        data = {
+            "url": self.url_var.get().strip(),
+            "remember": bool(self.remember_var.get()),
+            "auto_refresh": bool(self.auto_var.get()),
+            "auto_copy": bool(self.copy_var.get()),
+        }
+        if data["remember"]:
+            data["token"] = self.token_var.get().strip()
+        try:
+            with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+            try:
+                os.chmod(CONFIG_PATH, 0o600)
+            except OSError:
+                pass
+        except OSError:
+            pass
+
+    # ---------------------------------------------------------------- UI
+    def build_ui(self):
+        self.main = ctk.CTkFrame(self.root, fg_color=BG_MAIN, corner_radius=0)
+        self.main.pack(fill="both", expand=True)
+
+        self.build_topbar()
+        self.build_connection_strip()
+
+        body = ctk.CTkFrame(self.main, fg_color="transparent")
+        body.pack(fill="both", expand=True, padx=24, pady=(8, 24))
+        body.grid_columnconfigure(0, weight=0, minsize=310)
+        body.grid_columnconfigure(1, weight=1)
+        body.grid_rowconfigure(0, weight=1)
+
+        self.build_generator(body)
+        self.build_registry(body)
+        self.update_summary()
+
+    def card(self, parent):
+        return ctk.CTkFrame(parent, fg_color=CARD_SURFACE, border_color=BORDER_TINT,
+                            border_width=1, corner_radius=14)
+
+    def label(self, parent, text, size=10, bold=True, color=TEXT_MUTED, **kw):
+        return ctk.CTkLabel(parent, text=text, font=(FONT, size, "bold" if bold else "normal"),
+                            text_color=color, anchor="w", **kw)
+
+    def build_topbar(self):
+        bar = ctk.CTkFrame(self.main, fg_color=BG_SIDEBAR, corner_radius=0,
+                           border_color=BORDER_TINT, border_width=1, height=70)
+        bar.pack(fill="x")
+        bar.pack_propagate(False)
+
+        brand = ctk.CTkFrame(bar, fg_color="transparent")
+        brand.pack(side="left", padx=26)
+        ctk.CTkLabel(brand, text="SOLOS HUB", font=(FONT, 21, "bold"),
+                     text_color=ACCENT_PURPLE, anchor="w").pack(anchor="w", pady=(11, 0))
+        self.label(brand, "Key Manager", 11, False).pack(anchor="w")
+
+        right = ctk.CTkFrame(bar, fg_color="transparent")
+        right.pack(side="right", padx=26)
+
+        pill = ctk.CTkFrame(right, fg_color=INPUT_CANVAS, border_color=BORDER_TINT,
+                            border_width=1, corner_radius=16, height=32)
+        pill.pack(side="left", padx=(0, 12))
+        self.status_lbl = ctk.CTkLabel(pill, text="● Offline", font=(FONT, 12, "bold"),
+                                       text_color=RED_DANGER)
+        self.status_lbl.pack(padx=16, pady=4)
+
+        self.conn_toggle_btn = ctk.CTkButton(
+            right, text="⚙  Connection", width=120, height=32, corner_radius=16,
+            fg_color=CARD_SURFACE, border_color=BORDER_TINT, border_width=1,
+            hover_color=BORDER_TINT, font=(FONT, 12), command=self.toggle_conn_strip)
+        self.conn_toggle_btn.pack(side="left")
+
+    def build_connection_strip(self):
+        self.conn_strip = ctk.CTkFrame(self.main, fg_color="transparent", corner_radius=0)
+        self.conn_strip_visible = True
+        self.conn_strip.pack(fill="x", padx=24, pady=(16, 8))
+
+        c = self.card(self.conn_strip)
+        c.pack(fill="x")
+        inner = ctk.CTkFrame(c, fg_color="transparent")
+        inner.pack(fill="x", padx=18, pady=16)
+        inner.grid_columnconfigure(0, weight=3)
+        inner.grid_columnconfigure(1, weight=2)
+
+        self.label(inner, "WORKER URL").grid(row=0, column=0, sticky="w", padx=4)
+        self.label(inner, "ADMIN TOKEN").grid(row=0, column=1, sticky="w", padx=4)
+
+        self.url_var = tk.StringVar(value=self.cfg.get("url") or DEFAULT_URL)
+        ctk.CTkEntry(inner, textvariable=self.url_var, fg_color=INPUT_CANVAS,
+                     border_color=BORDER_TINT, text_color=TEXT_WHITE, font=(FONT, 12),
+                     height=36, corner_radius=8).grid(row=1, column=0, sticky="ew",
+                                                      padx=(0, 10), pady=(3, 0))
+
+        tok_wrap = ctk.CTkFrame(inner, fg_color="transparent")
+        tok_wrap.grid(row=1, column=1, sticky="ew", padx=(0, 10), pady=(3, 0))
+        tok_wrap.grid_columnconfigure(0, weight=1)
+        self.token_var = tk.StringVar(
+            value=self.cfg.get("token", "") if self.cfg.get("remember") else "")
+        self.token_entry = ctk.CTkEntry(tok_wrap, textvariable=self.token_var, show="•",
+                                        fg_color=INPUT_CANVAS, border_color=BORDER_TINT,
+                                        text_color=TEXT_WHITE, font=(FONT, 12), height=36,
+                                        corner_radius=8)
+        self.token_entry.grid(row=0, column=0, sticky="ew")
+        self.token_entry.bind("<Return>", lambda e: self.connect())
+        self.show_var = tk.BooleanVar(value=False)
+        ctk.CTkCheckBox(tok_wrap, text="Show", variable=self.show_var, width=60,
+                        command=self.toggle_token, font=(FONT, 11), text_color=TEXT_MUTED,
+                        fg_color=ACCENT_PURPLE, border_color=BORDER_TINT,
+                        hover_color=ACCENT_HOVER).grid(row=0, column=1, padx=(10, 0))
+
+        self.connect_btn = ctk.CTkButton(inner, text="Connect", width=120, height=36,
+                                         corner_radius=8, fg_color=ACCENT_PURPLE,
+                                         hover_color=ACCENT_HOVER, font=(FONT, 12, "bold"),
+                                         command=self.connect)
+        self.connect_btn.grid(row=1, column=2, pady=(3, 0))
+
+        opts = ctk.CTkFrame(inner, fg_color="transparent")
+        opts.grid(row=2, column=0, columnspan=3, sticky="w", pady=(12, 0))
+        self.remember_var = tk.BooleanVar(value=bool(self.cfg.get("remember")))
+        self.auto_var = tk.BooleanVar(value=bool(self.cfg.get("auto_refresh", True)))
+        self.copy_var = tk.BooleanVar(value=bool(self.cfg.get("auto_copy", True)))
+        for text, var in (("Remember connection", self.remember_var),
+                          ("Auto-refresh every 30s", self.auto_var),
+                          ("Auto-copy new keys", self.copy_var)):
+            ctk.CTkCheckBox(opts, text=text, variable=var, command=self.save_config,
+                            font=(FONT, 11), text_color=TEXT_MUTED, fg_color=ACCENT_PURPLE,
+                            border_color=BORDER_TINT, hover_color=ACCENT_HOVER
+                            ).pack(side="left", padx=(4, 22))
+
+    # ------------------------------------------------------- generator
+    def build_generator(self, body):
+        gen = self.card(body)
+        gen.grid(row=0, column=0, sticky="nsew", padx=(0, 16))
+
+        ctk.CTkLabel(gen, text="Generate Keys", font=(FONT, 17, "bold"),
+                     text_color=TEXT_WHITE, anchor="w").pack(fill="x", padx=24, pady=(24, 0))
+        self.label(gen, "Create premium keys with a set duration, or make them permanent.",
+                   11, False, wraplength=250, justify="left").pack(fill="x", padx=24, pady=(3, 20))
+
+        # permanent switch
+        perm_box = ctk.CTkFrame(gen, fg_color=INPUT_CANVAS, border_color=BORDER_TINT,
+                                border_width=1, corner_radius=10)
+        perm_box.pack(fill="x", padx=24, pady=(0, 18))
+        pi = ctk.CTkFrame(perm_box, fg_color="transparent")
+        pi.pack(fill="x", padx=14, pady=10)
+        txt = ctk.CTkFrame(pi, fg_color="transparent")
+        txt.pack(side="left")
+        ctk.CTkLabel(txt, text="∞  Permanent key", font=(FONT, 13, "bold"),
+                     text_color=PERM_LAVENDER, anchor="w").pack(anchor="w")
+        self.label(txt, "Never expires", 10, False).pack(anchor="w")
+        self.perm_var = tk.BooleanVar(value=False)
+        self.perm_switch = ctk.CTkSwitch(pi, text="", variable=self.perm_var, width=44,
+                                         progress_color=ACCENT_PURPLE, fg_color=BORDER_TINT,
+                                         button_color=TEXT_WHITE, button_hover_color="#E5E7EB",
+                                         command=self.on_perm)
+        self.perm_switch.pack(side="right")
+
+        self.label(gen, "DURATION").pack(fill="x", padx=24)
+        self.preset_seg = ctk.CTkSegmentedButton(
+            gen, values=[p[0] for p in PRESETS], command=self.on_preset,
+            fg_color=INPUT_CANVAS, selected_color=ACCENT_PURPLE,
+            selected_hover_color=ACCENT_HOVER, unselected_color=INPUT_CANVAS,
+            unselected_hover_color=BORDER_TINT, text_color=TEXT_WHITE,
+            text_color_disabled=TEXT_MUTED, font=(FONT, 11, "bold"), height=36)
+        self.preset_seg.pack(fill="x", padx=24, pady=(6, 16))
+        self.preset_seg.set("24h")
+
+        row = ctk.CTkFrame(gen, fg_color="transparent")
+        row.pack(fill="x", padx=24)
+        row.grid_columnconfigure((0, 1), weight=1, uniform="a")
+        self.label(row, "CUSTOM HOURS").grid(row=0, column=0, sticky="w")
+        self.label(row, "QUANTITY").grid(row=0, column=1, sticky="w", padx=(10, 0))
+
+        self.hours_var = tk.StringVar(value="24")
+        self.hours_entry = ctk.CTkEntry(row, textvariable=self.hours_var, fg_color=INPUT_CANVAS,
+                                        border_color=BORDER_TINT, text_color=TEXT_WHITE,
+                                        font=(FONT, 14), height=40, corner_radius=8)
+        self.hours_entry.grid(row=1, column=0, sticky="ew", pady=(6, 0))
+        self.hours_entry.bind("<KeyRelease>", lambda e: self.unsync_preset())
+        self.count_var = tk.StringVar(value="1")
+        self.count_entry = ctk.CTkEntry(row, textvariable=self.count_var, fg_color=INPUT_CANVAS,
+                                        border_color=BORDER_TINT, text_color=TEXT_WHITE,
+                                        font=(FONT, 14), height=40, corner_radius=8)
+        self.count_entry.grid(row=1, column=1, sticky="ew", padx=(10, 0), pady=(6, 0))
+        self.hours_var.trace_add("write", lambda *a: self.update_summary())
+        self.count_var.trace_add("write", lambda *a: self.update_summary())
+
+        self.summary_lbl = self.label(gen, "", 11, False, color=PERM_LAVENDER)
+        self.summary_lbl.pack(fill="x", padx=24, pady=(14, 0))
+
+        self.gen_btn = ctk.CTkButton(gen, text="Generate", height=46, corner_radius=10,
+                                     fg_color=ACCENT_PURPLE, hover_color=ACCENT_HOVER,
+                                     font=(FONT, 14, "bold"), command=self.generate,
+                                     state="disabled")
+        self.gen_btn.pack(fill="x", padx=24, pady=(10, 0))
+
+        ctk.CTkFrame(gen, height=1, fg_color=BORDER_TINT).pack(fill="x", padx=24, pady=22)
+
+        self.label(gen, "TIPS").pack(fill="x", padx=24)
+        self.label(
+            gen,
+            "Click a key to copy it.\nReset frees a key for another account.\n"
+            "Revoke kills a key immediately.\nF5 syncs the list.",
+            11, False, justify="left").pack(fill="x", padx=24, pady=(6, 0))
+
+    def on_perm(self):
+        perm = self.perm_var.get()
+        st = "disabled" if perm else "normal"
+        self.hours_entry.configure(state=st)
+        self.preset_seg.configure(state=st)
+        self.update_summary()
+
+    def update_summary(self):
+        try:
+            count = int(self.count_var.get().strip())
+        except ValueError:
+            count = 0
+        noun = "key" if count == 1 else "keys"
+        if self.perm_var.get():
+            txt = "Creates %d permanent %s that never expire." % (count, noun) if count > 0 else ""
+        else:
+            try:
+                hours = int(self.hours_var.get().strip())
+            except ValueError:
+                hours = 0
+            if count > 0 and hours > 0:
+                if hours % 24 == 0:
+                    d = hours // 24
+                    dur = "%d day%s" % (d, "" if d == 1 else "s")
+                else:
+                    dur = "%d hour%s" % (hours, "" if hours == 1 else "s")
+                txt = "Creates %d %s lasting %s." % (count, noun, dur)
+            else:
+                txt = ""
+        self.summary_lbl.configure(text=txt)
+
+    # -------------------------------------------------------- registry
+    def stat_card(self, parent, title, color=TEXT_WHITE):
+        f = ctk.CTkFrame(parent, fg_color=INPUT_CANVAS, border_color=BORDER_TINT,
+                         border_width=1, corner_radius=12)
+        val = ctk.CTkLabel(f, text="0", font=(FONT, 24, "bold"), text_color=color, anchor="w")
+        val.pack(anchor="w", padx=16, pady=(12, 0))
+        self.label(f, title).pack(anchor="w", padx=16, pady=(0, 12))
+        return f, val
+
+    def build_registry(self, body):
+        reg = self.card(body)
+        reg.grid(row=0, column=1, sticky="nsew")
+
+        stats = ctk.CTkFrame(reg, fg_color="transparent")
+        stats.pack(fill="x", padx=24, pady=(24, 0))
+        stats.grid_columnconfigure((0, 1, 2, 3), weight=1, uniform="s")
+        cards = [("ACTIVE KEYS", TEXT_WHITE), ("IN USE", ACCENT_PURPLE),
+                 ("AVAILABLE", GREEN_ONLINE), ("PERMANENT", PERM_LAVENDER)]
+        self.stat_vals = []
+        for i, (t, c) in enumerate(cards):
+            f, v = self.stat_card(stats, t, c)
+            f.grid(row=0, column=i, sticky="ew", padx=(0 if i == 0 else 6, 0 if i == 3 else 6))
+            self.stat_vals.append(v)
+
+        tb = ctk.CTkFrame(reg, fg_color="transparent")
+        tb.pack(fill="x", padx=24, pady=(20, 0))
+        ctk.CTkLabel(tb, text="Keys", font=(FONT, 17, "bold"),
+                     text_color=TEXT_WHITE).pack(side="left")
+        self.count_lbl = self.label(tb, "", 11, False)
+        self.count_lbl.pack(side="left", padx=10, pady=(4, 0))
+        self.refresh_btn = ctk.CTkButton(tb, text="⟳  Refresh", width=100, height=34,
+                                         corner_radius=8, fg_color=INPUT_CANVAS,
+                                         border_color=BORDER_TINT, border_width=1,
+                                         hover_color=BORDER_TINT, font=(FONT, 12),
+                                         command=self.refresh, state="disabled")
+        self.refresh_btn.pack(side="right")
+        self.search_entry = ctk.CTkEntry(tb, placeholder_text="🔍  Search keys...", width=210,
+                                         height=34, fg_color=INPUT_CANVAS,
+                                         border_color=BORDER_TINT, text_color=TEXT_WHITE,
+                                         font=(FONT, 12), corner_radius=8)
+        self.search_entry.pack(side="right", padx=10)
+        self.search_entry.bind("<KeyRelease>", lambda e: self.render_rows())
+
+        frow = ctk.CTkFrame(reg, fg_color="transparent")
+        frow.pack(fill="x", padx=24, pady=(12, 12))
+        self.filter_seg = ctk.CTkSegmentedButton(
+            frow, values=FILTERS, command=lambda v: self.render_rows(),
+            fg_color=INPUT_CANVAS, selected_color=ACCENT_PURPLE,
+            selected_hover_color=ACCENT_HOVER, unselected_color=INPUT_CANVAS,
+            unselected_hover_color=BORDER_TINT, text_color=TEXT_WHITE,
+            font=(FONT, 11, "bold"), height=32)
+        self.filter_seg.pack(side="left")
+        self.filter_seg.set("All")
+
+        hdr = ctk.CTkFrame(reg, fg_color=INPUT_CANVAS, corner_radius=8, height=36)
+        hdr.pack(fill="x", padx=24)
+        hdr.pack_propagate(False)
+        self.setup_cols(hdr)
+        for i, t in enumerate(("KEY", "STATUS", "ACCOUNT", "TIME LEFT")):
+            self.label(hdr, t).grid(row=0, column=i + 1, sticky="w", padx=(6, 4))
+
+        self.scroll_list = ctk.CTkScrollableFrame(reg, fg_color="transparent", label_text="")
+        self.scroll_list.pack(fill="both", expand=True, padx=(18, 18), pady=(6, 18))
+
+    def setup_cols(self, f):
+        f.grid_columnconfigure(0, weight=0, minsize=12)
+        f.grid_columnconfigure(1, weight=3, minsize=220)
+        f.grid_columnconfigure(2, weight=1, minsize=110)
+        f.grid_columnconfigure(3, weight=1, minsize=90)
+        f.grid_columnconfigure(4, weight=1, minsize=100)
+        f.grid_columnconfigure(5, weight=0, minsize=200)
+        f.grid_rowconfigure(0, weight=1)
+
+    # ---------------------------------------------------------- helpers
+    def toggle_token(self):
+        self.token_entry.configure(show="" if self.show_var.get() else "•")
+
+    def toggle_conn_strip(self):
+        if self.conn_strip_visible:
+            self.conn_strip.pack_forget()
+        else:
+            self.conn_strip.pack(fill="x", padx=24, pady=(16, 8),
+                                 after=self.main.winfo_children()[0])
+        self.conn_strip_visible = not self.conn_strip_visible
+
+    def on_preset(self, label):
+        self.hours_var.set(str(dict(PRESETS)[label]))
+
+    def unsync_preset(self):
+        try:
+            val = int(self.hours_var.get().strip())
+        except ValueError:
+            val = None
+        match = [l for l, h in PRESETS if h == val]
+        try:
+            self.preset_seg.set(match[0] if match else "")
+        except Exception:
+            pass
+
+    def toast(self, text, color=GREEN_ONLINE):
+        if self.toast_job:
+            self.root.after_cancel(self.toast_job)
+        if self.toast_frame is not None:
+            self.toast_frame.destroy()
+        f = ctk.CTkFrame(self.main, fg_color=CARD_SURFACE, border_color=color,
+                         border_width=1, corner_radius=12)
+        ctk.CTkLabel(f, text=text, font=(FONT, 12, "bold"),
+                     text_color=color).pack(padx=18, pady=10)
+        f.place(relx=1.0, rely=1.0, x=-28, y=-28, anchor="se")
+        self.toast_frame = f
+        self.toast_job = self.root.after(2200, self.hide_toast)
+
+    def hide_toast(self):
+        if self.toast_frame is not None:
+            self.toast_frame.destroy()
+            self.toast_frame = None
+        self.toast_job = None
+
+    def trigger(self, task, *args):
+        threading.Thread(target=task, args=args, daemon=True).start()
+
+    # ---------------------------------------------------------- actions
+    def connect(self):
+        url = self.url_var.get().strip()
+        token = self.token_var.get().strip()
+        if not url:
+            return messagebox.showerror("Configuration Error", "Worker URL can't be empty.")
+        self.status_lbl.configure(text="● Connecting...", text_color=AMBER_PROGRESS)
+        self.connect_btn.configure(state="disabled")
+        self.save_config()
+        self.trigger(self._bg_connect, url, token)
+
+    def _bg_connect(self, url, token):
+        try:
+            self.api.base = url
+            self.api.token = token
+            self.api.ping()
+            self.q.put(("CONNECT_OK", self.api.list_keys()))
+        except Exception as e:
+            self.q.put(("CONNECT_ERR", str(e)))
+
+    def refresh(self):
+        if not self.connected:
+            return
+        self.status_lbl.configure(text="● Syncing...", text_color=AMBER_PROGRESS)
+        self.trigger(self._bg_refresh)
+
+    def _bg_refresh(self):
+        try:
+            self.q.put(("REFRESH_OK", self.api.list_keys()))
+        except Exception as e:
+            self.q.put(("REFRESH_ERR", str(e)))
+
+    def generate(self):
+        perm = bool(self.perm_var.get())
+        try:
+            count = int(self.count_var.get().strip())
+            hours = 0 if perm else int(self.hours_var.get().strip())
+            if count <= 0 or (not perm and hours <= 0):
+                raise ValueError
+        except ValueError:
+            return messagebox.showerror("Invalid input", "Hours and quantity must be positive numbers.")
+        if count > 50:
+            count = 50
+            self.count_var.set("50")
+        self.status_lbl.configure(text="● Generating...", text_color=AMBER_PROGRESS)
+        self.trigger(self._bg_gen, hours, count, perm)
+
+    def _bg_gen(self, hours, count, perm):
+        try:
+            self.q.put(("GEN_OK", (self.api.generate(None, hours, count, perm), perm)))
+        except Exception as e:
+            self.q.put(("GEN_ERR", str(e)))
+
+    def copy_text(self, text, note="Copied to clipboard"):
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        self.toast("✓  " + note)
+
+    def reset_hwid(self, key):
+        if messagebox.askyesno("Reset key", "Unlock this key so another account can use it?\n\n" + key):
+            self.status_lbl.configure(text="● Resetting...", text_color=AMBER_PROGRESS)
+            self.trigger(self._bg_action, "RESET_OK", self.api.reset, key)
+
+    def delete_key(self, key):
+        if messagebox.askyesno("Revoke key", "Permanently revoke this key?\n\n" + key):
+            self.status_lbl.configure(text="● Revoking...", text_color=AMBER_PROGRESS)
+            self.trigger(self._bg_action, "DELETE_OK", self.api.revoke, key)
+
+    def _bg_action(self, ok_tag, func, key_str):
+        try:
+            func(key_str)
+        except Exception as e:
+            self.q.put(("ACTION_ERR", str(e)))
+            return
+        # the action worked; a failed list afterwards must not look like a failed action
+        try:
+            self.q.put((ok_tag, self.api.list_keys()))
+        except Exception as e:
+            self.q.put((ok_tag, None))
+
+    def pump(self):
+        try:
+            while True:
+                msg, data = self.q.get_nowait()
+                if msg == "CONNECT_OK":
+                    self.connected = True
+                    self.status_lbl.configure(text="● Online", text_color=GREEN_ONLINE)
+                    self.update_keys(data)
+                    if self.conn_strip_visible:
+                        self.toggle_conn_strip()
+                elif msg == "CONNECT_ERR":
+                    self.connected = False
+                    self.status_lbl.configure(text="● Connection failed", text_color=RED_DANGER)
+                    messagebox.showerror("Connection error", data)
+                elif msg in ("REFRESH_OK", "GEN_OK", "RESET_OK", "DELETE_OK"):
+                    self.status_lbl.configure(text="● Online", text_color=GREEN_ONLINE)
+                    if msg == "GEN_OK":
+                        self.show_new_keys(*data)
+                    else:
+                        if data is None:
+                            self.refresh()
+                        else:
+                            self.update_keys(data)
+                        if msg == "RESET_OK":
+                            self.toast("✓  Key reset")
+                        elif msg == "DELETE_OK":
+                            self.toast("✓  Key revoked")
+                elif msg in ("REFRESH_ERR", "GEN_ERR", "ACTION_ERR"):
+                    self.status_lbl.configure(text="● Error", text_color=RED_DANGER)
+                    messagebox.showerror("Error", data)
+                self.update_action_states()
+        except queue.Empty:
+            pass
+        self.root.after(100, self.pump)
+
+    def tick(self):
+        now = time.time()
+        if self.connected and self.auto_var.get() and (now - self.last_refresh >= AUTO_REFRESH_SECONDS):
+            self.last_refresh = now
+            self.refresh()
+        elapsed = (now - self.fetched_at) / 3600.0 if self.fetched_at else 0.0
+        for lbl, base in list(self.time_labels.values()):
+            try:
+                rem = base - elapsed
+                lbl.configure(text=fmt_left(rem), text_color=time_color(rem))
+            except Exception:
+                pass
+        self.root.after(1000, self.tick)
+
+    def update_keys(self, key_list):
+        self.keys = key_list
+        self.fetched_at = time.time()
+        self.last_refresh = time.time()
+        total = len(key_list)
+        used = sum(1 for k in key_list if key_used(k))
+        perm = sum(1 for k in key_list if key_perm(k))
+        for v, n in zip(self.stat_vals, (total, used, total - used, perm)):
+            v.configure(text=str(n))
+        self.render_rows()
+
+    # ------------------------------------------------------------ rows
+    def key_state(self, k, rem):
+        if key_perm(k):
+            return "perm"
+        if rem <= 0:
+            return "expired"
+        return "used" if key_used(k) else "free"
+
+    def render_rows(self):
+        for w in self.scroll_list.winfo_children():
+            w.destroy()
+        self.time_labels = {}
+        elapsed = (time.time() - self.fetched_at) / 3600.0 if self.fetched_at else 0.0
+
+        q = self.search_entry.get().strip().lower()
+        flt = self.filter_seg.get() or "All"
+        rows = []
+        for k in self.keys:
+            if q and q not in k.get("key", "").lower():
+                continue
+            rem = key_hours(k) - elapsed
+            if flt == "Available" and (key_used(k) or (not key_perm(k) and rem <= 0)):
+                continue
+            if flt == "In use" and not key_used(k):
+                continue
+            if flt == "Permanent" and not key_perm(k):
+                continue
+            rows.append((k, rem))
+        # permanent first, then most time left first
+        rows.sort(key=lambda r: (0 if key_perm(r[0]) else 1, -r[1]))
+        self.count_lbl.configure(text="%d shown" % len(rows) if self.keys else "")
+
+        if not rows:
+            msg = ("No keys match your filter." if self.keys else
+                   "No active keys yet. Generate some on the left." if self.connected
+                   else "Connect to your worker to see your keys.")
+            ctk.CTkLabel(self.scroll_list, text=msg, font=(FONT, 12),
+                         text_color=TEXT_MUTED).pack(pady=60)
+            return
+
+        styles = {
+            "perm": (PERM_LAVENDER, PILL_LAVENDER, "∞ Permanent"),
+            "used": (ACCENT_PURPLE, PILL_PURPLE, "● In use"),
+            "free": (GREEN_ONLINE, PILL_GREEN, "● Available"),
+            "expired": (RED_DANGER, PILL_RED, "● Expired"),
+        }
+
+        for k, rem in rows:
+            key_str = k.get("key", "")
+            state = self.key_state(k, rem)
+            color, pill_bg, pill_txt = styles[state]
+            copy_cmd = lambda e=None, s=key_str: self.copy_text(s)
+
+            row = ctk.CTkFrame(self.scroll_list, fg_color=BG_WORKSPACE, height=54,
+                               corner_radius=10, border_color=BORDER_TINT, border_width=1)
+            row.pack(fill="x", pady=3, padx=4)
+            row.pack_propagate(False)
+            inner = ctk.CTkFrame(row, fg_color="transparent")
+            inner.pack(fill="both", expand=True, padx=1, pady=1)
+            self.setup_cols(inner)
+
+            bar = ctk.CTkFrame(inner, width=4, fg_color=color, corner_radius=2)
+            bar.grid(row=0, column=0, sticky="ns", padx=(8, 2), pady=10)
+
+            kl = ctk.CTkLabel(inner, text=key_str, font=("Consolas", 13, "bold"),
+                              text_color=TEXT_WHITE, anchor="w")
+            kl.grid(row=0, column=1, sticky="w", padx=(8, 4))
+            kl.bind("<Button-1>", copy_cmd)
+
+            ctk.CTkLabel(inner, text=pill_txt, font=(FONT, 11, "bold"), text_color=color,
+                         fg_color=pill_bg, corner_radius=11, width=92, height=24
+                         ).grid(row=0, column=2, sticky="w", padx=4)
+
+            uid = k.get("uid") or k.get("hwid")
+            ctk.CTkLabel(inner, text=str(uid) if uid else "—", font=(FONT, 11),
+                         text_color=TEXT_WHITE if uid else TEXT_MUTED, anchor="w"
+                         ).grid(row=0, column=3, sticky="w", padx=4)
+
+            if state == "perm":
+                ctk.CTkLabel(inner, text="Never", font=(FONT, 12, "bold"),
+                             text_color=PERM_LAVENDER, anchor="w"
+                             ).grid(row=0, column=4, sticky="w", padx=4)
+            else:
+                tl = ctk.CTkLabel(inner, text=fmt_left(rem), font=(FONT, 12, "bold"),
+                                  text_color=time_color(rem), anchor="w")
+                tl.grid(row=0, column=4, sticky="w", padx=4)
+                self.time_labels[key_str] = (tl, key_hours(k))
+
+            acts = ctk.CTkFrame(inner, fg_color="transparent")
+            acts.grid(row=0, column=5, sticky="e", padx=(4, 12))
+            ctk.CTkButton(acts, text="Copy", width=54, height=30, corner_radius=8,
+                          fg_color=BORDER_TINT, hover_color="#2E2A52", font=(FONT, 11),
+                          command=copy_cmd).pack(side="left", padx=2)
+            ctk.CTkButton(acts, text="Reset", width=54, height=30, corner_radius=8,
+                          fg_color="#1E3A8A", hover_color="#1E40AF", font=(FONT, 11),
+                          command=lambda s=key_str: self.reset_hwid(s)).pack(side="left", padx=2)
+            ctk.CTkButton(acts, text="Revoke", width=60, height=30, corner_radius=8,
+                          fg_color="#7F1D1D", hover_color="#991B1B", font=(FONT, 11),
+                          command=lambda s=key_str: self.delete_key(s)).pack(side="left", padx=2)
+
+    # ----------------------------------------------------------- popup
+    def show_new_keys(self, new_keys, perm=False):
+        self.refresh()
+        key_list_str = "\n".join(new_keys)
+        copied = False
+        if self.copy_var.get():
+            self.root.clipboard_clear()
+            self.root.clipboard_append(key_list_str)
+            copied = True
+
+        pop = ctk.CTkToplevel(self.root, fg_color=BG_MAIN)
+        pop.title("Keys generated")
+        pop.geometry("480x380")
+        pop.transient(self.root)
+        pop.after(150, pop.grab_set)
+
+        n = len(new_keys)
+        ctk.CTkLabel(pop, text="%d %skey%s generated" % (n, "permanent " if perm else "", "" if n == 1 else "s"),
+                     font=(FONT, 16, "bold"), text_color=TEXT_WHITE).pack(pady=(20, 0))
+        ctk.CTkLabel(pop, text="✓ Copied to clipboard" if copied else "Select and copy below",
+                     font=(FONT, 11), text_color=GREEN_ONLINE if copied else TEXT_MUTED).pack(pady=(2, 10))
+        txt = tk.Text(pop, bg=INPUT_CANVAS, fg=PERM_LAVENDER if perm else ACCENT_PURPLE, bd=0,
+                      highlightbackground=BORDER_TINT, highlightthickness=1,
+                      font=("Consolas", 12), padx=14, pady=14, insertbackground=TEXT_WHITE)
+        txt.pack(fill="both", expand=True, padx=22, pady=5)
+        txt.insert("1.0", key_list_str)
+        txt.config(state="disabled")
+
+        btns = ctk.CTkFrame(pop, fg_color="transparent")
+        btns.pack(pady=16)
+        ctk.CTkButton(btns, text="Copy all", width=120, height=34, corner_radius=8,
+                      fg_color=ACCENT_PURPLE, hover_color=ACCENT_HOVER,
+                      command=lambda: self.copy_text(key_list_str, "Copied all keys")
+                      ).pack(side="left", padx=6)
+        ctk.CTkButton(btns, text="Close", width=120, height=34, corner_radius=8,
+                      fg_color=BORDER_TINT, hover_color="#3A365D",
+                      command=pop.destroy).pack(side="left", padx=6)
+
+    def update_action_states(self):
+        state = "normal" if self.connected else "disabled"
+        self.gen_btn.configure(state=state)
+        self.refresh_btn.configure(state=state)
+        self.connect_btn.configure(state="disabled" if self.connected else "normal")
+
+    def close(self):
+        self.save_config()
+        self.root.destroy()
+
+
+def main():
+    try:
+        import ctypes
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)
+    except Exception:
+        pass
+    root = ctk.CTk()
+    App(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
