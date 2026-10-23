@@ -1,0 +1,111 @@
+"""Solos Key Manager - worker API client.
+
+Matches the Cloudflare worker endpoints exactly:
+  GET  /list                      -> {"keys": [{key, uid, perm, hoursLeft}]}
+  POST /generate?hours=&count=    (&perm=1 for permanent keys) -> {"keys": [...]}
+  POST /reset?key=                -> {"ok": true}
+  POST /revoke?key=               -> {"ok": true}
+Uses only the standard library.
+"""
+import json
+import urllib.error
+import urllib.parse
+import urllib.request
+
+
+class ApiError(Exception):
+    pass
+
+
+class KeyApi:
+
+    def __init__(self):
+        self.base = ""
+        self.token = ""
+        self.timeout = 20
+
+    def _url(self, path, params):
+        base = (self.base or "").strip().rstrip("/")
+        if not base:
+            raise ApiError("Worker URL is empty.")
+        if not base.lower().startswith(("http://", "https://")):
+            base = "https://" + base
+        qs = urllib.parse.urlencode(params) if params else ""
+        return base + path + ("?" + qs if qs else "")
+
+    def _call(self, path, method="GET", **params):
+        req = urllib.request.Request(
+            self._url(path, params),
+            data=b"" if method == "POST" else None,
+            method=method,
+            headers={
+                "authorization": "Bearer " + (self.token or "").strip(),
+                # Cloudflare can block the default Python user agent
+                "user-agent": "SolosKeyManager/2.0",
+                "accept": "application/json",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                status, raw = resp.status, resp.read()
+        except urllib.error.HTTPError as e:
+            status, raw = e.code, e.read()
+        except urllib.error.URLError as e:
+            raise ApiError("Can't reach the worker: %s" % (e.reason,))
+        except Exception as e:
+            raise ApiError("Request failed: %s" % (e,))
+
+        try:
+            data = json.loads(raw.decode("utf-8"))
+        except ValueError:
+            raise ApiError("The worker sent an unexpected reply (HTTP %s). Check the URL." % status)
+
+        if status == 401:
+            raise ApiError("Wrong admin token.")
+        if status >= 400:
+            raise ApiError(str(data.get("error") or "HTTP %s" % status))
+        if not isinstance(data, dict):
+            raise ApiError("Unexpected reply from the worker.")
+        return data
+
+    def ping(self):
+        self._call("/list")
+        return True
+
+    def list_keys(self):
+        data = self._call("/list")
+        out = []
+        for k in data.get("keys", []):
+            hours = k.get("hoursLeft")
+            perm = bool(k.get("perm")) or hours is None
+            out.append({
+                "key": k.get("key", ""),
+                "uid": k.get("uid"),
+                "hwid": k.get("uid"),
+                "perm": perm,
+                "hoursLeft": hours,
+                "hours": 0.0 if hours is None else float(hours),
+            })
+        return out
+
+    def generate(self, _unused, hours, count, perm=False):
+        if perm:
+            data = self._call("/generate", "POST", perm=1, count=int(count))
+        else:
+            data = self._call("/generate", "POST", hours=int(hours), count=int(count))
+        keys = data.get("keys")
+        if not isinstance(keys, list):
+            raise ApiError(str(data.get("error") or "The worker did not return any keys."))
+        return keys
+
+    def reset(self, key):
+        data = self._call("/reset", "POST", key=key)
+        if data.get("ok") is False:
+            raise ApiError(str(data.get("error") or "Couldn't reset that key."))
+        return True
+
+    def revoke(self, key):
+        data = self._call("/revoke", "POST", key=key)
+        if data.get("ok") is False:
+            raise ApiError(str(data.get("error") or "Couldn't delete that key."))
+        return True
