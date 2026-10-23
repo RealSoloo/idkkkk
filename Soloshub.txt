@@ -6249,9 +6249,9 @@ do
 			warn("[Solos Hub module " .. tostring(g.id) .. "] " .. message)
 			return false, message
 		end
-		local src
+		local src = Hub.BundledModules and Hub.BundledModules[g.id]
 		local url = Hub.ModuleURLs[g.id]
-		if type(url) == "string" and url ~= "" then
+		if not src and type(url) == "string" and url ~= "" then
 			local req = type(request) == "function" and request or type(http_request) == "function" and http_request or (syn and syn.request)
 			local requestError = "request API unavailable"
 			if type(req) == "function" then
@@ -6272,10 +6272,19 @@ do
 				if okh and type(response) == "string" and response:find("%S") then
 					src = response
 				else
-					return failed("download failed", "request: " .. requestError .. "; HttpGet: " .. tostring(response))
+					local f = Hub.path("mod_" .. g.id .. ".lua")
+					local okf, localSource = pcall(function()
+						if canFile and isfile(f) then return readfile(f) end
+					end)
+					if okf and type(localSource) == "string" and localSource:find("%S") then
+						src = localSource
+					else
+						local httpError = type(response) == "string" and response:find("%S") and response or "empty response"
+						return failed("download failed", "request: " .. requestError .. "; HttpGet: " .. tostring(httpError) .. "; no local module at " .. f .. ". Use SoloshubStandalone.txt if the repository is private.")
+					end
 				end
 			end
-		else
+		elseif not src then
 			local f = Hub.path("mod_" .. g.id .. ".lua")
 			local okf, result = pcall(function() if canFile and isfile(f) then return readfile(f) end end)
 			if not okf then return failed("local file failed", result) end

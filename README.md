@@ -253,3 +253,21 @@ the Dashboard keeps a **Game Module Load Failed** card with **Copy Module Error*
 instead of relying only on a temporary notification. That report is needed to
 identify an executor-specific or live-game failure. Local checks cover both
 network methods and each failure stage; live loading remains unverified.
+
+### Standalone hub for private repositories or blocked downloads
+
+Use **SoloshubStandalone.txt** when Roblox receives 404 for module URLs. Download
+it while signed into GitHub, then run its contents in place of Soloshub.txt.
+It includes all six game scripts and selects them locally; game-module loading
+makes no network requests. Key validation and other existing online features
+still use their usual services. Never put a GitHub token into the client script.
+
+`Soloshub.txt` remains the modular version. If its downloads fail, it also checks
+the executor workspace for `SolosHub/mod_<id>.lua` (for example `mod_lt2.lua`).
+A private repository can return 404 to anonymous clients despite being accessible
+to the repository owner. No repository visibility changes are made here.
+
+After editing the hub or any game module, run `python scripts/build_standalone.py`
+to regenerate the standalone file, then download the new version. It does not
+fetch future module updates automatically. The loader tests verify that all six
+bundled sources match their originals and load without requesting the network.
