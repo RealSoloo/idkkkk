@@ -24,6 +24,32 @@ Click a key or Copy to copy its full value, including when the table shortens
 long keys. Search, status filters, duration presets, permanent keys, reset,
 revoke, and F5 refresh remain available.
 
+## Local code workspace
+
+Select **Code Workspace** in the top bar. It works offline, without connecting
+an API. Use **Open files** for existing `.txt`, `.lua`, `.luau`, Python, or other
+UTF-8/UTF-16 text files, or **New** to paste code into a blank tab. **Open folder**
+shows a local folder; double-click a file to edit it or a folder to browse it.
+
+Each file opens in a separate tab with line numbers, undo/redo, horizontal
+scrolling, and a cursor-position indicator. **Save**, **Save as**, and **Save all**
+write to your computer. Files are not uploaded, synced to GitHub, or executed.
+Reopen saved files through Open files or the folder browser next time.
+
+Shortcuts: Ctrl+N new, Ctrl+O open, Ctrl+S save, Ctrl+Shift+S save as,
+Ctrl+W close tab, Ctrl+F find, Ctrl+Z undo, Ctrl+Shift+Z redo. Find next wraps
+around and matches literal text without case sensitivity.
+
+A `*` marks edited tabs. Closing a changed tab or exiting prompts to save,
+discard, or cancel. Files changed by another program prompt before replacement.
+Saves preserve UTF encoding/BOM and the detected newline style; edited files
+with mixed newline styles are normalized to that style. Save failures leave
+the tab open. Unsaved tabs are kept while switching to Key Manager, but are
+not automatically recovered after a crash.
+
+Run the editor checks with `python -m unittest discover -s tests -p test_code_workspace.py`.
+GUI checks require a display (for example Xvfb on headless Linux).
+
 ## Solos Hub scripts
 
 The main hub is `Soloshub.txt`. Its game-module links load the files in this

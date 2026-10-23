@@ -12,6 +12,7 @@ import time
 import tkinter as tk
 from tkinter import messagebox
 from api import ApiError, KeyApi
+from code_workspace import CodeWorkspace
 import customtkinter as ctk
 
 ctk.set_appearance_mode("Dark")
@@ -147,11 +148,14 @@ class App:
         self.main = ctk.CTkFrame(self.root, fg_color=BG_MAIN, corner_radius=0)
         self.main.pack(fill="both", expand=True)
 
+        self.editor = None
         self.build_topbar()
+        self.key_page = ctk.CTkFrame(self.main, fg_color="transparent")
+        self.key_page.pack(fill="both", expand=True)
         self.build_connection_strip()
         self.build_page_heading()
 
-        body = ctk.CTkFrame(self.main, fg_color="transparent")
+        body = ctk.CTkFrame(self.key_page, fg_color="transparent")
         body.pack(fill="both", expand=True, padx=24, pady=(8, 24))
         body.grid_columnconfigure(0, weight=0, minsize=320)
         body.grid_columnconfigure(1, weight=1)
@@ -162,7 +166,7 @@ class App:
         self.update_summary()
 
     def build_page_heading(self):
-        heading = ctk.CTkFrame(self.main, fg_color="transparent")
+        heading = self.page_heading = ctk.CTkFrame(self.key_page, fg_color="transparent")
         heading.pack(fill="x", padx=28, pady=(16, 14))
         title = ctk.CTkFrame(heading, fg_color="transparent")
         title.pack(side="left")
@@ -191,6 +195,13 @@ class App:
                      text_color=ACCENT_PURPLE, anchor="w").pack(anchor="w", pady=(11, 0))
         self.label(brand, "ACCESS MANAGEMENT", 10, False).pack(anchor="w")
 
+        self.navigation = ctk.CTkSegmentedButton(
+            bar, values=["Key Manager", "Code Workspace"], command=self.show_page,
+            selected_color=ACCENT_PURPLE, selected_hover_color=ACCENT_HOVER,
+            unselected_color=CARD_SURFACE, font=(FONT, 13), height=34)
+        self.navigation.set("Key Manager")
+        self.navigation.pack(side="left", padx=32)
+
         right = ctk.CTkFrame(bar, fg_color="transparent")
         right.pack(side="right", padx=26)
 
@@ -208,7 +219,7 @@ class App:
         self.conn_toggle_btn.pack(side="left")
 
     def build_connection_strip(self):
-        self.conn_strip = ctk.CTkFrame(self.main, fg_color="transparent", corner_radius=0)
+        self.conn_strip = ctk.CTkFrame(self.key_page, fg_color="transparent", corner_radius=0)
         self.conn_strip_visible = True
         self.conn_strip.pack(fill="x", padx=24, pady=(16, 8))
 
@@ -450,12 +461,28 @@ class App:
     def toggle_token(self):
         self.token_entry.configure(show="" if self.show_var.get() else "•")
 
+    def show_page(self, name):
+        self.navigation.set(name)
+        if name == "Code Workspace":
+            self.key_page.pack_forget()
+            if self.editor is None:
+                self.editor = CodeWorkspace(self.main)
+            self.editor.pack(fill="both", expand=True)
+        else:
+            if self.editor is not None:
+                self.editor.pack_forget()
+            self.key_page.pack(fill="both", expand=True)
+
     def toggle_conn_strip(self):
+        if self.navigation.get() != "Key Manager":
+            self.show_page("Key Manager")
+            if self.conn_strip_visible:
+                return
         if self.conn_strip_visible:
             self.conn_strip.pack_forget()
         else:
             self.conn_strip.pack(fill="x", padx=24, pady=(16, 8),
-                                 after=self.main.winfo_children()[0])
+                                 before=self.page_heading)
         self.conn_strip_visible = not self.conn_strip_visible
 
     def on_preset(self, label):
@@ -787,6 +814,10 @@ class App:
         self.connect_btn.configure(state="disabled" if self.connected else "normal")
 
     def close(self):
+        if self.editor is not None:
+            self.show_page("Code Workspace")
+            if not self.editor.can_close():
+                return
         self.save_config()
         self.root.destroy()
 
