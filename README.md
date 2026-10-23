@@ -220,3 +220,25 @@ using the existing LT2 pages and hub controls:
 See [LT2_FEATURES.md](LT2_FEATURES.md) for controls, source scope, validation and
 live-game limitations. Stop and unload cancel the new operations. No new GUI
 framework or remote script loader is introduced.
+
+### Own-character body part editor
+
+Reload Solos Hub and open **Player → Body Part Editor**. Enable **Body Editing**,
+select a body part, and expand Size, Position, or Rotation. Width/height/depth
+range from 25–300% of the original size; offsets range from -5 to +5 studs per
+axis (10 slider units = 1 stud); rotation ranges from -180° to +180°. An outline
+marks the selected part. Settings are kept separately for each edited part.
+
+Movement uses the original Motor6D joint offset, so limbs stay attached; moving
+an upper limb can also move parts joined beneath it. The HumanoidRootPart and
+accessory/tool handles are excluded. **Reset Selected** restores one part;
+**Reset All**, disabling editing, respawning, and unloading restore tracked edits.
+Editing starts disabled and is never automatically applied to a new character.
+Use **Refresh Body Parts** if the list was populated before spawning completed.
+
+These are local character edits, not a guarantee of replication to other players.
+Games can override changes, and resizing can affect movement/collisions. Parts
+without a Motor6D support resizing but report that joint movement is unavailable.
+Five mock regression tests cover R6/R15, ownership checks, relative edits, and
+cleanup (`PYTHONPATH=... python tests/test_body_editor.py`, with `lupa` installed).
+Full hub Luau parsing passes; live Roblox behavior still needs verification.

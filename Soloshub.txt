@@ -5,6 +5,7 @@
 	* Press the menu key (RightShift by default) to hide / show without unloading.
 	* Re-executing the script unloads the previous copy automatically.
 
+	v3.27: Player Body Part Editor - local size, joint offsets, rotation, and reset controls.
 	v3.26: Build A Boat added to the game list (module: Bab.txt).
 	v3.25: main UI rework - sidebar categories (Combat / Movement / Visuals / Player / Teleports / Misc / Settings), every
 	       category and game is a panel with a left sub-nav + feature cards, gradient active tab, page header with icon +
@@ -2134,6 +2135,166 @@ do
 	Toggle(CharSec, "Anti-Fling (others can't collide)", false, function(v) S.AntiFling = v if not v then restoreFling() end end, "Owner", "antifling")
 	Button(CharSec, "Sit Down", "Sit", function() local h = getHum() if h then h.Sit = true end end)
 	Button(CharSec, "Heal To Full (local)", "Heal", function() local h = getHum() if h then h.Health = h.MaxHealth end end)
+
+	-- BODY EDITOR BEGIN: edits only the current LocalPlayer character.
+	do
+		local body = { enabled = false, parts = {}, selected = nil, originals = {}, values = {}, sliders = {} }
+		local sec = Section(PlayerTab, "Body Part Editor", "Experiment with your own R6/R15 character. Other players may not see local edits.")
+		local info = InfoRow(sec, "Disabled - choose a body part, then enable editing")
+		local picker, enabledToggle
+		local outline = new("SelectionBox", { LineThickness = 0.04, Color3 = T.Accent, SurfaceTransparency = 1, Visible = false }, Gui)
+		local function defaults()
+			return { sx = 100, sy = 100, sz = 100, x = 0, y = 0, z = 0, rx = 0, ry = 0, rz = 0 }
+		end
+		local function owned(part)
+			local char = LocalPlayer.Character
+			return char and part and part.Parent == char and part:IsA("BasePart") and part.Name ~= "HumanoidRootPart"
+		end
+		local function sync()
+			local values = body.values[body.selected] or defaults()
+			for key, slider in pairs(body.sliders) do slider.SetSilent(values[key]) end
+			outline.Adornee = body.enabled and owned(body.selected) and body.selected or nil
+			outline.Visible = outline.Adornee ~= nil
+		end
+		local function restore(part)
+			local original = body.originals[part]
+			if not original then body.values[part] = nil return true end
+			local ok = pcall(function()
+				if part.Parent == original.char then
+					part.Size = original.size
+					for _, joint in ipairs(original.joints) do
+						if joint.motor:IsDescendantOf(original.char) and joint.motor.Part1 == part then
+							joint.motor.C0 = joint.c0
+						end
+					end
+				end
+			end)
+			if ok then body.originals[part], body.values[part] = nil, nil end
+			return ok
+		end
+		local function restoreAll()
+			local pending = {}
+			for part in pairs(body.originals) do table.insert(pending, part) end
+			local failed = 0
+			for _, part in ipairs(pending) do if not restore(part) then failed = failed + 1 end end
+			sync()
+			return failed
+		end
+		local function apply()
+			local part, char = body.selected, LocalPlayer.Character
+			if not body.enabled then info.Text = "Enable editing before adjusting a body part" sync() return end
+			if not owned(part) then info.Text = "No editable body part - refresh after spawning" return end
+			local original = body.originals[part]
+			if not original then
+				original = { char = char, size = part.Size, joints = {} }
+				for _, joint in ipairs(char:GetDescendants()) do
+					if joint:IsA("Motor6D") and joint.Part1 == part and joint.Part0 and joint.Part0:IsDescendantOf(char) then
+						table.insert(original.joints, { motor = joint, c0 = joint.C0 })
+					end
+				end
+				body.originals[part] = original
+			end
+			local v = body.values[part] or defaults()
+			local ok, err = pcall(function()
+				part.Size = Vector3.new(math.max(0.05, original.size.X * v.sx / 100), math.max(0.05, original.size.Y * v.sy / 100), math.max(0.05, original.size.Z * v.sz / 100))
+				local offset = CFrame.new(v.x / 10, v.y / 10, v.z / 10) * CFrame.Angles(math.rad(v.rx), math.rad(v.ry), math.rad(v.rz))
+				for _, joint in ipairs(original.joints) do
+					if joint.motor:IsDescendantOf(char) and joint.motor.Part1 == part then joint.motor.C0 = joint.c0 * offset end
+				end
+			end)
+			if not ok then
+				restore(part)
+				info.Text = "Could not apply edit: " .. tostring(err)
+			else
+				info.Text = part.Name .. (#original.joints > 0 and " - local size / joint offsets applied" or " - size applied; no Motor6D for movement")
+			end
+			sync()
+		end
+		local function selectPart(index)
+			body.selected = body.parts[index]
+			sync()
+			info.Text = body.selected and (body.selected.Name .. " - offsets are relative to its original joint") or "No body parts found - refresh after spawning"
+		end
+		local function refresh()
+			local previous = body.selected
+			body.parts = {}
+			local char = LocalPlayer.Character
+			if char then
+				for _, part in ipairs(char:GetChildren()) do if owned(part) then table.insert(body.parts, part) end end
+			end
+			table.sort(body.parts, function(a, b) return a.Name < b.Name end)
+			local names, selected = {}, 1
+			for i, part in ipairs(body.parts) do names[i] = part.Name if part == previous then selected = i end end
+			if #names == 0 then names[1] = "No character" end
+			picker.SetOptions(names, false)
+			picker.Set(selected, true)
+			selectPart(selected)
+		end
+		enabledToggle = Toggle(sec, "Enable Body Editing", false, function(value)
+			body.enabled = value
+			if value then refresh() if body.selected then info.Text = "Ready - select a part and adjust the sliders" end
+			else
+				local failed = restoreAll()
+				info.Text = failed == 0 and "Disabled - all body edits restored" or "Some edits could not reset - try Reset All again"
+			end
+			sync()
+		end)
+		picker = Dropdown(sec, "Body Part", { "No character" }, 1, selectPart)
+		Button(sec, "Refresh Body Parts", "Refresh", refresh)
+		local scale = Collapse(sec, "Size - percent of original")
+		local move = Collapse(sec, "Position - 10 units = 1 stud")
+		local rotate = Collapse(sec, "Rotation - degrees")
+		local function control(parent, label, key, low, high, initial)
+			body.sliders[key] = Slider(parent, label, low, high, initial, function(value)
+				if not body.enabled or not owned(body.selected) then sync() info.Text = "Enable editing and select your body part first" return end
+				local v = body.values[body.selected] or defaults()
+				body.values[body.selected] = v
+				v[key] = math.clamp(value, low, high)
+				apply()
+			end)
+		end
+		control(scale, "Width %", "sx", 25, 300, 100)
+		control(scale, "Height %", "sy", 25, 300, 100)
+		control(scale, "Depth %", "sz", 25, 300, 100)
+		control(move, "Offset X", "x", -50, 50, 0)
+		control(move, "Offset Y", "y", -50, 50, 0)
+		control(move, "Offset Z", "z", -50, 50, 0)
+		control(rotate, "Rotate X", "rx", -180, 180, 0)
+		control(rotate, "Rotate Y", "ry", -180, 180, 0)
+		control(rotate, "Rotate Z", "rz", -180, 180, 0)
+		Button(sec, "Reset Selected Body Part", "Reset", function()
+			if body.selected then
+				local ok = restore(body.selected)
+				info.Text = ok and "Selected part restored" or "Could not restore selected part - try again"
+				sync()
+			end
+		end)
+		Button(sec, "Reset All Body Parts", "Reset All", function()
+			info.Text = restoreAll() == 0 and "All body parts restored" or "Some parts could not reset - try again"
+		end)
+		bind(LocalPlayer.CharacterRemoving, function()
+			body.enabled = false
+			restoreAll()
+			body.selected, body.parts = nil, {}
+			enabledToggle.Set(false)
+			sync()
+			info.Text = "Character changed - refresh body parts after spawning"
+		end)
+		bind(LocalPlayer.CharacterAdded, function()
+			-- Edits are never transferred to a new rig automatically.
+			body.enabled = false
+			restoreAll()
+			enabledToggle.Set(false)
+			refresh()
+		end)
+		onUnload(function()
+			body.enabled = false
+			restoreAll()
+			outline:Destroy()
+		end)
+		refresh()
+	end
+	-- BODY EDITOR END
 
 	local Misc = Section(PlayerTab, "Utility", "Quality-of-life options")
 	Toggle(Misc, "Anti-AFK", true, function(v) S.AntiAfk = v end, nil, "antiafk")
