@@ -26,8 +26,12 @@ PURPLE = "#9B87F5"
 EDITOR_REVISION = "editor-3"
 
 LANGUAGES = ["Luau", "Python", "JSON", "JavaScript", "Plain text"]
-COLORS = {"keyword": "#BDA7FF", "string": "#91D9B1", "comment": "#697892",
-          "number": "#F4BD6A", "function": "#81CDE8", "operator": "#D7B8EE"}
+COLORS = {
+    "keyword": "#CE8CFF", "string": "#B6F36A", "comment": "#8B9CB6",
+    "number": "#FFAE57", "function": "#FFD866", "operator": "#FF79C6",
+    "variable": "#8CDCFE", "property": "#FFC9A3", "builtin": "#5EF0D5",
+    "punctuation": "#E9D86C",
+}
 
 
 def language_for(path):
@@ -42,15 +46,29 @@ def analyze_code(source, language):
     notice = "Syntax checked · runtime errors are not checked"
     try:
         from pygments.lexers import get_lexer_by_name
-        from pygments.token import Keyword, String, Comment, Number, Name, Operator
+        from pygments.token import Keyword, String, Comment, Number, Name, Operator, Punctuation
         lexer = get_lexer_by_name({"Luau": "luau", "Python": "python", "JSON": "json",
                                   "JavaScript": "javascript", "Plain text": "text"}[language])
+        previous = ""
+        call_suffix = re.compile(r"\s*[(]")
         for offset, token, value in lexer.get_tokens_unprocessed(source):
+            if token in Name:
+                if token in Name.Function or call_suffix.match(source, offset + len(value)):
+                    kind = "function"
+                elif previous in (".", ":"):
+                    kind = "property"
+                elif token in Name.Builtin or token in Name.Class:
+                    kind = "builtin"
+                else:
+                    kind = "variable"
+                highlights.append((kind, offset, offset + len(value)))
             for kind, family in (("keyword", Keyword), ("string", String), ("comment", Comment),
-                                 ("number", Number), ("function", Name.Function), ("operator", Operator)):
+                                 ("number", Number), ("operator", Operator), ("punctuation", Punctuation)):
                 if token in family:
                     highlights.append((kind, offset, offset + len(value)))
                     break
+            if value.strip() and token not in Comment:
+                previous = value
     except ImportError as error:
         notice = "Highlighting unavailable: " + str(error)
     except Exception as error:
