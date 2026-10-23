@@ -24,6 +24,11 @@ Click a key or Copy to copy its full value, including when the table shortens
 long keys. Search, status filters, duration presets, permanent keys, reset,
 revoke, and F5 refresh remain available.
 
+If your local files are named `app.py` and `api.py`, keep those names and launch
+with `python app.py`. Keep `code_workspace.py` beside them. For editor updates,
+replace `code_workspace.py` and `requirements.txt`, then run
+`python -m pip install -r requirements.txt` before restarting.
+
 ## Local code workspace
 
 Select **Code Workspace** in the top bar. It works offline, without connecting
@@ -32,7 +37,20 @@ UTF-8/UTF-16 text files, or **New** to paste code into a blank tab. **Open folde
 shows a local folder; double-click a file to edit it or a folder to browse it.
 
 Each file opens in a separate tab with line numbers, undo/redo, horizontal
-scrolling, and a cursor-position indicator. **Save**, **Save as**, and **Save all**
+scrolling, syntax colors, current-line shading, and automatic indentation.
+The explorer, scrollbars, search controls, and Problems panel use the app's
+dark purple palette. Choose a language in the toolbar; `.txt` and new files
+default to Luau for the hub scripts (select Plain text for notes).
+
+After a short typing pause, local parsers check Luau, Python, and JSON syntax.
+Errors underline the affected code and mark its line number red. Select an
+entry in **Problems** to jump to it. Luau checks support Roblox type annotations
+and `continue`. JavaScript has highlighting only. These checks do not execute
+code, validate Roblox APIs, or detect runtime/logic errors. Install the updated
+`requirements.txt` to enable highlighting and Luau parsing; missing packages
+are reported in the Problems header.
+
+**Save**, **Save as**, and **Save all**
 write to your computer. Files are not uploaded, synced to GitHub, or executed.
 Reopen saved files through Open files or the folder browser next time.
 

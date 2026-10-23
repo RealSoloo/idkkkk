@@ -3,10 +3,11 @@ import codecs
 import os
 from pathlib import Path
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
-from code_workspace import Document, ExternalChangeError, CodeWorkspace
+from code_workspace import Document, ExternalChangeError, CodeWorkspace, analyze_code
 
 
 class DocumentTests(unittest.TestCase):
@@ -62,6 +63,23 @@ class DocumentTests(unittest.TestCase):
             Document.open(self.path)
 
 
+class AnalysisTests(unittest.TestCase):
+    def test_luau_types_comments_and_errors(self):
+        valid = '-- missing end here is only a comment\nlocal n: number = 2\nn += 1\nfor i=1,3 do if i == 2 then continue end end'
+        colors, errors, notice = analyze_code(valid, "Luau")
+        self.assertFalse(errors)
+        self.assertIn("Syntax checked", notice)
+        self.assertTrue(any(kind == "comment" for kind, _, _ in colors))
+        self.assertTrue(analyze_code('local x = )', "Luau")[1])
+        self.assertTrue(analyze_code('if true then\n print("hello")', "Luau")[1])
+
+    def test_other_languages_and_no_execution(self):
+        self.assertTrue(analyze_code('if True\n pass', "Python")[1])
+        self.assertTrue(analyze_code('{"x":}', "JSON")[1])
+        self.assertFalse(analyze_code('raise RuntimeError("must not run")', "Python")[1])
+        self.assertIn("Highlighting only", analyze_code('let x = ;', "JavaScript")[2])
+
+
 @unittest.skipUnless(os.environ.get("DISPLAY") or os.name == "nt", "GUI requires a display")
 class GuiTests(unittest.TestCase):
     def setUp(self):
@@ -79,7 +97,7 @@ class GuiTests(unittest.TestCase):
 
     def close_root(self):
         for job in self.root.tk.call("after", "info"):
-            self.root.after_cancel(job)
+            self.root.tk.call("after", "cancel", job)
         self.root.destroy()
 
     def test_app_navigation_shortcuts_and_cancel_exit(self):
@@ -157,11 +175,38 @@ class GuiTests(unittest.TestCase):
             self.assertFalse(ws.save())
             error.assert_called_once()
 
+    def test_live_diagnostics_and_navigation(self):
+        ws = self.workspace
+        tab = ws.active()
+        tab.text.insert("1.0", "local x = )")
+        deadline = time.monotonic() + 5
+        while not tab.problems and time.monotonic() < deadline:
+            self.root.update()
+            time.sleep(0.02)
+        self.assertTrue(tab.problems)
+        self.assertTrue(tab.text.tag_ranges("error"))
+        self.assertTrue(tab.text.tag_ranges("keyword"))
+        ws.problem_list.selection_set(0)
+        ws.jump_problem()
+        self.assertEqual(tab.text.index("insert").split(".")[0], "1")
+        tab.text.delete("1.0", "end")
+        tab.text.insert("1.0", "local x: number = 3")
+        self.root.update()
+        deadline = time.monotonic() + 5
+        while tab.notice == "Checking syntax…" and time.monotonic() < deadline:
+            self.root.update()
+            time.sleep(0.02)
+        self.assertEqual(tab.problems, [])
+        self.assertFalse(tab.text.tag_ranges("error"))
+        self.assertIn("Syntax checked", tab.notice)
+
     def test_large_script(self):
         text = "local example = 'a line of Lua'\n" * 17000
         self.path.write_text(text)
         tab = self.workspace.open_path(self.path)
         self.root.update()
+        tab.apply_analysis(analyze_code(text, "Luau"))
+        self.assertTrue(tab.text.tag_ranges("keyword"))
         tab.text.insert("end", "-- end\n")
         self.assertTrue(self.workspace.save())
         self.assertEqual(self.path.read_text(), text + "-- end\n")

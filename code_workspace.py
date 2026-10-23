@@ -1,4 +1,10 @@
 """Local text editing. Documents never use the key API or execute their contents."""
+from bisect import bisect_right
+import ast
+import json
+import queue
+import re
+import threading
 import codecs
 import os
 from pathlib import Path
@@ -13,6 +19,72 @@ BG = "#10131E"
 FG = "#F0F2FA"
 MUTED = "#9AA3BA"
 PURPLE = "#9B87F5"
+
+
+LANGUAGES = ["Luau", "Python", "JSON", "JavaScript", "Plain text"]
+COLORS = {"keyword": "#BDA7FF", "string": "#91D9B1", "comment": "#697892",
+          "number": "#F4BD6A", "function": "#81CDE8", "operator": "#D7B8EE"}
+
+
+def language_for(path):
+    suffix = Path(path).suffix.lower() if path else ""
+    return {".py": "Python", ".json": "JSON", ".js": "JavaScript",
+            ".md": "Plain text"}.get(suffix, "Luau")
+
+
+def analyze_code(source, language):
+    """Parse only; never import, evaluate, or run the user's code."""
+    highlights, problems = [], []
+    notice = "Syntax checked · runtime errors are not checked"
+    try:
+        from pygments.lexers import get_lexer_by_name
+        from pygments.token import Keyword, String, Comment, Number, Name, Operator
+        lexer = get_lexer_by_name({"Luau": "luau", "Python": "python", "JSON": "json",
+                                  "JavaScript": "javascript", "Plain text": "text"}[language])
+        for offset, token, value in lexer.get_tokens_unprocessed(source):
+            for kind, family in (("keyword", Keyword), ("string", String), ("comment", Comment),
+                                 ("number", Number), ("function", Name.Function), ("operator", Operator)):
+                if token in family:
+                    highlights.append((kind, offset, offset + len(value)))
+                    break
+    except ImportError:
+        notice = "Install requirements.txt to enable syntax colors"
+    except Exception as error:
+        notice = "Highlighting unavailable: " + str(error)
+    try:
+        if language == "Python":
+            ast.parse(source)
+        elif language == "JSON":
+            json.loads(source)
+        elif language == "Luau":
+            from tree_sitter import Language, Parser
+            import tree_sitter_luau
+            raw = source.encode("utf-8")
+            tree = Parser(Language(tree_sitter_luau.language())).parse(raw)
+            lines = raw.split(b"\n")
+            stack = [tree.root_node]
+            while stack and len(problems) < 100:
+                node = stack.pop()
+                if node.is_missing or node.type == "ERROR":
+                    row, byte_col = node.start_point
+                    line = lines[row]
+                    col = len(line[:byte_col].decode("utf-8", errors="replace")) + 1
+                    detail = "Expected " + node.type if node.is_missing else "Unexpected or incomplete syntax"
+                    problems.append((row + 1, col, detail))
+                    if node.type == "ERROR":
+                        continue
+                stack.extend(reversed(node.children))
+        else:
+            notice = "Highlighting only · syntax checking unavailable for " + language
+    except SyntaxError as error:
+        problems.append((error.lineno or 1, error.offset or 1, error.msg))
+    except json.JSONDecodeError as error:
+        problems.append((error.lineno, error.colno, error.msg))
+    except ImportError:
+        notice = "Luau checks unavailable · run python -m pip install -r requirements.txt"
+    except Exception as error:
+        notice = "Syntax checker unavailable: " + str(error)
+    return highlights, problems, notice
 
 
 class ExternalChangeError(OSError):
@@ -79,6 +151,11 @@ class Document:
 class EditorTab:
     def __init__(self, workspace, document, title):
         self.workspace, self.document, self.title = workspace, document, title
+        self.language = language_for(document.path)
+        self.revision = 0
+        self.analysis_job = None
+        self.problems = []
+        self.notice = "Checking syntax…"
         self.frame = tk.Frame(workspace.notebook, bg=BG)
         self.gutter = tk.Canvas(self.frame, width=58, bg=BG, highlightthickness=0)
         self.gutter.grid(row=0, column=0, sticky="ns")
@@ -90,14 +167,20 @@ class EditorTab:
         # Handle editor shortcuts before Tk Text's built-in class bindings.
         for sequence, command in workspace.commands:
             self.text.bind(sequence, lambda e, fn=command: workspace.shortcut(fn))
-        vertical = ttk.Scrollbar(self.frame, command=self.text.yview)
+        vertical = ctk.CTkScrollbar(self.frame, command=self.text.yview, fg_color=BG, button_color="#333A50", button_hover_color=PURPLE)
         vertical.grid(row=0, column=2, sticky="ns")
-        horizontal = ttk.Scrollbar(self.frame, orient="horizontal", command=self.text.xview)
+        horizontal = ctk.CTkScrollbar(self.frame, orientation="horizontal", command=self.text.xview, fg_color=BG, button_color="#333A50", button_hover_color=PURPLE)
         horizontal.grid(row=1, column=1, sticky="ew")
         self.text.configure(xscrollcommand=horizontal.set,
                             yscrollcommand=lambda a, b: (vertical.set(a, b), self.draw_lines()))
         self.frame.grid_rowconfigure(0, weight=1)
         self.frame.grid_columnconfigure(1, weight=1)
+        for kind, color in COLORS.items():
+            self.text.tag_configure(kind, foreground=color)
+        self.text.tag_configure("current_line", background="#171D2D")
+        self.text.tag_configure("error", underline=True, foreground="#FB7185")
+        self.text.bind("<Return>", self.indent_return)
+        self.text.bind("<Tab>", self.indent_tab)
         self.text.insert("1.0", document.text)
         self.text.edit_reset()
         self.text.edit_modified(False)
@@ -109,6 +192,7 @@ class EditorTab:
         workspace.notebook.add(self.frame, text=title)
         workspace.notebook.select(self.frame)
         self.text.focus_set()
+        self.schedule_analysis()
 
     def content(self):
         return self.text.get("1.0", "end-1c")
@@ -119,6 +203,65 @@ class EditorTab:
             self.text.edit_modified(False)
             self.workspace.notebook.tab(self.frame, text=self.title + " *")
             self.draw_lines()
+            self.schedule_analysis()
+            self.workspace.update_status()
+
+    def indent_return(self, event=None):
+        prefix = self.text.get("insert linestart", "insert")
+        indent = re.match(r"[ \t]*", prefix).group()
+        if re.search(r"(?:\bthen|\bdo|\belse|\brepeat|\bfunction.*\)|[{:])\s*$", prefix):
+            indent += "    "
+        if self.text.tag_ranges("sel"):
+            self.text.delete("sel.first", "sel.last")
+        self.text.insert("insert", "\n" + indent)
+        self.text.see("insert")
+        return "break"
+
+    def indent_tab(self, event=None):
+        self.text.insert("insert", "    ")
+        return "break"
+
+    def schedule_analysis(self):
+        self.revision += 1
+        self.problems = []
+        self.notice = "Checking syntax…"
+        self.text.tag_remove("error", "1.0", "end")
+        if self.analysis_job:
+            self.text.after_cancel(self.analysis_job)
+        self.analysis_job = self.text.after(400, self.start_analysis)
+
+    def start_analysis(self):
+        self.analysis_job = None
+        source, language, revision = self.content(), self.language, self.revision
+        # Workers only handle strings. Tk calls stay on the UI thread.
+        results = self.workspace.analysis_results
+        def work():
+            results.put((self, revision, analyze_code(source, language)))
+        threading.Thread(target=work, daemon=True).start()
+
+    def apply_analysis(self, result):
+        highlights, self.problems, self.notice = result
+        source = self.content()
+        starts = [0] + [match.end() for match in re.finditer("\n", source)]
+        def text_index(offset):
+            row = bisect_right(starts, offset)
+            return "%d.%d" % (row, offset - starts[row - 1])
+        for kind in COLORS:
+            self.text.tag_remove(kind, "1.0", "end")
+            ranges = []
+            for name, start, end in highlights:
+                if name == kind:
+                    ranges.extend((text_index(start), text_index(end)))
+            for offset in range(0, len(ranges), 1000):
+                self.text.tag_add(kind, *ranges[offset:offset + 1000])
+        self.text.tag_remove("error", "1.0", "end")
+        for line, column, _ in self.problems:
+            index = "%d.%d" % (line, max(0, column - 1))
+            self.text.tag_add("error", index, index + " lineend+1c")
+        self.text.tag_raise("error")
+        self.text.tag_raise("sel")
+        self.draw_lines()
+        if self.workspace.active() is self:
             self.workspace.update_status()
 
     def draw_lines(self):
@@ -129,7 +272,7 @@ class EditorTab:
             if info is None:
                 break
             self.gutter.create_text(48, info[1], anchor="ne", text=index.split(".")[0],
-                                    fill=MUTED, font=("Consolas", 11))
+                                    fill="#FB7185" if any(p[0] == int(index.split(".")[0]) for p in self.problems) else MUTED, font=("Consolas", 11))
             index = self.text.index(index + "+1line")
 
     def has_changes(self):
@@ -143,11 +286,13 @@ class CodeWorkspace(ctk.CTkFrame):
         self.counter = 0
         self.folder = None
         self.entries = []
+        self.analysis_results = queue.Queue()
+        self.closing = False
         heading = ctk.CTkFrame(self, fg_color="transparent")
         heading.pack(fill="x", padx=24, pady=(16, 8))
-        ctk.CTkLabel(heading, text="Code workspace", font=("Segoe UI", 26, "bold"),
+        ctk.CTkLabel(heading, text="Code workspace", font=("Segoe UI", 24, "bold"),
                      text_color=FG).pack(side="left")
-        ctk.CTkLabel(heading, text="Local files · Saved on your computer", text_color=MUTED).pack(side="right")
+        ctk.CTkLabel(heading, text="LOCAL WORKSPACE  /  Saved on your computer", text_color=MUTED).pack(side="right")
         toolbar = ctk.CTkFrame(self, fg_color="transparent")
         toolbar.pack(fill="x", padx=24, pady=8)
         for label, command in (("New", self.new), ("Open files", self.open_files),
@@ -155,30 +300,38 @@ class CodeWorkspace(ctk.CTkFrame):
                                ("Save as", lambda: self.save(save_as=True)),
                                ("Save all", self.save_all), ("Close tab", self.close_tab)):
             ctk.CTkButton(toolbar, text=label, command=command, width=100, height=32,
-                          fg_color="#241B45", hover_color="#483B73").pack(side="left", padx=(0, 8))
+                          fg_color=PURPLE if label == "Save" else "#171B28", text_color=BG if label == "Save" else FG,
+                          border_width=1, border_color="#2B3247", hover_color="#483B73").pack(side="left", padx=(0, 8))
         search = ctk.CTkFrame(self, fg_color="transparent")
         search.pack(fill="x", padx=24, pady=(0, 8))
-        self.query = ctk.CTkEntry(search, placeholder_text="Find in current file (Ctrl+F)", width=280)
+        self.query = ctk.CTkEntry(search, placeholder_text="Find in file  ·  Ctrl+F", width=280,
+                                  fg_color=BG, border_color="#2B3247", text_color=FG)
         self.query.pack(side="left")
         self.query.bind("<Return>", lambda e: self.find_next())
         ctk.CTkButton(search, text="Find next", command=self.find_next, width=100,
                       fg_color="#241B45").pack(side="left", padx=8)
         self.find_result = ctk.CTkLabel(search, text="", text_color=MUTED)
         self.find_result.pack(side="left")
+        self.language_menu = ctk.CTkOptionMenu(search, values=LANGUAGES, command=self.change_language,
+                                              fg_color="#171B28", button_color="#2B3247",
+                                              button_hover_color="#483B73", width=130)
+        self.language_menu.pack(side="right")
+        ctk.CTkLabel(search, text="Language", text_color=MUTED).pack(side="right", padx=12)
         body = tk.PanedWindow(self, orient="horizontal", bg="#0B0D14", sashwidth=8, bd=0)
         body.pack(fill="both", expand=True, padx=24)
-        sidebar = tk.Frame(body, bg=BG)
+        sidebar = ctk.CTkFrame(body, fg_color=BG, corner_radius=12, border_width=1, border_color="#2B3247")
+        ctk.CTkLabel(sidebar, text="EXPLORER", text_color=PURPLE, anchor="w", font=("Segoe UI", 11, "bold")).pack(fill="x", padx=14, pady=(12, 0))
         self.folder_label = tk.Label(sidebar, text="Open a folder to browse files", bg=BG, fg=MUTED,
                                      anchor="w", wraplength=210, padx=8, pady=8)
         self.folder_label.pack(fill="x")
         actions = tk.Frame(sidebar, bg=BG)
         actions.pack(fill="x")
         for label, command in (("↑ Parent", self.parent_folder), ("Refresh", self.refresh_folder)):
-            tk.Button(actions, text=label, command=command, bg="#241B45", fg=FG,
-                      relief="flat").pack(side="left", padx=5, pady=5)
+            ctk.CTkButton(actions, text=label, command=command, fg_color="#171B28", hover_color="#483B73", width=90, height=28).pack(side="left", padx=5, pady=5)
         self.files = tk.Listbox(sidebar, bg=BG, fg=FG, selectbackground="#483B73",
+                               font=("Segoe UI", 12), activestyle="none", selectborderwidth=0,
                                borderwidth=0, highlightthickness=0, exportselection=False)
-        scrollbar = ttk.Scrollbar(sidebar, command=self.files.yview)
+        scrollbar = ctk.CTkScrollbar(sidebar, command=self.files.yview, fg_color=BG, button_color="#333A50")
         scrollbar.pack(side="right", fill="y")
         self.files.configure(yscrollcommand=scrollbar.set)
         self.files.pack(fill="both", expand=True)
@@ -186,12 +339,25 @@ class CodeWorkspace(ctk.CTkFrame):
         self.files.bind("<Return>", self.open_selected)
         style = ttk.Style(self)
         style.theme_use("clam")
-        style.configure("Code.TNotebook", background=BG, borderwidth=0)
-        style.configure("Code.TNotebook.Tab", background="#171B28", foreground=MUTED, padding=(14, 9))
+        style.configure("Code.TNotebook", background=BG, borderwidth=0, lightcolor=BG, darkcolor=BG, bordercolor=BG)
+        style.configure("Code.TNotebook.Tab", background="#171B28", foreground=MUTED, padding=(18, 11), font=("Segoe UI", 11), borderwidth=0, lightcolor=BG, darkcolor=BG, bordercolor=BG)
         style.map("Code.TNotebook.Tab", background=[("selected", "#241B45")], foreground=[("selected", FG)])
-        self.notebook = ttk.Notebook(body, style="Code.TNotebook")
+        style.layout("Code.TNotebook.Tab", [("Notebook.tab", {"sticky": "nswe", "children": [
+            ("Notebook.padding", {"side": "top", "sticky": "nswe", "children": [
+                ("Notebook.label", {"side": "top", "sticky": ""})]})]})])
+        editor_area = tk.Frame(body, bg=BG)
+        self.notebook = ttk.Notebook(editor_area, style="Code.TNotebook")
+        self.notebook.pack(fill="both", expand=True)
+        problems_panel = ctk.CTkFrame(editor_area, fg_color="#131722", corner_radius=0, height=120)
+        problems_panel.pack(fill="x", pady=(1, 0))
+        self.problem_heading = ctk.CTkLabel(problems_panel, text="PROBLEMS", text_color=MUTED, anchor="w", font=("Segoe UI", 11, "bold"))
+        self.problem_heading.pack(fill="x", padx=14, pady=(6, 2))
+        self.problem_list = tk.Listbox(problems_panel, height=3, bg="#131722", fg="#FB7185", font=("Segoe UI", 11),
+                                      selectbackground="#302748", activestyle="none", bd=0, highlightthickness=0)
+        self.problem_list.pack(fill="x", padx=14, pady=(0, 10))
+        self.problem_list.bind("<<ListboxSelect>>", self.jump_problem)
         body.add(sidebar, width=230, minsize=160)
-        body.add(self.notebook, minsize=400, stretch="always")
+        body.add(editor_area, minsize=400, stretch="always")
         self.notebook.bind("<<NotebookTabChanged>>", lambda e: self.update_status())
         self.status = ctk.CTkLabel(self, text="", anchor="w", text_color=MUTED)
         self.status.pack(fill="x", padx=24, pady=8)
@@ -203,6 +369,38 @@ class CodeWorkspace(ctk.CTkFrame):
         for sequence, command in self.commands:
             self.winfo_toplevel().bind(sequence, lambda e, fn=command: self.shortcut(fn), add="+")
         self.new()
+        self.after(100, self.poll_analysis)
+
+    def destroy(self):
+        self.closing = True
+        super().destroy()
+
+    def poll_analysis(self):
+        try:
+            while True:
+                tab, revision, result = self.analysis_results.get_nowait()
+                if str(tab.frame) in self.tabs and tab.revision == revision:
+                    tab.apply_analysis(result)
+        except queue.Empty:
+            pass
+        self.after(100, self.poll_analysis)
+
+    def change_language(self, language):
+        tab = self.active()
+        if tab:
+            tab.language = language
+            tab.schedule_analysis()
+            self.update_status()
+
+    def jump_problem(self, event=None):
+        tab = self.active()
+        selected = self.problem_list.curselection()
+        if tab and selected and selected[0] < len(tab.problems):
+            line, column, _ = tab.problems[selected[0]]
+            index = "%d.%d" % (line, max(0, column - 1))
+            tab.text.mark_set("insert", index)
+            tab.text.see(index)
+            tab.text.focus_set()
 
     def shortcut(self, command):
         if self.winfo_ismapped():
@@ -246,6 +444,7 @@ class CodeWorkspace(ctk.CTkFrame):
         tab = tab or self.active()
         if tab is None:
             return True
+        previous_path = tab.document.path
         path = tab.document.path
         if save_as or path is None:
             chosen = filedialog.asksaveasfilename(parent=self, title="Save local file",
@@ -270,6 +469,9 @@ class CodeWorkspace(ctk.CTkFrame):
         except (OSError, ValueError) as error:
             messagebox.showerror("Cannot save file", str(error), parent=self)
             return False
+        if path != previous_path and path.suffix.lower() in (".py", ".json", ".js", ".lua", ".luau", ".md"):
+            tab.language = language_for(path)
+            tab.schedule_analysis()
         tab.title = tab.document.path.name
         tab.dirty = False
         tab.text.edit_modified(False)
@@ -299,6 +501,8 @@ class CodeWorkspace(ctk.CTkFrame):
         if tab and self.confirm_close(tab):
             self.tabs.pop(str(tab.frame))
             self.notebook.forget(tab.frame)
+            if tab.analysis_job:
+                tab.text.after_cancel(tab.analysis_job)
             tab.frame.destroy()
             self.update_status()
 
@@ -356,10 +560,23 @@ class CodeWorkspace(ctk.CTkFrame):
             self.update_status()
 
     def update_status(self):
+        if self.closing:
+            return
         tab = self.active()
         if not tab:
+            self.problem_list.delete(0, "end")
+            self.problem_heading.configure(text="PROBLEMS · Open a file to check syntax")
             self.status.configure(text="New or Open files to start editing · Ctrl+N / Ctrl+O")
             return
+        self.language_menu.set(tab.language)
+        self.problem_heading.configure(text="PROBLEMS  ·  %d syntax issue%s   /   %s" %
+                                       (len(tab.problems), "" if len(tab.problems) == 1 else "s", tab.notice))
+        self.problem_list.delete(0, "end")
+        for row, col, detail in tab.problems:
+            self.problem_list.insert("end", "  Line %d:%d   %s" % (row, col, detail))
+        tab.text.tag_remove("current_line", "1.0", "end")
+        tab.text.tag_add("current_line", "insert linestart", "insert lineend+1c")
+        tab.text.tag_lower("current_line")
         line, column = tab.text.index("insert").split(".")
         doc = tab.document
         newline = {"\n": "LF", "\r\n": "CRLF", "\r": "CR"}[doc.newline]
