@@ -34,7 +34,7 @@ The icon sprite sheet still loads from its original SolosHub repository.
 Update these same files in place for later releases. Reload the hub after
 updating a module. Updating a file does not change an already running session.
 
-`Pf.txt` includes the pf-esp-7 update.
+`Pf.txt` includes the pf-esp-8 update.
 
 ### Phantom Forces automatic teams and names
 
@@ -47,7 +47,7 @@ using stale teams. Available native team colors remain a fallback.
 In **ESP → Team Detection**, the roster and model-owner status lines explain
 which data was found. **Refresh leaderboard teams** forces an immediate retry
 while the leaderboard is open. Keep **Team Check** enabled to show confirmed
-enemies only. Then enable Aim Assist with **Camera tracking** and hold right
+enemies only. Then enable Aim Assist with **Mouse movement** and hold right
 mouse near a visible enemy in the FOV circle.
 
 The scoreboard provides player-to-team information, not character ownership.
@@ -72,8 +72,10 @@ press F6, or a known enemy and press F7. Calibration uses normal raycasts plus
 body-box intersection and a small 16-pixel margin. It infers the complementary
 team only when exactly two groups exist. Recalibrate after changing team/server.
 
-Camera tracking runs after the normal camera update and does not require a
-mouse movement API. Optional Mouse movement reports missing or failing APIs.
+Mouse movement is the default tracking method after the user verified it works
+in a live match. Camera tracking selected targets but did not move the user's
+view, so it remains an optional alternative. Mouse movement reports missing or
+failing APIs.
 Sticky targets are rechecked for team and range. ESP uses verified player names
 when available; otherwise labels are Enemy, Teammate, or Unknown player rather
 than randomized model IDs. Real usernames cannot be recovered from model IDs
@@ -82,5 +84,5 @@ alone. Randomized body-part names use geometric head/torso fallbacks.
 Regression checks cover leaderboard parsing and expiry, verified ownership lookup,
 randomized 6/7-player groups, calibration, team filtering,
 activation modes, camera writes, mouse API failures, labels, and render cleanup
-using mocked game objects. Live Phantom Forces behavior still requires in-game
-verification. Troubleshooting identifies this revision as `pf-esp-7`.
+using mocked game objects. The user confirmed live F6 team calibration and
+mouse aiming work; automatic username/model lookup remains unverified. Troubleshooting identifies this revision as `pf-esp-8`.

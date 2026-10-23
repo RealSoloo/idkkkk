@@ -1,5 +1,5 @@
 -- Solos Hub game module: pf.lua
--- ESP revision: pf-esp-7 (shared team resolution + per-character rendering recovery)
+-- ESP revision: pf-esp-8 (shared team resolution + per-character rendering recovery)
 -- Loaded by the main hub script (picker -> loadstring). Do not run this file on its own.
 --
 -- Built to be low-profile: no teleporting, no speed, no hitboxes, no remote/metatable hooks, no getgc.
@@ -46,7 +46,7 @@ TabButtons["Phantom Forces"].Btn.LayoutOrder = -19
 filterTabs({ "Phantom Forces", "Dashboard", "Hub Chat", "Theme", "Settings" })
 
 local P = {
-	aim = false, mode = 1, aimMethod = 1, teamCheck = true, key = Enum.KeyCode.Unknown, part = 1, fov = 110, showFov = true, strength = 0.16, maxStep = 16,
+	aim = false, mode = 1, aimMethod = 2, teamCheck = true, key = Enum.KeyCode.Unknown, part = 1, fov = 110, showFov = true, strength = 0.16, maxStep = 16,
 	deadzone = 2, scale = 1, wall = true, maxDist = 700, sticky = true, humanize = true, delay = 0.12, jitter = 3,
 	trig = false, trigAds = true, trigMin = 0.05, trigMax = 0.12,
 	esp = false, box = true, names = true, dist = true, chams = false, tracers = false, showTeam = false, visColor = true, espMax = 1200,
@@ -965,7 +965,7 @@ task.spawn(function()
 			local unknown = 0
 			for _, e in ipairs(cache) do if e.enemy == nil then unknown = unknown + 1 end end
 			local err = P.espErr or P.scanErr
-			espRow.Text = "pf-esp-7 | Found " .. #cache .. " models (" .. #collect(false) .. " enemy, " .. unknown .. " unknown) | drawn " .. tostring(P.drawn or 0) .. " | failed " .. tostring(P.renderFailed or 0) .. (err and (" | ERROR: " .. err) or "")
+			espRow.Text = "pf-esp-8 | Found " .. #cache .. " models (" .. #collect(false) .. " enemy, " .. unknown .. " unknown) | drawn " .. tostring(P.drawn or 0) .. " | failed " .. tostring(P.renderFailed or 0) .. (err and (" | ERROR: " .. err) or "")
 		end
 		if statusRow then
 			statusRow.Text = "Enemies: " .. #collect(false) .. " | " .. (P.aimState or "off") ..
@@ -977,7 +977,7 @@ end)
 local function report()
 	local out = {}
 	local function add(s) table.insert(out, s) end
-	add("ESP revision: pf-esp-7")
+	add("ESP revision: pf-esp-8")
 	add(tostring(P.rosterStatus))
 	add(tostring(P.ownerStatus))
 	local faction, source = myFaction()
@@ -1043,7 +1043,7 @@ local Aim = Section(AimTab, "Aim Assist", "Tracks the enemy nearest your crossha
 tog(Aim, "Aim Assist", false, function(v) P.aim = v if not v then P.target = nil end end)
 Dropdown(Aim, "Tracking method", { "Camera tracking", "Mouse movement" }, P.aimMethod, function(i)
 	P.aimMethod, P.target = i, nil
-end, nil, "Camera tracking works without mousemoverel. Mouse movement requires a supported mouse API.")
+end, nil, "Mouse movement is the default verified in-game. Camera tracking is an optional alternative.")
 Dropdown(Aim, "Activation", AIM_MODES, P.mode, function(i) P.mode = i end, nil, "When the aim assist pulls")
 Keybind(Aim, "Aim Key (activation: Hold Key)", P.key, function(k) P.key = k end, true)
 Dropdown(Aim, "Aim At", AIM_PARTS, P.part, function(i) P.part = i end, nil, "Which body part to aim at")
