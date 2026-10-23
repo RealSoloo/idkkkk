@@ -6243,30 +6243,52 @@ do
 
 	-- downloads + runs a game script. returns true, or false + reason
 	function Hub.loadGameModule(g)
+		local function failed(stage, reason)
+			local message = stage .. ": " .. tostring(reason)
+			Hub.LastModuleError = { game = g.name or g.id, id = g.id, url = Hub.ModuleURLs[g.id], message = message }
+			warn("[Solos Hub module " .. tostring(g.id) .. "] " .. message)
+			return false, message
+		end
 		local src
 		local url = Hub.ModuleURLs[g.id]
 		if type(url) == "string" and url ~= "" then
-			local req = request or http_request or (syn and syn.request)
-			local okq, body = pcall(function()
-				if req then
-					local res = req({ Url = url, Method = "GET" })
-					if res.StatusCode and res.StatusCode ~= 200 then error("HTTP " .. tostring(res.StatusCode)) end
-					return res.Body
+			local req = type(request) == "function" and request or type(http_request) == "function" and http_request or (syn and syn.request)
+			local requestError = "request API unavailable"
+			if type(req) == "function" then
+				local okq, response = pcall(req, { Url = url, Method = "GET" })
+				if okq and type(response) == "table" then
+					local status = tonumber(response.StatusCode or response.Status)
+					if (status == nil or status == 200) and response.Success ~= false and type(response.Body) == "string" and response.Body:find("%S") then
+						src = response.Body
+					else
+						requestError = "HTTP " .. tostring(status or "unknown") .. " or empty response"
+					end
+				else
+					requestError = okq and "invalid response from request API" or tostring(response)
 				end
-				return game:HttpGet(url)
-			end)
-			if not okq or type(body) ~= "string" or body == "" then return false, "couldn't download the script (" .. tostring(body) .. ")" end
-			src = body
+			end
+			if not src then
+				local okh, response = pcall(function() return game:HttpGet(url, true) end)
+				if okh and type(response) == "string" and response:find("%S") then
+					src = response
+				else
+					return failed("download failed", "request: " .. requestError .. "; HttpGet: " .. tostring(response))
+				end
+			end
 		else
 			local f = Hub.path("mod_" .. g.id .. ".lua")
-			if canFile and isfile(f) then src = readfile(f) end
+			local okf, result = pcall(function() if canFile and isfile(f) then return readfile(f) end end)
+			if not okf then return failed("local file failed", result) end
+			src = result
 		end
-		if not src then return false, "no script URL set for " .. g.id .. " (Hub.ModuleURLs)" end
-		if type(loadstring) ~= "function" then return false, "this executor has no loadstring" end
-		local fn, cerr = loadstring(src, "=" .. g.id)
-		if not fn then return false, "script error: " .. tostring(cerr) end
+		if type(src) ~= "string" or not src:find("%S") then return failed("source missing", "no script URL or local file for " .. g.id) end
+		if type(loadstring) ~= "function" then return failed("compile unavailable", "this executor has no loadstring") end
+		local okc, fn, cerr = pcall(loadstring, src, "=" .. g.id)
+		if not okc then return failed("compile failed", fn) end
+		if type(fn) ~= "function" then return failed("compile failed", cerr) end
 		local okr, rerr = pcall(fn, Hub, S, T, C)
-		if not okr then return false, "script crashed: " .. tostring(rerr) end
+		if not okr then return failed("module initialization failed", rerr) end
+		Hub.LastModuleError = nil
 		return true
 	end
 
@@ -6491,6 +6513,15 @@ do
 			local okm, errm = Hub.loadGameModule(pick)
 			if not okm then
 				notify("Couldn't load " .. pick.name .. ": " .. tostring(errm) .. " - using Universal", T.Bad)
+				if Tabs["Dashboard"] then
+					local report = "Game: " .. pick.name .. "\nURL: " .. tostring(Hub.ModuleURLs[pick.id]) .. "\n" .. tostring(errm)
+					local issue = Section(Tabs["Dashboard"], "Game Module Load Failed", "Copy the error below to identify why the selected game could not load.")
+					new("TextBox", { Size = UDim2.new(1, -20, 0, 110), BackgroundColor3 = T.Bg, TextColor3 = T.Text,
+						Text = report, TextSize = 12, Font = Enum.Font.Code, TextWrapped = true, MultiLine = true,
+						ClearTextOnFocus = false, TextEditable = false, TextXAlignment = Enum.TextXAlignment.Left,
+						TextYAlignment = Enum.TextYAlignment.Top }, issue)
+					Button(issue, "Copy Module Error", "Copy", function() copyText(report) end)
+				end
 				Hub.currentGame = "universal"
 				pick = Hub.Games[1]
 			end

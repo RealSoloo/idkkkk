@@ -242,3 +242,14 @@ without a Motor6D support resizing but report that joint movement is unavailable
 Five mock regression tests cover R6/R15, ownership checks, relative edits, and
 cleanup (`PYTHONPATH=... python tests/test_body_editor.py`, with `lupa` installed).
 Full hub Luau parsing passes; live Roblox behavior still needs verification.
+
+### Game loading recovery
+
+The reported failure was an HTTP download error. The body editor is retained.
+The shared downloader now tries Roblox `HttpGet`
+if the executor request API fails or returns an empty/invalid response. All six
+game URLs remain unchanged. If download, compilation, or initialization fails,
+the Dashboard keeps a **Game Module Load Failed** card with **Copy Module Error**
+instead of relying only on a temporary notification. That report is needed to
+identify an executor-specific or live-game failure. Local checks cover both
+network methods and each failure stage; live loading remains unverified.
