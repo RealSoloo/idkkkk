@@ -25,8 +25,8 @@ long keys. Search, status filters, duration presets, permanent keys, reset,
 revoke, and F5 refresh remain available.
 
 If your local files are named `app.py` and `api.py`, keep those names and launch
-with `python app.py`. Keep `code_workspace.py` beside them. For editor updates,
-replace `code_workspace.py` and `requirements.txt`, then run
+with `python app.py`. Keep `code_workspace.py` and `lua_preview.py` beside them. For editor updates,
+replace `code_workspace.py`, `lua_preview.py`, and `requirements.txt`, then run
 `python -m pip install -r requirements.txt` before restarting.
 
 ## Local code workspace
@@ -88,6 +88,32 @@ the tab open. The app also remembers whether you last used Key Manager or Code W
 
 Run the editor checks with `python -m unittest discover -s tests -p test_code_workspace.py`.
 GUI checks require a display (for example Xvfb on headless Linux).
+
+## Visual Lua preview
+
+Click **Preview** in the editor toolbar to open a pane beside the code. Drag the
+vertical divider to resize it; **Hide preview** gives the space back to the
+editor. The choice is remembered between launches. Use **Example** in the preview
+to create a new, unsaved sample UI without replacing your current script.
+
+The preview refreshes after a short pause while editing Luau. It reads
+`Instance.new`, the hub's `new(class, props, parent)`, `Label` and `Row` helpers,
+and direct property assignments. Frames, labels, buttons, text boxes, scale/offset
+sizes and positions, anchor points, colors, visibility, corners, strokes, padding,
+and simple horizontal/vertical list layouts are approximated on a 720×480 canvas.
+Roblox image assets use placeholders. Click a previewed element to locate the
+line that created it.
+
+For Solos Hub game modules, `Hub.GamePanel`, `Panel.Sub`, `Section`, `Collapse`,
+`Button`, `Toggle`, `Slider`, `Dropdown`, `Input`, `Keybind`, and `InfoRow` produce
+an approximate control layout. Select a page in the preview dropdown; LT2's Wood,
+Logs, Plot, Shop, Tools, Vehicle, World, and Protection pages are supported.
+
+This is a static preview, not a Roblox runtime. It never executes Lua, callbacks,
+network requests, or game actions. Function-built/conditional/loop-created UI,
+complex expressions, constraints, clipping, rich-text formatting, and animations
+are not reproduced exactly. Runtime values use defaults; the pane reports partial
+or unsupported content. Use Roblox Studio for a full runtime preview.
 
 ## App icon
 

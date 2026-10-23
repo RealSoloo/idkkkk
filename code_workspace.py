@@ -18,6 +18,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 import customtkinter as ctk
+from lua_preview import LuaPreview, PreviewPlan, build_preview, EXAMPLE_SOURCE
 
 BG = "#10131E"
 FG = "#F0F2FA"
@@ -25,7 +26,7 @@ MUTED = "#9AA3BA"
 PURPLE = "#9B87F5"
 
 
-EDITOR_REVISION = "editor-4"
+EDITOR_REVISION = "editor-5"
 SESSION_PATH = Path.home() / ".solos_code_workspace.json"
 
 LANGUAGES = ["Luau", "Python", "JSON", "JavaScript", "Plain text"]
@@ -178,6 +179,7 @@ class EditorTab:
         self.workspace, self.document, self.title = workspace, document, title
         self.language = language_for(document.path)
         self.revision = 0
+        self.preview_result = None
         self.analysis_job = None
         self.problems = []
         self.notice = "Checking syntax…"
@@ -261,12 +263,16 @@ class EditorTab:
         source, language, revision = self.content(), self.language, self.revision
         # Workers only handle strings. Tk calls stay on the UI thread.
         results = self.workspace.analysis_results
+        preview_results = self.workspace.preview_results
+        make_preview = self.workspace.preview_enabled and language == "Luau"
         def work():
             try:
                 result = analyze_code(source, language)
             except Exception as error:
                 result = ([], [], "Checker unavailable: " + str(error))
             results.put((self, revision, result))
+            if make_preview:
+                preview_results.put((self, revision, build_preview(source)))
         threading.Thread(target=work, daemon=True).start()
 
     def apply_analysis(self, result):
@@ -317,6 +323,7 @@ class CodeWorkspace(ctk.CTkFrame):
         self.folder = None
         self.entries = []
         self.analysis_results = queue.Queue()
+        self.preview_results = queue.Queue()
         self.closing = False
         self.restoring = True
         self.session_job = None
@@ -327,6 +334,7 @@ class CodeWorkspace(ctk.CTkFrame):
         self.workspace_name = self.session.get("active", "")
         if self.workspace_name not in self.session["workspaces"]:
             self.workspace_name = next(iter(self.session["workspaces"]))
+        self.preview_enabled = bool(self.session.get("preview_enabled", False))
         self.font_size = self.session.get("font_size", 14)
         if self.font_size not in (12, 14, 16, 18, 20):
             self.font_size = 14
@@ -398,6 +406,9 @@ class CodeWorkspace(ctk.CTkFrame):
             ctk.CTkButton(toolbar, text=label, command=command, width=82, height=34,
                           fg_color=PURPLE if label == "Save" else "transparent", text_color=BG if label == "Save" else FG,
                           hover_color="#483B73", font=("Segoe UI", 13)).pack(side="left", padx=3, pady=10)
+        self.preview_button = ctk.CTkButton(toolbar, text="Preview", width=88, height=34,
+                                           fg_color="#302448", command=self.toggle_preview)
+        self.preview_button.pack(side="left", padx=3)
         self.font_menu = ctk.CTkOptionMenu(toolbar, values=["12", "14", "16", "18", "20"], width=66,
                                          fg_color="#242A3D", button_color="#242A3D", command=self.change_font_size)
         self.font_menu.set(str(self.font_size))
@@ -414,8 +425,14 @@ class CodeWorkspace(ctk.CTkFrame):
         self.language_menu = ctk.CTkOptionMenu(search, values=LANGUAGES, command=self.change_language, width=130,
                                               fg_color="#171B28", button_color="#242A3D")
         self.language_menu.pack(side="right", padx=12)
-        self.editor_content = tk.Frame(editor_area, bg=BG)
-        self.editor_content.pack(fill="both", expand=True)
+        self.editor_split = tk.PanedWindow(editor_area, orient="horizontal", bg="#2B3247", sashwidth=6, bd=0)
+        self.editor_split.pack(fill="both", expand=True)
+        self.editor_content = tk.Frame(self.editor_split, bg=BG)
+        self.editor_split.add(self.editor_content, minsize=250, width=600, stretch="always")
+        self.preview = LuaPreview(self.editor_split, self.select_preview_line, self.new_preview_example)
+        if self.preview_enabled:
+            self.editor_split.add(self.preview, minsize=320, width=420, stretch="always")
+            self.after_idle(self.balance_preview)
         self.empty_state = ctk.CTkFrame(self.editor_content, fg_color=BG, corner_radius=0)
         center = ctk.CTkFrame(self.empty_state, fg_color="transparent")
         center.place(relx=0.5, rely=0.45, anchor="center")
@@ -504,6 +521,7 @@ class CodeWorkspace(ctk.CTkFrame):
                      selected=list(self.tabs).index(self.notebook.select()) if self.active() else 0)
         self.session["active"] = self.workspace_name
         self.session["font_size"] = self.font_size
+        self.session["preview_enabled"] = self.preview_enabled
 
     def persist_session(self, notify=False):
         if self.restoring or self.closing:
@@ -699,7 +717,62 @@ class CodeWorkspace(ctk.CTkFrame):
                             self.update_status()
         except queue.Empty:
             pass
+        try:
+            while True:
+                tab, revision, plan = self.preview_results.get_nowait()
+                if str(tab.frame) in self.tabs and tab.revision == revision:
+                    tab.preview_result = (revision, plan)
+                    if self.active() is tab:
+                        self.refresh_preview()
+        except queue.Empty:
+            pass
         self.poll_job = self.after(100, self.poll_analysis)
+
+    def balance_preview(self):
+        if self.preview_enabled and self.editor_split.winfo_exists():
+            self.editor_split.sash_place(0, int(self.editor_split.winfo_width() * 0.55), 0)
+
+    def toggle_preview(self):
+        self.preview_enabled = not self.preview_enabled
+        if self.preview_enabled:
+            self.editor_split.add(self.preview, minsize=320, width=420, stretch="always")
+            self.after_idle(self.balance_preview)
+            if self.active():
+                self.active().schedule_analysis()
+        else:
+            self.editor_split.forget(self.preview)
+        self.preview_button.configure(text="Hide preview" if self.preview_enabled else "Preview")
+        self.refresh_preview()
+        self.schedule_session()
+
+    def refresh_preview(self):
+        if not self.preview_enabled:
+            return
+        tab = self.active()
+        if not tab or tab.language != "Luau":
+            self.preview.show(PreviewPlan(error="Open a Luau script or choose Example."), (id(tab), "unsupported"))
+        elif tab.preview_result and tab.preview_result[0] == tab.revision:
+            try:
+                self.preview.show(tab.preview_result[1], (id(tab), tab.revision))
+            except Exception as error:
+                self.preview.show(PreviewPlan(error="Preview could not draw this layout: " + str(error)), (id(tab), tab.revision, "error"))
+        else:
+            self.preview.show(PreviewPlan(error="Updating preview…"), (id(tab), tab.revision, "pending"))
+
+    def select_preview_line(self, line):
+        tab = self.active()
+        if tab:
+            index = "%d.0" % line
+            tab.text.mark_set("insert", index)
+            tab.text.see(index)
+            tab.text.focus_set()
+            self.update_status()
+
+    def new_preview_example(self):
+        tab = self.new()
+        tab.text.insert("1.0", EXAMPLE_SOURCE)
+        if not self.preview_enabled:
+            self.toggle_preview()
 
     def check_now(self):
         tab = self.active()
@@ -923,6 +996,7 @@ class CodeWorkspace(ctk.CTkFrame):
         if self.closing:
             return
         tab = self.active()
+        self.refresh_preview()
         if not tab:
             self.notebook.pack_forget()
             self.empty_state.pack(fill="both", expand=True)

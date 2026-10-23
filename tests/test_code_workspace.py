@@ -222,7 +222,7 @@ class GuiTests(unittest.TestCase):
         self.assertTrue(tab.text.tag_ranges("keyword"))
         with patch("code_workspace.messagebox.showinfo"):
             report = self.workspace.check_setup()
-        self.assertIn("editor-4", report)
+        self.assertIn("editor-5", report)
         self.assertIn("Luau color test: PASS", report)
         self.assertIn("Luau error test: PASS", report)
         self.assertNotIn("local x = )", report)
@@ -334,6 +334,52 @@ class GuiTests(unittest.TestCase):
             self.assertEqual(saved_icon.read_bytes(), icon_path.read_bytes())
             self.assertTrue(hasattr(app, "_icon_image"))
             self.assertEqual(app.load_config()["icon_path"], str(saved_icon))
+
+    def test_preview_refresh_and_source_navigation(self):
+        from lua_preview import EXAMPLE_SOURCE
+        ws = self.workspace
+        tab = ws.active()
+        tab.text.insert("1.0", EXAMPLE_SOURCE)
+        ws.toggle_preview()
+        self.root.update()
+        deadline = time.monotonic() + 5
+        while not tab.preview_result and time.monotonic() < deadline:
+            self.root.update()
+            time.sleep(0.02)
+        self.assertIsNotNone(tab.preview_result)
+        self.assertEqual(len(ws.preview.plan.elements), 5)
+        self.assertTrue(ws.preview.locations)
+        text_items = [ws.preview.canvas.itemcget(i, "text") for i in ws.preview.canvas.find_all()
+                      if ws.preview.canvas.type(i) == "text"]
+        self.assertIn("Get started", text_items)
+        index = tab.text.search("Get started", "1.0", stopindex="end")
+        tab.text.delete(index, index + "+11c")
+        tab.text.insert(index, "Updated live")
+        self.root.update()
+        deadline = time.monotonic() + 5
+        while (not tab.preview_result or tab.preview_result[0] != tab.revision) and time.monotonic() < deadline:
+            self.root.update()
+            time.sleep(0.02)
+        text_items = [ws.preview.canvas.itemcget(i, "text") for i in ws.preview.canvas.find_all()
+                      if ws.preview.canvas.type(i) == "text"]
+        self.assertIn("Updated live", text_items)
+        ws.select_preview_line(10)
+        self.assertEqual(tab.text.index("insert"), "10.0")
+        ws.toggle_preview()
+        self.assertFalse(ws.preview_enabled)
+
+    def test_preview_hub_page_switching(self):
+        from lua_preview import build_preview
+        ws = self.workspace
+        plan = build_preview(Path("Lt2.txt").read_text())
+        ws.preview.show(plan, "lt2")
+        self.assertEqual(ws.preview.pages.get(), "Wood")
+        ws.preview.pages.set("Protection")
+        ws.preview.draw()
+        text_items = [ws.preview.canvas.itemcget(i, "text") for i in ws.preview.canvas.find_all()
+                      if ws.preview.canvas.type(i) == "text"]
+        self.assertNotIn("Auto Chop", text_items)
+        self.assertTrue(ws.preview.locations)
 
     def test_large_script(self):
         text = "local example = 'a line of Lua'\n" * 17000
