@@ -1,5 +1,5 @@
 -- Solos Hub game module: pf.lua
--- ESP revision: pf-esp-3 (shared team resolution + per-character rendering recovery)
+-- ESP revision: pf-esp-4 (shared team resolution + per-character rendering recovery)
 -- Loaded by the main hub script (picker -> loadstring). Do not run this file on its own.
 --
 -- Built to be low-profile: no teleporting, no speed, no hitboxes, no remote/metatable hooks, no getgc.
@@ -49,7 +49,7 @@ local P = {
 	deadzone = 2, scale = 1, wall = true, maxDist = 700, sticky = true, humanize = true, delay = 0.12, jitter = 3,
 	trig = false, trigAds = true, trigMin = 0.05, trigMax = 0.12,
 	esp = false, box = true, names = true, dist = true, chams = false, tracers = false, showTeam = false, visColor = true, espMax = 1200,
-	radar = false, radarRange = 250, alert = false, alertDist = 60,
+	radar = false, radarRange = 250, alert = false, alertDist = 60, teamMode = 1,
 	target = nil, targetSince = 0, offset = Vector3.zero,
 }
 local AIM_PARTS = { "Head", "Torso", "Closest" }
@@ -113,31 +113,65 @@ local function addTeamName(set, value)
 		end
 	end
 end
+local function factionOf(value)
+	local key = teamKey(value)
+	for faction, names in pairs(TEAM_ALIASES) do
+		for _, name in ipairs(names) do
+			if key == teamKey(name) then return faction end
+		end
+	end
+	return nil
+end
+local function playerFaction(pl)
+	if pl.Team then
+		local faction = factionOf(pl.Team.Name)
+		if faction then return faction end
+		if pl.Team.TeamColor then
+			faction = factionOf(pl.Team.TeamColor.Name)
+			if faction then return faction end
+		end
+	end
+	if not pl.Neutral and pl.TeamColor then return factionOf(pl.TeamColor.Name) end
+	return nil
+end
+local function folderFaction(m, root)
+	local cur = m.Parent
+	while cur and cur ~= root and cur ~= Workspace do
+		local faction = factionOf(cur.Name)
+		if faction then return faction, cur.Name end
+		cur = cur.Parent
+	end
+	return nil
+end
+local function myFaction()
+	if P.teamMode == 2 then return "phantoms", "manual" end
+	if P.teamMode == 3 then return "ghosts", "manual" end
+	local faction = playerFaction(LocalPlayer)
+	if faction then return faction, "player team" end
+	local character, root = LocalPlayer.Character, playersRoot()
+	if character and root and character:IsDescendantOf(root) then
+		faction = folderFaction(character, root)
+		if faction then return faction, "local character folder" end
+	end
+	return nil, "unresolved - select Your team on the ESP tab"
+end
 local function myTeamNames()
 	local set = {}
-	if LocalPlayer.TeamColor then addTeamName(set, LocalPlayer.TeamColor.Name) end
-	local team = LocalPlayer.Team
-	if team then
-		addTeamName(set, team.Name)
-		if team.TeamColor then addTeamName(set, team.TeamColor.Name) end
-	end
-	return set
-end
-local function playerTeamNames(pl)
-	local set = {}
-	if pl.Team then
-		addTeamName(set, pl.Team.Name)
-		if pl.Team.TeamColor then addTeamName(set, pl.Team.TeamColor.Name) end
-	elseif not pl.Neutral and pl.TeamColor then
-		addTeamName(set, pl.TeamColor.Name)
+	local faction = myFaction()
+	if faction then
+		addTeamName(set, faction)
+	else
+		if LocalPlayer.Team then addTeamName(set, LocalPlayer.Team.Name) end
+		if not LocalPlayer.Neutral and LocalPlayer.TeamColor then
+			addTeamName(set, LocalPlayer.TeamColor.Name)
+		end
 	end
 	return set
 end
 local function sameKnownTeam(pl)
-	local mine, theirs = playerTeamNames(LocalPlayer), playerTeamNames(pl)
-	if next(mine) == nil or next(theirs) == nil then return nil end
-	for name in pairs(theirs) do if mine[name] then return true end end
-	return false
+	local mine, theirs = myFaction(), playerFaction(pl)
+	if not mine or not theirs then return nil end
+	return mine == theirs
 end
 local function modelPlayer(m)
 	local pl = Players:GetPlayerFromCharacter(m) or Players:FindFirstChild(m.Name)
@@ -154,6 +188,8 @@ local cache, cacheSet = {}, {}
 local function scan(loose)
 	P.scanErr = nil
 	local root, mine = playersRoot(), myTeamNames()
+	local faction, source = myFaction()
+	P.teamFaction, P.teamSource = faction, source
 	if loose and not root then return end
 	local base = root or Workspace
 	local found, set, hasMine = {}, {}, false
@@ -172,17 +208,18 @@ local function scan(loose)
 			local enemy = nil
 			local pl = modelPlayer(d)
 			if pl == LocalPlayer then return end
-			-- Character ownership is stronger evidence than a containing folder.
+			local modelFaction, factionFolder = folderFaction(d, root)
+			if factionFolder then folderName = factionFolder end
+			-- A manual faction selection works even when Roblox Player.Team is
+			-- unset, and does not need our faction's folder to contain a player.
 			local same = nil
 			if pl then same = sameKnownTeam(pl) end
 			if same ~= nil then
 				enemy = not same
+			elseif faction and modelFaction then
+				enemy = faction ~= modelFaction
 			elseif hasMine then
 				enemy = not mine[teamKey(folderName)]
-			else
-				-- No matching local team folder: keep the relationship unknown.
-				-- The previous `enemy = true` fallback targeted teammates too.
-				enemy = nil
 			end
 			local e = { m = d, enemy = enemy, player = pl, folder = folderName }
 			table.insert(found, e)
@@ -192,10 +229,10 @@ local function scan(loose)
 	end
 	cache, cacheSet = found, set
 end
-local function collect(includeTeam)
+local function collect(includeTeam, includeUnknown)
 	local out = {}
 	for _, e in ipairs(cache) do
-		if e.m.Parent and (e.enemy or includeTeam or P.allEnemy) then table.insert(out, e) end
+		if e.m.Parent and (e.enemy or includeTeam or P.allEnemy or (includeUnknown and e.enemy == nil)) then table.insert(out, e) end
 	end
 	return out
 end
@@ -215,7 +252,7 @@ local function refreshFilter()
 	local ig = Workspace:FindFirstChild("Ignore")
 	if ig then table.insert(list, ig) end
 	for _, e in ipairs(cache) do
-		if not e.enemy and e.m.Parent then table.insert(list, e.m) end
+		if e.enemy == false and e.m.Parent then table.insert(list, e.m) end
 	end
 	if LocalPlayer.Character then table.insert(list, LocalPlayer.Character) end
 	rp.FilterDescendantsInstances = list
@@ -456,7 +493,7 @@ local function updateEsp()
 	end
 	local seen = {}
 	if P.esp then
-		for _, e in ipairs(collect(P.showTeam)) do
+		for _, e in ipairs(collect(P.showTeam, true)) do
 			seen[e.m] = true
 			local ok, drawn = pcall(drawModel, c, e)
 			if ok then
@@ -553,14 +590,18 @@ task.spawn(function() -- keep the character list fresh
 		task.wait(playersRoot() and 0.4 or 1.5)
 	end
 end)
-local statusRow, espRow
+local statusRow, espRow, teamRow
 task.spawn(function()
 	while Live.Running do
+		if teamRow then
+			local faction, source = myFaction()
+			teamRow.Text = "Your team: " .. (faction or "unknown") .. " | " .. source
+		end
 		if espRow then
 			local unknown = 0
 			for _, e in ipairs(cache) do if e.enemy == nil then unknown = unknown + 1 end end
 			local err = P.espErr or P.scanErr
-			espRow.Text = "pf-esp-3 | Found " .. #cache .. " models (" .. #collect(false) .. " enemy, " .. unknown .. " unknown) | drawn " .. tostring(P.drawn or 0) .. " | failed " .. tostring(P.renderFailed or 0) .. (err and (" | ERROR: " .. err) or "")
+			espRow.Text = "pf-esp-4 | Found " .. #cache .. " models (" .. #collect(false) .. " enemy, " .. unknown .. " unknown) | drawn " .. tostring(P.drawn or 0) .. " | failed " .. tostring(P.renderFailed or 0) .. (err and (" | ERROR: " .. err) or "")
 		end
 		if statusRow then
 			local state = "idle"
@@ -573,7 +614,9 @@ end)
 local function report()
 	local out = {}
 	local function add(s) table.insert(out, s) end
-	add("ESP revision: pf-esp-3")
+	add("ESP revision: pf-esp-4")
+	local faction, source = myFaction()
+	add("selected team mode=" .. tostring(P.teamMode) .. " faction=" .. tostring(faction) .. " source=" .. source)
 	add("scan error=" .. tostring(P.scanErr) .. " render error=" .. tostring(P.espErr))
 	add("enabled=" .. tostring(P.esp) .. " showTeam=" .. tostring(P.showTeam) .. " maxDistance=" .. tostring(P.espMax) .. " drawn=" .. tostring(P.drawn or 0))
 	add("PlaceId " .. game.PlaceId .. " | team " .. tostring(LocalPlayer.Team and LocalPlayer.Team.Name) .. " | teamcolor " .. LocalPlayer.TeamColor.Name)
@@ -632,6 +675,7 @@ Dropdown(Aim, "Activation", AIM_MODES, P.mode, function(i) P.mode = i end, nil, 
 Keybind(Aim, "Aim Key (activation: Hold Key)", P.key, function(k) P.key = k end, true)
 Dropdown(Aim, "Aim At", AIM_PARTS, P.part, function(i) P.part = i end, nil, "Which body part to aim at")
 tog(Aim, "Show FOV Circle", true, function(v) P.showFov = v end)
+InfoRow(Aim, "If no enemies are detected, select Your team on the ESP tab.")
 local AimOpt = Collapse(Aim, "Settings")
 Slider(AimOpt, "FOV (px) - smaller = less obvious", 20, 400, 110, function(v) P.fov = v end, "pffov")
 Slider(AimOpt, "Smoothness (lower = slower / more human)", 2, 60, 16, function(v) P.strength = v / 100 end, "pfstrength")
@@ -672,6 +716,15 @@ bind(UIS.InputBegan, function(i, gp)
 end)
 
 -- ====================================================== UI : Phantom ESP tab
+local TeamSetup = Section(EspTab3, "Team Detection", "Used by both ESP and aim assist", "players")
+Dropdown(TeamSetup, "Your team", { "Auto", "Phantoms", "Ghosts" }, P.teamMode, function(i)
+	P.teamMode = i
+	P.target, P.targetSince = nil, 0
+	scan(false)
+	if #cache == 0 then scan(true) end
+end, nil, "If Auto cannot detect your team, select the faction you are playing on. Update it when you switch teams.")
+teamRow = InfoRow(TeamSetup, "Your team: checking...")
+InfoRow(TeamSetup, "Gray ESP = unknown team. Unknown players are displayed but not aimed at.")
 local E = Section(EspTab3, "Enemy ESP", "Drawn only on your screen", "esp")
 tog(E, "Enable ESP", false, function(v) P.esp = v if not v then clearEsp() end end)
 local EOpt = Collapse(E, "Options")

@@ -34,9 +34,15 @@ The icon sprite sheet still loads from its original SolosHub repository.
 Update these same files in place for later releases. Reload the hub after
 updating a module. Updating a file does not change an already running session.
 
-`Pf.txt` includes the pf-esp-3 update: shared team resolution for ESP and aim
-assist, Phantoms/Ghosts and blue/orange folder aliases, and safer rendering.
-Leave **Treat Everyone As Enemy** off to use team filtering. Unresolved teams
-are excluded from targeting instead of automatically treated as enemies.
-Logic checks passed; behavior inside a live Phantom Forces match has not been
-verified in this environment.
+`Pf.txt` includes the pf-esp-4 update. ESP and aim assist share team detection.
+If Roblox does not expose your faction, open **ESP → Team Detection → Your
+team** and select **Phantoms** or **Ghosts**. Update that selection after
+switching teams. Auto uses available player or local-character folder data.
+Unknown-team models remain visible in gray ESP but are excluded from aim
+assist until their relationship can be resolved. Leave **Treat Everyone As
+Enemy** off to keep team filtering.
+
+The update handles nested faction folders and servers where only opponents
+have a replicated faction folder. Team logic and rendering regression checks
+passed with mocked game objects. Live Phantom Forces behavior still requires
+in-game verification. The troubleshooting row identifies this as `pf-esp-4`.
