@@ -1,5 +1,5 @@
 -- Solos Hub game module: pf.lua
--- ESP revision: pf-esp-9 (shared team resolution + per-character rendering recovery)
+-- ESP revision: pf-esp-10 (shared team resolution + per-character rendering recovery)
 -- Loaded by the main hub script (picker -> loadstring). Do not run this file on its own.
 --
 -- Built to be low-profile: no teleporting, no speed, no hitboxes, no remote/metatable hooks, no getgc.
@@ -50,7 +50,7 @@ local P = {
 	deadzone = 2, scale = 1, wall = true, maxDist = 700, sticky = true, humanize = true, delay = 0.12, jitter = 3,
 	trig = false, trigAds = true, trigMin = 0.05, trigMax = 0.12,
 	esp = false, box = true, names = true, dist = true, chams = false, tracers = false, showTeam = false, visColor = true, espMax = 1200,
-	radar = false, radarRange = 250, alert = false, alertDist = 60, teamMode = 1, autoTeam = true,
+	radar = false, radarRange = 250, alert = false, alertDist = 60, teamMode = 1,
 	target = nil, targetSince = 0, offset = Vector3.zero,
 }
 local AIM_PARTS = { "Head", "Torso", "Closest" }
@@ -593,17 +593,21 @@ local function nativeCrosshairRelation(c)
 			end
 		end
 	end
-	if not found then return nil, "Waiting for game Friendly text near crosshair" end
-	if relation then return nil, "Enemy indicator ignored - center a teammate to detect teams" end
+	if not found then return nil, "Team detection: briefly look at a teammate" end
+	if relation then return nil, "Team detection: waiting for a teammate" end
 	return false
 end
 local function updateAutoTeam()
-	if not P.autoTeam then resetAutoCandidate() P.autoTeamStatus = "Automatic team detection off" return end
 	if Live.BindingActive or not Live.Unlocked or UIS:GetFocusedTextBox() then resetAutoCandidate() return end
 	local c = cam()
 	if not c then resetAutoCandidate() return end
 	local relation, reason = nativeCrosshairRelation(c)
-	if relation == nil then resetAutoCandidate() P.autoTeamStatus = reason return end
+	if relation == nil then
+		resetAutoCandidate()
+		calibratedEnemy(nil) -- discard references to groups removed by the game
+		P.autoTeamStatus = (P.myGroup or P.enemyGroup) and "Team check ready" or reason
+		return
+	end
 	local entry = calibrationCandidate(c)
 	if not entry or not entry.group then
 		resetAutoCandidate() P.autoTeamStatus = "HUD indicator found; waiting for a body under crosshair" return
@@ -745,7 +749,7 @@ local function updateAim(dt)
 				for _, entry in ipairs(cache) do
 					if entry.enemy == nil then unresolved = true break end
 				end
-				P.aimState = unresolved and "waiting for Friendly HUD detection; F6 is a manual fallback" or
+				P.aimState = unresolved and "team detection: briefly look at a teammate" or
 					(not faction and "select Your team on ESP tab" or "no confirmed visible enemy in FOV / range")
 			end
 		return
@@ -1037,7 +1041,7 @@ end)
 local statusRow, espRow, teamRow, rosterRow, ownerRow, autoTeamRow
 task.spawn(function()
 	while Live.Running do
-		if autoTeamRow then autoTeamRow.Text = P.autoTeamStatus or "Watching game Friendly indicator" end
+		if autoTeamRow then autoTeamRow.Text = P.autoTeamStatus or "Team detection is automatic - briefly look at a teammate" end
 		if rosterRow then rosterRow.Text = P.rosterStatus or "Open the game's leaderboard to read teams" end
 		if ownerRow then ownerRow.Text = P.ownerStatus or "Checking model ownership..." end
 		if teamRow then
@@ -1049,7 +1053,7 @@ task.spawn(function()
 			local unknown = 0
 			for _, e in ipairs(cache) do if e.enemy == nil then unknown = unknown + 1 end end
 			local err = P.espErr or P.scanErr
-			espRow.Text = "pf-esp-9 | Found " .. #cache .. " models (" .. #collect(false) .. " enemy, " .. unknown .. " unknown) | drawn " .. tostring(P.drawn or 0) .. " | failed " .. tostring(P.renderFailed or 0) .. (err and (" | ERROR: " .. err) or "")
+			espRow.Text = "pf-esp-10 | Found " .. #cache .. " models (" .. #collect(false) .. " enemy, " .. unknown .. " unknown) | drawn " .. tostring(P.drawn or 0) .. " | failed " .. tostring(P.renderFailed or 0) .. (err and (" | ERROR: " .. err) or "")
 		end
 		if statusRow then
 			statusRow.Text = "Enemies: " .. #collect(false) .. " | " .. (P.aimState or "off") ..
@@ -1061,8 +1065,8 @@ end)
 local function report()
 	local out = {}
 	local function add(s) table.insert(out, s) end
-	add("ESP revision: pf-esp-9")
-	add("auto team=" .. tostring(P.autoTeam) .. " status=" .. tostring(P.autoTeamStatus) .. " source=" .. tostring(P.calibrationSource))
+	add("ESP revision: pf-esp-10")
+	add("built-in team detection status=" .. tostring(P.autoTeamStatus) .. " source=" .. tostring(P.calibrationSource))
 	add(tostring(P.rosterStatus))
 	add(tostring(P.ownerStatus))
 	local faction, source = myFaction()
@@ -1184,11 +1188,7 @@ Dropdown(TeamSetup, "Your team", { "Auto", "Phantoms", "Ghosts" }, P.teamMode, f
 	if #cache == 0 then scan(true) end
 end, nil, "If Auto cannot detect your team, select the faction you are playing on. Update it when you switch teams.")
 teamRow = InfoRow(TeamSetup, "Your team: checking...")
-tog(TeamSetup, "Automatic Team Detection", true, function(v)
-	P.autoTeam = v
-	resetAutoCandidate()
-end, "Briefly center a teammate while the game displays Friendly. Enemy indicators never calibrate teams.")
-autoTeamRow = InfoRow(TeamSetup, "Watching game Friendly indicator")
+autoTeamRow = InfoRow(TeamSetup, "Team detection is automatic - briefly look at a teammate")
 rosterRow = InfoRow(TeamSetup, "Open the game's leaderboard to read teams")
 ownerRow = InfoRow(TeamSetup, "Checking model ownership...")
 InfoRow(TeamSetup, "Open the game leaderboard to refresh its team roster. Automatic names require a verified model-owner link.")

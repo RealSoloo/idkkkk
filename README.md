@@ -34,13 +34,14 @@ The icon sprite sheet still loads from its original SolosHub repository.
 Update these same files in place for later releases. Reload the hub after
 updating a module. Updating a file does not change an already running session.
 
-`Pf.txt` includes the pf-esp-9 update.
+`Pf.txt` includes the pf-esp-10 update.
 
 ### Automatic teammate calibration
 
-**ESP → Team Detection → Automatic Team Detection** is on by default. Briefly
-center a teammate until the game itself displays **Friendly** for about 0.2
-seconds. The module uses that native HUD indicator and the existing crosshair
+Team detection is built into Phantom Forces and runs automatically; there is
+no toggle or configuration step. When the crosshair briefly passes over a
+teammate and the game displays **Friendly** for about 0.2 seconds, it calibrates
+the team groups. The module uses that native HUD indicator and the existing crosshair
 body picker to calibrate the teammate group automatically; no F6 press is needed.
 **Enemy** text never calibrates a group. Conflicting or hidden indicators, this
 hub's own labels, and text away from the crosshair are excluded. Changing the
@@ -102,4 +103,4 @@ Regression checks cover leaderboard parsing and expiry, verified ownership looku
 randomized 6/7-player groups, calibration, team filtering,
 activation modes, camera writes, mouse API failures, labels, and render cleanup
 using mocked game objects. The user confirmed live F6 team calibration and
-mouse aiming work; automatic username/model lookup remains unverified. Troubleshooting identifies this revision as `pf-esp-9`.
+mouse aiming work; automatic username/model lookup remains unverified. Troubleshooting identifies this revision as `pf-esp-10`.
