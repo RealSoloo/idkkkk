@@ -34,7 +34,7 @@ The icon sprite sheet still loads from its original SolosHub repository.
 Update these same files in place for later releases. Reload the hub after
 updating a module. Updating a file does not change an already running session.
 
-`Pf.txt` includes the pf-esp-5 update.
+`Pf.txt` includes the pf-esp-6 update.
 
 ### Phantom Forces setup
 
@@ -53,9 +53,13 @@ updating a module. Updating a file does not change an already running session.
 Auto team detection recognizes known faction colors even when `Player.Team`
 is nil. The Your team dropdown can specify a faction, but faction names alone
 cannot identify randomized folders; use the calibration keys in that case.
-Calibration requires a direct raycast hit on a visible player. If no player is
-hit, it reports that and leaves existing calibration unchanged. It infers the
-complementary team only when exactly two groups exist.
+Calibration first uses a normal raycast. If the game's visible body parts do not
+participate in raycasts, it checks the screen-center ray against their body boxes
+directly and permits a small 16-pixel margin around body-part centers. Place the
+known player's body at the center of the screen, then press F6 or F7; merely
+having them somewhere on screen is insufficient. Overlapping body hits choose
+the nearest character. Failed selections leave existing calibration unchanged.
+It infers the complementary team only when exactly two groups exist.
 
 Camera tracking runs after the normal camera update and does not require a
 mouse movement API. Optional Mouse movement reports missing or failing APIs.
@@ -67,4 +71,4 @@ alone. Randomized body-part names use geometric head/torso fallbacks.
 Regression checks cover randomized 6/7-player groups, calibration, team filtering,
 activation modes, camera writes, mouse API failures, labels, and render cleanup
 using mocked game objects. Live Phantom Forces behavior still requires in-game
-verification. Troubleshooting identifies this revision as `pf-esp-5`.
+verification. Troubleshooting identifies this revision as `pf-esp-6`.

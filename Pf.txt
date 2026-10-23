@@ -1,5 +1,5 @@
 -- Solos Hub game module: pf.lua
--- ESP revision: pf-esp-5 (shared team resolution + per-character rendering recovery)
+-- ESP revision: pf-esp-6 (shared team resolution + per-character rendering recovery)
 -- Loaded by the main hub script (picker -> loadstring). Do not run this file on its own.
 --
 -- Built to be low-profile: no teleporting, no speed, no hitboxes, no remote/metatable hooks, no getgc.
@@ -305,6 +305,52 @@ local function collectEsp()
 	end
 	return out
 end
+-- Calibration must not depend on CanQuery: replicated PF body parts can be
+-- visible but absent from Workspace:Raycast results. Intersect the center ray
+-- with their oriented boxes directly, then allow a small screen-space margin.
+local function bodyRayDistance(part, origin, direction, limit)
+	local o = part.CFrame:PointToObjectSpace(origin)
+	local d = part.CFrame:VectorToObjectSpace(direction)
+	local near, far = 0, limit
+	for _, axis in ipairs({ "X", "Y", "Z" }) do
+		local half = part.Size[axis] / 2
+		if math.abs(d[axis]) < 1e-8 then
+			if o[axis] < -half or o[axis] > half then return nil end
+		else
+			local a, b = (-half - o[axis]) / d[axis], (half - o[axis]) / d[axis]
+			if a > b then a, b = b, a end
+			near, far = math.max(near, a), math.min(far, b)
+			if near > far then return nil end
+		end
+	end
+	return near
+end
+local function calibrationCandidate(c)
+	if not c.ViewportSize then return nil end
+	local center = Vector2.new(c.ViewportSize.X / 2, c.ViewportSize.Y / 2)
+	local ray = c:ViewportPointToRay(center.X, center.Y)
+	local best, bestDistance, close, closePixels, closeDepth = nil, P.espMax, nil, 16, math.huge
+	for _, entry in ipairs(cache) do
+		if entry.group and entry.m.Parent then
+			-- Ignore nested weapon/accessory geometry. Only the direct body parts
+			-- count; their names and query/collision flags do not matter.
+			for _, part in ipairs(entry.m:GetChildren()) do
+				if part:IsA("BasePart") then
+					local ok, distance = pcall(bodyRayDistance, part, ray.Origin, ray.Direction, P.espMax)
+					if ok and distance and distance < bestDistance then best, bestDistance = entry, distance end
+					local sp, on = c:WorldToViewportPoint(part.Position)
+					if on and sp.Z > 0 and sp.Z <= P.espMax then
+						local pixels = (Vector2.new(sp.X, sp.Y) - center).Magnitude
+						if pixels < closePixels or (pixels == closePixels and sp.Z < closeDepth) then
+							close, closePixels, closeDepth = entry, pixels, sp.Z
+						end
+					end
+				end
+			end
+		end
+	end
+	return best or close
+end
 local function calibrateTeam(isEnemy)
 	local c = cam()
 	if not c then return notify("Camera is not ready", T.Warn) end
@@ -324,8 +370,10 @@ local function calibrateTeam(isEnemy)
 		if cacheSet[cur] then entry = cacheSet[cur] break end
 		cur = cur.Parent
 	end
+	if not entry or not entry.group then entry = calibrationCandidate(c) end
 	if not entry or not entry.group then
-		return notify("Aim directly at a visible player, then press the calibration key", T.Warn)
+		return notify(#cache == 0 and "No character models found yet - deploy and try again" or
+			"Put a player's body at the center of the screen, then press F6 or F7", T.Warn)
 	end
 	P.myGroup, P.enemyGroup = nil, nil
 	if isEnemy then P.enemyGroup = entry.group else P.myGroup = entry.group end
@@ -751,7 +799,7 @@ task.spawn(function()
 			local unknown = 0
 			for _, e in ipairs(cache) do if e.enemy == nil then unknown = unknown + 1 end end
 			local err = P.espErr or P.scanErr
-			espRow.Text = "pf-esp-5 | Found " .. #cache .. " models (" .. #collect(false) .. " enemy, " .. unknown .. " unknown) | drawn " .. tostring(P.drawn or 0) .. " | failed " .. tostring(P.renderFailed or 0) .. (err and (" | ERROR: " .. err) or "")
+			espRow.Text = "pf-esp-6 | Found " .. #cache .. " models (" .. #collect(false) .. " enemy, " .. unknown .. " unknown) | drawn " .. tostring(P.drawn or 0) .. " | failed " .. tostring(P.renderFailed or 0) .. (err and (" | ERROR: " .. err) or "")
 		end
 		if statusRow then
 			statusRow.Text = "Enemies: " .. #collect(false) .. " | " .. (P.aimState or "off") ..
@@ -763,7 +811,7 @@ end)
 local function report()
 	local out = {}
 	local function add(s) table.insert(out, s) end
-	add("ESP revision: pf-esp-5")
+	add("ESP revision: pf-esp-6")
 	local faction, source = myFaction()
 	add("calibrated teammate group=" .. tostring(P.myGroup and P.myGroup.Name) .. " enemy group=" .. tostring(P.enemyGroup and P.enemyGroup.Name))
 	add("selected team mode=" .. tostring(P.teamMode) .. " faction=" .. tostring(faction) .. " source=" .. source)
@@ -882,7 +930,7 @@ Dropdown(TeamSetup, "Your team", { "Auto", "Phantoms", "Ghosts" }, P.teamMode, f
 	if #cache == 0 then scan(true) end
 end, nil, "If Auto cannot detect your team, select the faction you are playing on. Update it when you switch teams.")
 teamRow = InfoRow(TeamSetup, "Your team: checking...")
-InfoRow(TeamSetup, "Randomized team names? Aim at a known teammate and press F6, or an enemy and press F7.")
+InfoRow(TeamSetup, "Randomized teams? Center a known teammate on screen and press F6, or an enemy and press F7.")
 P.markAllyKey, P.markEnemyKey = Enum.KeyCode.F6, Enum.KeyCode.F7
 Keybind(TeamSetup, "Mark teammate under crosshair", P.markAllyKey, function(k) P.markAllyKey = k end, true)
 Keybind(TeamSetup, "Mark enemy under crosshair", P.markEnemyKey, function(k) P.markEnemyKey = k end, true)
