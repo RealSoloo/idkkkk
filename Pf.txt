@@ -1,5 +1,5 @@
 -- Solos Hub game module: pf.lua
--- ESP revision: pf-esp-8 (shared team resolution + per-character rendering recovery)
+-- ESP revision: pf-esp-9 (shared team resolution + per-character rendering recovery)
 -- Loaded by the main hub script (picker -> loadstring). Do not run this file on its own.
 --
 -- Built to be low-profile: no teleporting, no speed, no hitboxes, no remote/metatable hooks, no getgc.
@@ -50,7 +50,7 @@ local P = {
 	deadzone = 2, scale = 1, wall = true, maxDist = 700, sticky = true, humanize = true, delay = 0.12, jitter = 3,
 	trig = false, trigAds = true, trigMin = 0.05, trigMax = 0.12,
 	esp = false, box = true, names = true, dist = true, chams = false, tracers = false, showTeam = false, visColor = true, espMax = 1200,
-	radar = false, radarRange = 250, alert = false, alertDist = 60, teamMode = 1,
+	radar = false, radarRange = 250, alert = false, alertDist = 60, teamMode = 1, autoTeam = true,
 	target = nil, targetSince = 0, offset = Vector3.zero,
 }
 local AIM_PARTS = { "Head", "Torso", "Closest" }
@@ -515,6 +515,16 @@ local function calibrationCandidate(c)
 	end
 	return best or close
 end
+local function applyTeamCalibration(entry, isEnemy, source)
+	if not entry or not entry.group or entry.group.Parent ~= playersRoot() then return false end
+	P.myGroup, P.enemyGroup = nil, nil
+	if isEnemy then P.enemyGroup = entry.group else P.myGroup = entry.group end
+	P.calibrationSource = source
+	P.target = nil
+	scan(false)
+	if #cache == 0 then scan(true) end
+	return true
+end
 local function calibrateTeam(isEnemy)
 	local c = cam()
 	if not c then return notify("Camera is not ready", T.Warn) end
@@ -539,12 +549,78 @@ local function calibrateTeam(isEnemy)
 		return notify(#cache == 0 and "No character models found yet - deploy and try again" or
 			"Put a player's body at the center of the screen, then press F6 or F7", T.Warn)
 	end
-	P.myGroup, P.enemyGroup = nil, nil
-	if isEnemy then P.enemyGroup = entry.group else P.myGroup = entry.group end
-	P.target = nil
-	scan(false)
-	if #cache == 0 then scan(true) end
+	applyTeamCalibration(entry, isEnemy, "manual")
 	notify(isEnemy and "Enemy group marked - team check updated" or "Teammate group marked - team check updated", T.Good)
+end
+-- Use the game's own crosshair relation text, never our ESP labels, menu
+-- controls, scoreboard roster, model IDs, or an assumed first target.
+local hintLabels, hintsChecked = {}, -math.huge
+local pendingGroup, pendingModel, pendingRelation, pendingAt
+local function resetAutoCandidate()
+	pendingGroup, pendingModel, pendingRelation, pendingAt = nil, nil, nil, nil
+end
+local function nativeCrosshairRelation(c)
+	if not PlayerGui then return nil, "PlayerGui unavailable" end
+	if os.clock() - hintsChecked >= 1 then
+		hintsChecked = os.clock()
+		hintLabels = {}
+		for _, node in ipairs(PlayerGui:GetDescendants()) do
+			if node:IsA("TextLabel") or node:IsA("TextButton") then table.insert(hintLabels, node) end
+		end
+	end
+	local center = Vector2.new(c.ViewportSize.X / 2, c.ViewportSize.Y / 2)
+	local relation, found = nil, false
+	for _, node in ipairs(hintLabels) do
+		if node.Parent and gameGui(node) and node.TextTransparency < 0.95 then
+			local text = plainText(node.Text)
+			if text == "friendly" or text == "enemy" then
+				local pos, size = node.AbsolutePosition, node.AbsoluteSize
+				local x, y = pos.X + size.X / 2, pos.Y + size.Y / 2
+				-- Use the actual text alignment when a HUD label spans the screen.
+				local bounds = node.TextBounds
+				if bounds then
+					if node.TextXAlignment == Enum.TextXAlignment.Left then x = pos.X + bounds.X / 2
+					elseif node.TextXAlignment == Enum.TextXAlignment.Right then x = pos.X + size.X - bounds.X / 2 end
+					if node.TextYAlignment == Enum.TextYAlignment.Top then y = pos.Y + bounds.Y / 2
+					elseif node.TextYAlignment == Enum.TextYAlignment.Bottom then y = pos.Y + size.Y - bounds.Y / 2 end
+				end
+				-- Includes Roblox's top GUI inset while excluding corner HUD/menus.
+				if math.abs(x - center.X) <= 120 and math.abs(y - center.Y) <= 100 then
+					local isEnemy = text == "enemy"
+					if found and relation ~= isEnemy then return nil, "Conflicting game HUD indicators" end
+					relation, found = isEnemy, true
+				end
+			end
+		end
+	end
+	if not found then return nil, "Waiting for game Friendly text near crosshair" end
+	if relation then return nil, "Enemy indicator ignored - center a teammate to detect teams" end
+	return false
+end
+local function updateAutoTeam()
+	if not P.autoTeam then resetAutoCandidate() P.autoTeamStatus = "Automatic team detection off" return end
+	if Live.BindingActive or not Live.Unlocked or UIS:GetFocusedTextBox() then resetAutoCandidate() return end
+	local c = cam()
+	if not c then resetAutoCandidate() return end
+	local relation, reason = nativeCrosshairRelation(c)
+	if relation == nil then resetAutoCandidate() P.autoTeamStatus = reason return end
+	local entry = calibrationCandidate(c)
+	if not entry or not entry.group then
+		resetAutoCandidate() P.autoTeamStatus = "HUD indicator found; waiting for a body under crosshair" return
+	end
+	if calibratedEnemy(entry.group) == relation then
+		resetAutoCandidate() P.autoTeamStatus = "Team groups confirmed by game HUD" return
+	end
+	if pendingGroup ~= entry.group or pendingModel ~= entry.m or pendingRelation ~= relation then
+		pendingGroup, pendingModel, pendingRelation, pendingAt = entry.group, entry.m, relation, os.clock()
+		P.autoTeamStatus = "Reading game " .. (relation and "Enemy" or "Friendly") .. " indicator..."
+		return
+	end
+	if os.clock() - pendingAt < 0.2 then return end
+	if applyTeamCalibration(entry, relation, "game crosshair " .. (relation and "Enemy" or "Friendly")) then
+		P.autoTeamStatus = "Teams detected automatically from game HUD"
+	end
+	resetAutoCandidate()
 end
 local function enemyModelOf(inst)
 	local cur = inst
@@ -669,7 +745,7 @@ local function updateAim(dt)
 				for _, entry in ipairs(cache) do
 					if entry.enemy == nil then unresolved = true break end
 				end
-				P.aimState = unresolved and "mark teammate (F6) or enemy (F7) to calibrate team groups" or
+				P.aimState = unresolved and "waiting for Friendly HUD detection; F6 is a manual fallback" or
 					(not faction and "select Your team on ESP tab" or "no confirmed visible enemy in FOV / range")
 			end
 		return
@@ -951,21 +1027,29 @@ task.spawn(function() -- keep the character list fresh
 		task.wait(playersRoot() and 0.4 or 1.5)
 	end
 end)
-local statusRow, espRow, teamRow, rosterRow, ownerRow
 task.spawn(function()
 	while Live.Running do
+		local ok, err = pcall(updateAutoTeam)
+		if not ok then resetAutoCandidate() P.autoTeamStatus = "HUD detection error: " .. tostring(err) end
+		task.wait(0.1)
+	end
+end)
+local statusRow, espRow, teamRow, rosterRow, ownerRow, autoTeamRow
+task.spawn(function()
+	while Live.Running do
+		if autoTeamRow then autoTeamRow.Text = P.autoTeamStatus or "Watching game Friendly indicator" end
 		if rosterRow then rosterRow.Text = P.rosterStatus or "Open the game's leaderboard to read teams" end
 		if ownerRow then ownerRow.Text = P.ownerStatus or "Checking model ownership..." end
 		if teamRow then
 			local faction, source = myFaction()
-			teamRow.Text = (P.myGroup or P.enemyGroup) and "Team groups calibrated for this session" or
+			teamRow.Text = (P.myGroup or P.enemyGroup) and "Team groups calibrated: " .. (P.calibrationSource or "manual") or
 				("Your team: " .. (faction or "unknown") .. " | " .. source)
 		end
 		if espRow then
 			local unknown = 0
 			for _, e in ipairs(cache) do if e.enemy == nil then unknown = unknown + 1 end end
 			local err = P.espErr or P.scanErr
-			espRow.Text = "pf-esp-8 | Found " .. #cache .. " models (" .. #collect(false) .. " enemy, " .. unknown .. " unknown) | drawn " .. tostring(P.drawn or 0) .. " | failed " .. tostring(P.renderFailed or 0) .. (err and (" | ERROR: " .. err) or "")
+			espRow.Text = "pf-esp-9 | Found " .. #cache .. " models (" .. #collect(false) .. " enemy, " .. unknown .. " unknown) | drawn " .. tostring(P.drawn or 0) .. " | failed " .. tostring(P.renderFailed or 0) .. (err and (" | ERROR: " .. err) or "")
 		end
 		if statusRow then
 			statusRow.Text = "Enemies: " .. #collect(false) .. " | " .. (P.aimState or "off") ..
@@ -977,7 +1061,8 @@ end)
 local function report()
 	local out = {}
 	local function add(s) table.insert(out, s) end
-	add("ESP revision: pf-esp-8")
+	add("ESP revision: pf-esp-9")
+	add("auto team=" .. tostring(P.autoTeam) .. " status=" .. tostring(P.autoTeamStatus) .. " source=" .. tostring(P.calibrationSource))
 	add(tostring(P.rosterStatus))
 	add(tostring(P.ownerStatus))
 	local faction, source = myFaction()
@@ -1092,12 +1177,18 @@ end)
 local TeamSetup = Section(EspTab3, "Team Detection", "Used by both ESP and aim assist", "players")
 Dropdown(TeamSetup, "Your team", { "Auto", "Phantoms", "Ghosts" }, P.teamMode, function(i)
 	P.teamMode = i
-	P.myGroup, P.enemyGroup = nil, nil
+	P.myGroup, P.enemyGroup, P.calibrationSource = nil, nil, nil
+	resetAutoCandidate()
 	P.target, P.targetSince = nil, 0
 	scan(false)
 	if #cache == 0 then scan(true) end
 end, nil, "If Auto cannot detect your team, select the faction you are playing on. Update it when you switch teams.")
 teamRow = InfoRow(TeamSetup, "Your team: checking...")
+tog(TeamSetup, "Automatic Team Detection", true, function(v)
+	P.autoTeam = v
+	resetAutoCandidate()
+end, "Briefly center a teammate while the game displays Friendly. Enemy indicators never calibrate teams.")
+autoTeamRow = InfoRow(TeamSetup, "Watching game Friendly indicator")
 rosterRow = InfoRow(TeamSetup, "Open the game's leaderboard to read teams")
 ownerRow = InfoRow(TeamSetup, "Checking model ownership...")
 InfoRow(TeamSetup, "Open the game leaderboard to refresh its team roster. Automatic names require a verified model-owner link.")
@@ -1107,12 +1198,13 @@ Button(TeamSetup, "Refresh leaderboard teams", "Refresh", function()
 	if #cache == 0 then scan(true) end
 	notify((P.rosterStatus or "No leaderboard found") .. " | " .. (P.ownerStatus or "No owners found"), T.Accent)
 end)
-InfoRow(TeamSetup, "Randomized teams? Center a known teammate on screen and press F6, or an enemy and press F7.")
+InfoRow(TeamSetup, "Automatic detection uses only Friendly. F6 remains an optional teammate fallback.")
 P.markAllyKey, P.markEnemyKey = Enum.KeyCode.F6, Enum.KeyCode.F7
 Keybind(TeamSetup, "Mark teammate under crosshair", P.markAllyKey, function(k) P.markAllyKey = k end, true)
 Keybind(TeamSetup, "Mark enemy under crosshair", P.markEnemyKey, function(k) P.markEnemyKey = k end, true)
 Button(TeamSetup, "Clear team calibration", "Clear", function()
-	P.myGroup, P.enemyGroup, P.target = nil, nil, nil
+	P.myGroup, P.enemyGroup, P.target, P.calibrationSource = nil, nil, nil, nil
+	resetAutoCandidate()
 	scan(false)
 	if #cache == 0 then scan(true) end
 end)
