@@ -104,3 +104,17 @@ randomized 6/7-player groups, calibration, team filtering,
 activation modes, camera writes, mouse API failures, labels, and render cleanup
 using mocked game objects. The user confirmed live F6 team calibration and
 mouse aiming work; automatic username/model lookup remains unverified. Troubleshooting identifies this revision as `pf-esp-10`.
+
+## LT2 additions
+
+`Lt2.txt` now includes more features adapted from the supplied Dynxe source,
+using the existing LT2 pages and hub controls:
+
+- **Tools:** lasso selection, pyramid sorting, wood/length group matching,
+  Select All My Planks, and Select All My Loose Items.
+- **Plot:** owned-plank wood/length filters, click-to-fill, and fill-all blueprints.
+- **Shop:** selected/all-missing blueprint purchases and the Rukiryaxe quest.
+
+See [LT2_FEATURES.md](LT2_FEATURES.md) for controls, source scope, validation and
+live-game limitations. Stop and unload cancel the new operations. No new GUI
+framework or remote script loader is introduced.

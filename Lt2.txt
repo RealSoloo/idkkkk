@@ -5,10 +5,12 @@
 -- logs live in Workspace.LogModels, trees in Workspace.*TreeRegion* folders, ownership of a log is claimed by
 -- spamming Interaction.ClientIsDragging before moving its parts. UNTESTED in game.
 --
--- v2: tabs and features ported from the Dynxe script - Wood (get trees x quantity, chop logs into sections),
--- Logs (click to sell), Plot, Shop, Tools (selection + sorting), Vehicle, World, Protection (axe recovery),
--- plus player / waypoint / vehicle-aware teleports. Dynxe's duplication, 1x1 cutter, lasso, tree server search
--- and blueprint / Rukiry purchases are NOT ported (see the notes in the chat).
+-- v3: additional features adapted from the user's supplied Dynxe reference.
+-- Existing pages and shared GUI are preserved. Adds lasso and pyramid selection,
+-- wood/length matching, owned-plank bulk selection, blueprint filling and purchases,
+-- and the Rukiryaxe material/collection flow. See LT2_FEATURES.md for scope and tests.
+-- These game interactions require live LT2 verification; source-specific remote
+-- and world paths are checked at runtime rather than assumed to be available.
 
 local Hub, S, T, C = ...
 local API = Hub.API
@@ -66,6 +68,7 @@ local LT = {
 	sellPos = Vector3.new(315, 0, 88), sellWrap = 8,
 	esp = false, espAll = false, espMax = 1500, stopKey = Enum.KeyCode.X,
 }
+local LTExtra = { pickers = {}, stopHooks = {} }
 local PICK_MODES = { "Biggest Tree", "Nearest Tree" }
 local statusRow, axeRow, countRow, logRow
 local showTreePreview
@@ -281,7 +284,10 @@ end
 -- ---------------------------------------------------- status / job runner
 local function setStatus(text) if statusRow then statusRow.Text = "Status: " .. text end end
 local function dropLock() if LT.lock then LT.lock:Disconnect() LT.lock = nil end end
-local function stopAll() LT.token = LT.token + 1 LT.busy = false dropLock() setStatus("Idle") end
+local function stopAll()
+	LT.token = LT.token + 1 LT.busy = false dropLock() setStatus("Idle")
+	for _, stop in ipairs(LTExtra.stopHooks) do pcall(stop) end
+end
 local function runJob(label, fn)
 	if LT.busy then notify("Already running - press Stop first", T.Warn) return end
 	if not RemoteProxy or not DragRemote then
@@ -328,13 +334,13 @@ local function cutSection(section, tool, axeName, class, stop)
 end
 
 -- ---------------------------------------------------- moving logs (claim ownership, then set CFrame)
-local function claimDrag(model, timeout)
+local function claimDrag(model, timeout, alive)
 	local owner = model:FindFirstChild("Owner")
 	local li = (owner and owner:FindFirstChild("LastInteraction")) or model:FindFirstChild("LastInteraction")
 	local changed, conn = false, nil
 	if li then conn = li:GetPropertyChangedSignal("Value"):Connect(function() changed = true end) end
 	local deadline = os.clock() + timeout
-	while Live.Running and os.clock() < deadline and not changed do
+	while Live.Running and (not alive or alive()) and os.clock() < deadline and not changed do
 		pcall(DragRemote.FireServer, DragRemote, model)
 		task.wait()
 	end
@@ -762,6 +768,92 @@ local function async(fn)
 	end)
 end
 
+-- Shared helpers for the added LT2 tools. No external loader is used.
+function LTExtra.activatePicker(name)
+	for id, stop in pairs(LTExtra.pickers) do if id ~= name then stop() end end
+end
+function LTExtra.withReturn(fn)
+	local root, token = getRoot(), LT.token
+	local home = root and root.CFrame
+	local ok, err = pcall(fn)
+	-- Do not move the player out of a newer job or during unload.
+	if Live.Running and LT.token <= token + 1 and home then
+		local current = getRoot()
+		if current then current.CFrame = home current.AssemblyLinearVelocity = Vector3.zero end
+	end
+	if not ok then error(err) end
+end
+function LTExtra.moveOwned(model, goal, alive, timeout)
+	if not alive() or not model.Parent or not ownedByMe(model) then return false end
+	local part, root = mainPartOf(model), getRoot()
+	if not (part and part:IsA("BasePart") and not part.Anchored and root) then return false end
+	if (root.Position - part.Position).Magnitude > 10 then
+		root.CFrame = CFrame.new(part.Position + Vector3.new(0, 3, 0))
+		task.wait(0.05)
+	end
+	if not alive() then return false end
+	claimDrag(model, timeout or 2, alive)
+	if not alive() or not part.Parent or not ownedByMe(model) then return false end
+	local pivot = goal * part.CFrame:Inverse() * model:GetPivot()
+	model:PivotTo(pivot)
+	part.AssemblyLinearVelocity, part.AssemblyAngularVelocity = Vector3.zero, Vector3.zero
+	task.wait(0.1)
+	return true
+end
+function LTExtra.isBlueprint(model)
+	local kind = model and model:FindFirstChild("Type")
+	return model ~= nil and model:IsA("Model") and ownedByMe(model) and kind ~= nil and kind.Value == "Blueprint"
+end
+function LTExtra.scanPlanks(class, low, high)
+	local result, folder = {}, Workspace:FindFirstChild("PlayerModels")
+	if not folder or low > high then return result end
+	for _, model in ipairs(folder:GetChildren()) do
+		if model:IsA("Model") and model.Name == "Plank" and ownedByMe(model) then
+			local part, treeClass = mainPartOf(model), classOf(model)
+			if part and part:IsA("BasePart") and not part.Anchored and treeClass and
+				(not class or class == treeClass) and part.Size.Y >= low and part.Size.Y <= high then
+				table.insert(result, { model = model, part = part, class = treeClass, sizeY = part.Size.Y })
+			end
+		end
+	end
+	table.sort(result, function(a, b) return a.sizeY < b.sizeY end)
+	return result
+end
+function LTExtra.sameSelectionKind(a, b, matchLength)
+	if a.Name ~= b.Name then return false end
+	if a.Name == "Plank" then
+		if classOf(a) ~= classOf(b) then return false end
+		if matchLength then
+			local pa, pb = mainPartOf(a), mainPartOf(b)
+			if not pa or not pb or math.abs(pa.Size.Y - pb.Size.Y) > 0.05 then return false end
+		end
+	end
+	return true
+end
+function LTExtra.layout(count, columns, layers, rows, pyramid)
+	local raw = {}
+	if count <= 0 then return raw end
+	for layer = 0, layers - 1 do
+		local width = pyramid and (columns - layer) or columns
+		local depth = pyramid and (rows - layer) or rows
+		if width <= 0 or depth <= 0 then break end
+		local inset = pyramid and layer * 0.5 or 0
+		for row = 0, depth - 1 do
+			for col = 0, width - 1 do
+				table.insert(raw, Vector3.new(col + inset, layer, row + inset))
+				if #raw == count then break end
+			end
+			if #raw == count then break end
+		end
+		if #raw == count then break end
+	end
+	if #raw < count then return nil, "Selection exceeds layout capacity; increase X / Y / Z" end
+	local x, z = 0, 0
+	for _, point in ipairs(raw) do x = x + point.X z = z + point.Z end
+	for i, point in ipairs(raw) do raw[i] = Vector3.new(point.X - x / count, point.Y, point.Z - z / count) end
+	return raw
+end
+
 -- ---------------------------------------------------- WOOD: get trees (quantity) + chop logs into sections
 local function cutAtHeight(section, tool, axeName, class, height, stop)
 	local idObj = section:FindFirstChild("ID")
@@ -1109,6 +1201,77 @@ addCleanup(function() if pc.conn then pc.conn:Disconnect() end end)
 
 -- ---------------------------------------------------- SHOP (store NPC dialog purchase flow)
 do
+local BLUEPRINT_KEYS = {
+	["Wall2Tall"] = true,
+	["Wall2"] = true,
+	["Wall2Short"] = true,
+	["Wall2TallThin"] = true,
+	["Wall2Thin"] = true,
+	["Wall2ShortThin"] = true,
+	["Wall2TallCorner"] = true,
+	["Wall2Corner"] = true,
+	["Wall2ShortCorner"] = true,
+	["Wall1Tall"] = true,
+	["Wall1"] = true,
+	["Wall1Short"] = true,
+	["Wall1TallThin"] = true,
+	["Wall1Thin"] = true,
+	["Wall1ShortThin"] = true,
+	["Wall1TallCorner"] = true,
+	["Wall1Corner"] = true,
+	["Wall1ShortCorner"] = true,
+	["Wall3Tall"] = true,
+	["Wall3"] = true,
+	["Wall3TallThin"] = true,
+	["Wall3Thin"] = true,
+	["Wall3TallCorner"] = true,
+	["Wall3Corner"] = true,
+	["Floor1Large"] = true,
+	["Floor1"] = true,
+	["Floor1Small"] = true,
+	["Floor1Tiny"] = true,
+	["Floor2Large"] = true,
+	["Floor2"] = true,
+	["Floor2Small"] = true,
+	["Floor2Tiny"] = true,
+	["Wedge1"] = true,
+	["Wedge1_Thin"] = true,
+	["Wedge2"] = true,
+	["Wedge2_Thin"] = true,
+	["Wedge3"] = true,
+	["Wedge3_Thin"] = true,
+	["Wedge4"] = true,
+	["Wedge4_Thin"] = true,
+	["Wedge5"] = true,
+	["Wedge5_Thin"] = true,
+	["Wedge6"] = true,
+	["Wedge6_Thin"] = true,
+	["Wedge7"] = true,
+	["Wedge7_Thin"] = true,
+	["Wedge8"] = true,
+	["Wedge8_Thin"] = true,
+	["Wedge9"] = true,
+	["Wedge9_Thin"] = true,
+	["Wedge10"] = true,
+	["Wedge10_Thin"] = true,
+	["Stair1"] = true,
+	["Stair2"] = true,
+	["Ladder1"] = true,
+	["Post"] = true,
+	["Door1"] = true,
+	["Door2"] = true,
+	["Door3"] = true,
+	["Table1"] = true,
+	["Table2"] = true,
+	["Chair1"] = true,
+	["Cabinet1CornerWide"] = true,
+	["Cabinet1"] = true,
+	["Cabinet1Thin"] = true,
+	["Cabinet1CornerTight"] = true,
+	["CounterTop1"] = true,
+	["CounterTop1Thin"] = true,
+	["CounterTop1Sink"] = true,
+}
 local STORES = {
 	{ "Wood R Us", "WoodRUs", "Thom", CFrame.new(262.1, 3.2, 64.8) },
 	{ "Fancy Furnishings", "FurnitureStore", "Corey", CFrame.new(481.4, 3.2, -1712.5) },
@@ -1165,18 +1328,21 @@ local function fetchNpcId(name, npc)
 	return nil
 end
 local function safeInvoke(chatted, arg, action)
-	local done = false
+	local done, success = false, false
 	task.spawn(function()
-		pcall(function() chatted:InvokeServer(arg, action) end)
+		success = pcall(function() chatted:InvokeServer(arg, action) end)
 		done = true
 	end)
 	local t = os.clock()
 	while not done and os.clock() - t < 4 do task.wait(0.03) end
-	return done
+	return done and success
 end
 local function inMine(inst)
 	local pm = Workspace:FindFirstChild("PlayerModels")
-	if pm and inst:IsDescendantOf(pm) then return true end
+	if pm and inst:IsDescendantOf(pm) then
+		local model = topModel(inst, pm)
+		return model ~= nil and ownedByMe(model)
+	end
 	local bp = LocalPlayer:FindFirstChildOfClass("Backpack")
 	if bp and inst:IsDescendantOf(bp) then return true end
 	local ch = getChar()
@@ -1277,6 +1443,7 @@ end
 -- flow (same order the Dynxe script uses): item onto the counter first, THEN stand at the cashier and get the ID, then confirm,
 -- then bring the item back to dropCF. The cashier ID can only be fetched while you are standing near the cashier.
 local function buyBox(e, box, alive, dropCF)
+	if not alive() then return false end
 	local main = box:FindFirstChild("Main")
 	local npc = npcOf(e)
 	local _, chatted = dialogRemotes()
@@ -1285,7 +1452,8 @@ local function buyBox(e, box, alive, dropCF)
 	-- 1. go to the item, take ownership, put it on the counter
 	local r = getRoot()
 	if r then r.CFrame = CFrame.new(main.Position + Vector3.new(0, 4, 0)) task.wait(0.15) end
-	claimDrag(box, 2)
+	claimDrag(box, 2, alive)
+	if not alive() then return false end
 	if main.Parent then
 		local up = cp.CFrame.UpVector
 		main.CFrame = CFrame.new(cp.Position + up * (cp.Size.Y / 2 + main.Size.Y / 2 + 0.05))
@@ -1294,10 +1462,12 @@ local function buyBox(e, box, alive, dropCF)
 	end
 	task.wait(0.1)
 	-- 2. stand at the cashier, then get the dialog ID
+	if not alive() then return false end
 	r = getRoot()
 	if r then r.CFrame = e[4] task.wait(0.4) end
 	if not npc:FindFirstChild("Dialog") then Instance.new("Dialog", npc) end
 	local id = SH.npcIds[e[3]] or fetchNpcId(e[3], npc)
+	if not alive() then return false end
 	if not id then notify("Could not get the cashier's ID - try again", T.Bad) return false end
 	local arg = { ID = id, Character = npc, Name = e[3], Dialog = npc.Dialog }
 	-- 3. confirm until the item belongs to you
@@ -1331,7 +1501,7 @@ local function buyBox(e, box, alive, dropCF)
 	end
 	safeInvoke(chatted, arg, "EndChat")
 	-- 4. bring the item back to where you started
-	if bought and dropCF and main.Parent then
+	if alive() and bought and dropCF and main.Parent then
 		claimDrag(main:FindFirstAncestorOfClass("Model") or box, 1)
 		if main.Parent then
 			main.CFrame = dropCF
@@ -1440,11 +1610,209 @@ Button(Sp, "Power of Ease ($10,009,000)", "Buy", function()
 		if rr then rr.CFrame = home end
 	end)
 end, nil, "Teleports to Strange Man's spot and spams the purchase until your money drops")
+-- Additional purchases use the same cashier flow and current job token.
+local function blueprintFolder()
+	local folder = LocalPlayer:FindFirstChild("PlayerBlueprints")
+	return folder and folder:FindFirstChild("Blueprints")
+end
+local function blueprintOwned(key)
+	local folder = blueprintFolder()
+	return folder and folder:FindFirstChild(key) ~= nil or false
+end
+local function itemDefinition(key)
+	for _, item in ipairs(SH.all) do if item.key == key then return item end end
+end
+local function stockBox(item)
+	local folder = shopItemsFor(STORES[item.store])
+	if folder then
+		for _, box in ipairs(folder:GetChildren()) do
+			local key, main = box:FindFirstChild("BoxItemName"), box:FindFirstChild("Main")
+			if box.Name == "Box" and key and key.Value == item.key and main and main:IsA("BasePart") and not main.Anchored then return box end
+		end
+	end
+end
+local function purchasedBox(key)
+	local folder = Workspace:FindFirstChild("PlayerModels")
+	if folder then
+		for _, box in ipairs(folder:GetChildren()) do
+			local name = box:FindFirstChild("PurchasedBoxItemName") or box:FindFirstChild("BoxItemName")
+			if name and name.Value == key and ownedByMe(box) then return box end
+		end
+	end
+end
+local function openPurchasedBox(key, alive)
+	local event = Interaction and Interaction:FindFirstChild("ClientInteracted")
+	if not event then return false, "ClientInteracted remote not found" end
+	local deadline = os.clock() + 8
+	while alive() and os.clock() < deadline do
+		local box, root = purchasedBox(key), getRoot()
+		if box and root then
+			event:FireServer(box, "Open box", root.CFrame)
+			return true
+		end
+		task.wait(0.1)
+	end
+	return false, alive() and "Owned purchase box did not appear" or "Stopped"
+end
+local function buyOneKey(key, alive)
+	if not alive() then return false, "Stopped" end
+	local item = itemDefinition(key)
+	if not item then return false, key .. " is not stocked in the scanned stores" end
+	local funds = fetchFunds()
+	if not funds or not item.price then return false, "Could not verify price / funds for " .. key end
+	if funds < item.price then return false, "Not enough funds for " .. item.name end
+	local box = stockBox(item)
+	if not box then return false, item.name .. " is out of stock" end
+	if not buyBox(STORES[item.store], box, alive) then return false, "Purchase not confirmed: " .. item.name end
+	if not alive() then return false, "Stopped" end
+	return openPurchasedBox(key, alive)
+end
+local blueprintSection = Section(ShopTab, "Blueprint Purchases", "Buy and open missing blueprint boxes using the existing stores", "premium")
+local blueprintList, blueprintDropdown, blueprintRow = {}, nil, nil
+local function refreshBlueprintPurchases()
+	blueprintList = {}
+	for key in pairs(BLUEPRINT_KEYS) do table.insert(blueprintList, key) end
+	table.sort(blueprintList)
+	local names, owned = {}, 0
+	for _, key in ipairs(blueprintList) do
+		if blueprintOwned(key) then owned = owned + 1 end
+		local item = itemDefinition(key)
+		table.insert(names, (blueprintOwned(key) and "[Owned] " or "") .. key .. (item and item.price and (" ($" .. commas(item.price) .. ")") or ""))
+	end
+	blueprintDropdown.SetOptions(names)
+	blueprintRow.Text = "Blueprints unlocked: " .. owned .. " / " .. #blueprintList
+end
+blueprintDropdown = Dropdown(blueprintSection, "Blueprint", { "Press Scan" }, 1)
+blueprintRow = InfoRow(blueprintSection, "Blueprints: press Scan")
+Button(blueprintSection, "Refresh Blueprint Catalog", "Scan", function() scanAllItems() refreshBlueprintPurchases() end)
+local function purchaseBlueprints(keys)
+	if not blueprintFolder() then notify("Load your base first; blueprint inventory is unavailable", T.Warn) return end
+	runJob("Purchasing blueprints", function(alive)
+		LTExtra.withReturn(function()
+			scanAllItems()
+			local unlocked, skipped, failed = 0, 0, 0
+			for i, key in ipairs(keys) do
+				if not alive() then break end
+				if blueprintOwned(key) then skipped = skipped + 1
+				else
+					setStatus("Blueprint purchase " .. i .. " / " .. #keys)
+					local ok, reason = buyOneKey(key, alive)
+					if ok then
+						local deadline = os.clock() + 5
+						while alive() and not blueprintOwned(key) and os.clock() < deadline do task.wait(0.1) end
+					end
+					if blueprintOwned(key) then unlocked = unlocked + 1
+					else failed = failed + 1 if alive() and failed <= 3 then notify(reason or ("Unlock not confirmed: " .. key), T.Warn) end end
+				end
+			end
+			if alive() then notify("Blueprints unlocked: " .. unlocked .. " | owned: " .. skipped .. " | unavailable: " .. failed, unlocked > 0 and T.Good or T.Sub) end
+		end)
+		refreshBlueprintPurchases()
+	end)
+end
+Button(blueprintSection, "Purchase Selected Blueprint", "Buy", function()
+	local key = blueprintList[blueprintDropdown.Get()]
+	if not key then notify("Scan the blueprint catalog first", T.Warn) return end
+	purchaseBlueprints({ key })
+end)
+Button(blueprintSection, "Purchase All Missing Blueprints", "Buy", function()
+	local keys = {} for key in pairs(BLUEPRINT_KEYS) do table.insert(keys, key) end table.sort(keys)
+	purchaseBlueprints(keys)
+end)
+Button(blueprintSection, "Stop Blueprint Purchases", "Stop", stopAll)
+
+local RUKIRY_PLAN = {
+	{ key = "CanOfWorms", goal = CFrame.new(317.3, 46.0, 1918.1) },
+	{ key = "BagOfSand", goal = CFrame.new(319.5, 46.0, 1914.9) },
+	{ key = "LightBulb", goal = CFrame.new(322.4, 43.6, 1916.4) },
+}
+local function ownedQuestItem(key)
+	local folder = Workspace:FindFirstChild("PlayerModels")
+	if folder then
+		for _, model in ipairs(folder:GetChildren()) do
+			local item = model:FindFirstChild("ItemName")
+			if item and item.Value == key and ownedByMe(model) and mainPartOf(model) then return model end
+		end
+	end
+end
+local function rukiryCount()
+	local count = 0
+	local function check(container)
+		if container then
+			for _, tool in ipairs(container:GetChildren()) do
+				if tool:IsA("Tool") then
+					local name = axeNameOf(tool) or tool.Name
+					if name == "Rukiryaxe" or name == "Rukiry Axe" then count = count + 1 end
+				end
+			end
+		end
+	end
+	check(getChar()) check(LocalPlayer:FindFirstChildOfClass("Backpack"))
+	return count
+end
+local questSection = Section(ShopTab, "Rukiryaxe Quest", "Buy the three materials, place them at the shrine and collect the reward", "loot")
+Button(questSection, "Complete Rukiryaxe Quest", "Start", function()
+	runJob("Rukiryaxe quest", function(alive)
+		LTExtra.withReturn(function()
+			scanAllItems()
+			local folder = Workspace:FindFirstChild("PlayerModels")
+			local interact = Interaction and Interaction:FindFirstChild("ClientInteracted")
+			if not folder or not interact then notify("Quest folders / interaction remote unavailable", T.Warn) return end
+			local old, before = {}, rukiryCount()
+			for _, model in ipairs(folder:GetChildren()) do old[model] = true end
+			for _, entry in ipairs(RUKIRY_PLAN) do
+				if not alive() then return end
+				setStatus("Quest material: " .. entry.key)
+				local model = ownedQuestItem(entry.key)
+				if not model then
+					local ok, reason = buyOneKey(entry.key, alive)
+					if not ok then if alive() then notify(reason, T.Warn) end return end
+					local deadline = os.clock() + 6
+					while alive() and os.clock() < deadline and not model do model = ownedQuestItem(entry.key) task.wait(0.1) end
+				end
+				if not model or not LTExtra.moveOwned(model, entry.goal, alive) then
+					if alive() then notify("Could not deliver " .. entry.key .. "; quest stopped", T.Warn) end return
+				end
+			end
+			local root = getRoot()
+			if not alive() or not root then return end
+			root.CFrame = CFrame.new(320.6, 45.8, 1919.2)
+			local reward, deadline = nil, os.clock() + 20
+			while alive() and os.clock() < deadline and not reward do
+				for _, model in ipairs(folder:GetChildren()) do
+					local name, part = model:FindFirstChild("ToolName"), mainPartOf(model)
+					if not old[model] and name and name.Value == "Rukiryaxe" and part and (part.Position - root.Position).Magnitude < 50 then
+						local owner = model:FindFirstChild("Owner")
+						local ownerString = owner and owner:FindFirstChild("OwnerString")
+						if ownedByMe(model) or (ownerString and ownerString.Value == "") then reward = model break end
+					end
+				end
+				if not reward then task.wait(0.2) end
+			end
+			if not alive() then return end
+			if not reward then notify("Materials delivered; no new quest reward appeared within 20s", T.Warn) return end
+			deadline = os.clock() + 8
+			while alive() and os.clock() < deadline and rukiryCount() <= before do
+				local handle = reward:FindFirstChild("Handle") or mainPartOf(reward)
+				root = getRoot()
+				if not root or not handle then break end
+				root.CFrame = handle.CFrame + Vector3.new(0, 3, 0)
+				claimDrag(reward, 0.3, alive)
+				if alive() and handle.Parent then interact:FireServer(reward, "Pick up tool", handle.CFrame) end
+				task.wait(0.2)
+			end
+			if alive() then notify(rukiryCount() > before and "Rukiryaxe pickup confirmed" or "Reward found; pickup was not confirmed", rukiryCount() > before and T.Good or T.Warn) end
+		end)
+	end)
+end)
+Button(questSection, "Stop Rukiryaxe Quest", "Stop", stopAll)
+task.delay(1, function() if Live.Running then refreshBlueprintPurchases() end end)
+
 end
 
 -- ---------------------------------------------------- TOOLS: object selection + sorting
 do
-local SEL = { list = {}, hl = {}, click = nil, same = false, keep = true, back = false, timeout = 3, X = 4, Y = 1, Z = 4, pad = 2 }
+local SEL = { list = {}, hl = {}, click = nil, same = false, keep = true, back = false, timeout = 3, X = 4, Y = 1, Z = 4, pad = 2, pyramid = false, matchLength = true }
 local function setSel(model, on)
 	if on and not SEL.list[model] then
 		SEL.list[model] = true
@@ -1466,7 +1834,7 @@ local function selList()
 end
 local selRow
 local function updSel() if selRow then selRow.Text = "Selected: " .. #selList() .. " object(s)" end end
-local function moveModel(model, goal)
+local function moveModel(model, goal, alive)
 	local part = mainPartOf(model)
 	if not (part and part.Parent) then return false end
 	local r = getRoot()
@@ -1474,8 +1842,8 @@ local function moveModel(model, goal)
 		local flat = (r.Position - part.Position) * Vector3.new(1, 0, 1)
 		if flat.Magnitude > 10 then r.CFrame = CFrame.new(part.Position + Vector3.new(0, 3, 0)) task.wait(0.05) end
 	end
-	claimDrag(model, SEL.timeout)
-	if part.Parent then part.CFrame = goal end
+	claimDrag(model, SEL.timeout, alive)
+	if alive() and part.Parent then part.CFrame = goal end
 	task.wait(0.05)
 	return true
 end
@@ -1492,18 +1860,24 @@ local function sendSelection(centerCF, grid, alive)
 		end
 		cell, cellY = cell + SEL.pad, cellY + SEL.pad * 0.5
 	end
+	local positions
+	if grid then
+		local err
+		positions, err = LTExtra.layout(#list, SEL.X, SEL.Y, SEL.Z, SEL.pyramid)
+		if not positions then notify(err, T.Warn) return end
+	end
 	for i, m in ipairs(list) do
 		if not alive() then break end
 		local k = i - 1
 		local col, row, layer
 		if grid then
-			col, row, layer = k % SEL.X, math.floor(k / SEL.X) % SEL.Z, math.floor(k / (SEL.X * SEL.Z))
+			col, row, layer = positions[i].X, positions[i].Z, positions[i].Y
 		else
 			col, row, layer = k % 5, math.floor(k / 5), 0
 		end
 		local step = grid and cell or 5
 		local goal = centerCF * CFrame.new(col * step, 1 + layer * (grid and cellY or 3), -row * step)
-		moveModel(m, goal)
+		moveModel(m, goal, alive)
 	end
 	if SEL.back and home then local rr = getRoot() if rr then rr.CFrame = home end end
 	if not SEL.keep then clearSel() end
@@ -1516,9 +1890,11 @@ local function plotCenter()
 end
 
 local Sl = Section(ToolsTab, "Selection Tools", "Click things of yours (or anyone's loose items) to select them, then move or sort them", "magnet")
-Toggle(Sl, "Click Selection", false, function(v)
+local clickToggle
+clickToggle = Toggle(Sl, "Click Selection", false, function(v)
 	if SEL.click then SEL.click:Disconnect() SEL.click = nil end
 	if not v then return end
+	LTExtra.activatePicker("selection")
 	SEL.click = UIS.InputBegan:Connect(function(i, gp)
 		if gp or i.UserInputType ~= Enum.UserInputType.MouseButton1 or not mouse.Target then return end
 		local pm, lmf = Workspace:FindFirstChild("PlayerModels"), Workspace:FindFirstChild("LogModels")
@@ -1527,7 +1903,7 @@ Toggle(Sl, "Click Selection", false, function(v)
 		local on = not SEL.list[model]
 		if SEL.same then
 			for _, m in ipairs(model.Parent:GetChildren()) do
-				if m:IsA("Model") and m.Name == model.Name and ownedByMe(m) then setSel(m, on) end
+				if m:IsA("Model") and LTExtra.sameSelectionKind(model, m, SEL.matchLength) and ownedByMe(m) then setSel(m, on) end
 			end
 		else
 			setSel(model, on)
@@ -1535,6 +1911,78 @@ Toggle(Sl, "Click Selection", false, function(v)
 		updSel()
 	end)
 end, nil, nil, "Left click an object to add / remove it")
+LTExtra.pickers.selection = function()
+	if SEL.click then SEL.click:Disconnect() SEL.click = nil end
+	clickToggle.Set(false)
+end
+table.insert(LTExtra.stopHooks, LTExtra.pickers.selection)
+-- Rectangle selection uses the same selection list, highlights and move jobs.
+local lasso = { on = false, start = nil }
+local lassoFrame = new("Frame", { BackgroundColor3 = T.Accent, BackgroundTransparency = 0.86,
+	BorderSizePixel = 0, Visible = false, ZIndex = 20 }, EspGui)
+new("UIStroke", { Color = T.Accent, Thickness = 1 }, lassoFrame)
+local lassoToggle
+local function stopLasso()
+	lasso.on, lasso.start = false, nil
+	lassoFrame.Visible = false
+	if lassoToggle then lassoToggle.Set(false) end
+end
+LTExtra.pickers.lasso = stopLasso
+table.insert(LTExtra.stopHooks, stopLasso)
+lassoToggle = Toggle(Sl, "Lasso Selection", false, function(v)
+	if v then LTExtra.activatePicker("lasso") end
+	lasso.on = v
+	if not v then stopLasso() end
+end, nil, nil, "Drag a rectangle around your objects to add them to the selection")
+bind(UIS.InputBegan, function(input, processed)
+	if not lasso.on or processed or Live.BindingActive or UIS:GetFocusedTextBox() then return end
+	if input.UserInputType == Enum.UserInputType.MouseButton1 then lasso.start = UIS:GetMouseLocation() end
+end)
+bind(UIS.InputChanged, function(input)
+	if not lasso.start or input.UserInputType ~= Enum.UserInputType.MouseMovement then return end
+	local current = UIS:GetMouseLocation()
+	lassoFrame.Position = UDim2.fromOffset(math.min(current.X, lasso.start.X), math.min(current.Y, lasso.start.Y))
+	lassoFrame.Size = UDim2.fromOffset(math.abs(current.X - lasso.start.X), math.abs(current.Y - lasso.start.Y))
+	lassoFrame.Visible = true
+end)
+bind(UIS.InputEnded, function(input)
+	if input.UserInputType ~= Enum.UserInputType.MouseButton1 or not lasso.start then return end
+	local start, finish = lasso.start, UIS:GetMouseLocation()
+	lasso.start, lassoFrame.Visible = nil, false
+	if math.abs(start.X - finish.X) < 6 or math.abs(start.Y - finish.Y) < 6 then return end
+	local camera = API.cam()
+	if not camera then return end
+	for _, folderName in ipairs({ "PlayerModels", "LogModels" }) do
+		local folder = Workspace:FindFirstChild(folderName)
+		if folder then
+			for _, model in ipairs(folder:GetChildren()) do
+				local part = model:IsA("Model") and mainPartOf(model)
+				if part and ownedByMe(model) then
+					local p, on = camera:WorldToScreenPoint(part.Position)
+					if on and p.Z > 0 and p.X >= math.min(start.X, finish.X) and p.X <= math.max(start.X, finish.X) and
+						p.Y >= math.min(start.Y, finish.Y) and p.Y <= math.max(start.Y, finish.Y) then setSel(model, true) end
+				end
+			end
+		end
+	end
+	updSel()
+end)
+Button(Sl, "Select All My Planks", "Select", function()
+	for _, entry in ipairs(LTExtra.scanPlanks(nil, 0, math.huge)) do setSel(entry.model, true) end
+	updSel()
+end)
+Button(Sl, "Select All My Loose Items", "Select", function()
+	local folder = Workspace:FindFirstChild("PlayerModels")
+	if folder then
+		for _, model in ipairs(folder:GetChildren()) do
+			local part = model:IsA("Model") and mainPartOf(model)
+			if part and not part.Anchored and ownedByMe(model) and not LTExtra.isBlueprint(model) then setSel(model, true) end
+		end
+	end
+	updSel()
+end)
+addCleanup(function() stopLasso() lassoFrame:Destroy() end)
+
 Toggle(Sl, "Group Selection (same name, yours)", false, function(v) SEL.same = v end, nil, nil, "Clicking selects every object of that name you own")
 Button(Sl, "Select All My Logs", "Select", function()
 	for _, m in ipairs(myLogs()) do setSel(m, true) end
@@ -1562,6 +2010,8 @@ Button(Sl, "Sort Selection Into A Grid (in front of me)", "Sort", function()
 end, nil, "Uses the grid sliders below")
 Button(Sl, "Stop", "Stop", function() stopAll() notify("Stopped", T.Sub) end)
 local SlOpt = Collapse(Sl, "Selection Settings")
+Toggle(SlOpt, "Pyramid Sorter", false, function(v) SEL.pyramid = v end, nil, nil, "Each layer shrinks and stays centered over the layer below")
+Toggle(SlOpt, "Match Plank Length In Groups", true, function(v) SEL.matchLength = v end, nil, nil, "Group selection matches wood type and plank length")
 Slider(SlOpt, "Grid Columns (X)", 1, 20, 4, function(v) SEL.X = v end)
 Slider(SlOpt, "Grid Layers (Y)", 1, 10, 1, function(v) SEL.Y = v end)
 Slider(SlOpt, "Grid Rows (Z)", 1, 20, 4, function(v) SEL.Z = v end)
@@ -1570,6 +2020,130 @@ Slider(SlOpt, "Ownership Timeout (s)", 1, 10, 3, function(v) SEL.timeout = v end
 Toggle(SlOpt, "Keep Selection After Moving", true, function(v) SEL.keep = v end)
 Toggle(SlOpt, "Return To Origin After Moving", false, function(v) SEL.back = v end)
 addCleanup(function() if SEL.click then SEL.click:Disconnect() end clearSel() end)
+end
+
+-- ---------------------------------------------------- PLOT: plank selection and blueprint filling
+-- Ported from the reference Build module into the existing Plot tab.
+do
+local Build = { class = nil, minY = 0, maxY = 100, click = false, pick = false }
+local classNames, classDropdown, fillToggle, buildRow = {}, nil, nil, nil
+local function refreshBuildStatus()
+	local count = #LTExtra.scanPlanks(Build.class, Build.minY, Build.maxY)
+	if buildRow then buildRow.Text = "Planks: " .. count .. " | type: " .. tostring(Build.class or "all") end
+end
+local function refreshPlankTypes(wanted)
+	local seen = {}
+	classNames = { "All my wood types" }
+	for _, entry in ipairs(LTExtra.scanPlanks(nil, 0, math.huge)) do seen[entry.class] = true end
+	local types = {} for class in pairs(seen) do table.insert(types, class) end table.sort(types)
+	for _, class in ipairs(types) do table.insert(classNames, class) end
+	classDropdown.SetOptions(classNames)
+	local selected = 1
+	for i, name in ipairs(classNames) do if name == (wanted or Build.class) then selected = i end end
+	classDropdown.Set(selected, true)
+	Build.class = selected > 1 and classNames[selected] or nil
+	refreshBuildStatus()
+end
+local function blueprints()
+	local result, folder = {}, Workspace:FindFirstChild("PlayerModels")
+	if folder then
+		for _, model in ipairs(folder:GetChildren()) do
+			if LTExtra.isBlueprint(model) and mainPartOf(model) then table.insert(result, model) end
+		end
+	end
+	local root = getRoot()
+	if root then table.sort(result, function(a, b) return (mainPartOf(a).Position - root.Position).Magnitude < (mainPartOf(b).Position - root.Position).Magnitude end) end
+	return result
+end
+local function feedBlueprint(blueprint, alive)
+	if not alive() or not blueprint.Parent or not LTExtra.isBlueprint(blueprint) then return false, "Blueprint unavailable" end
+	local list = LTExtra.scanPlanks(Build.class, Build.minY, Build.maxY)
+	if #list == 0 then return false, "No matching owned planks" end
+	local part = mainPartOf(blueprint)
+	if not part then return false, "Blueprint has no placement part" end
+	local plank = list[1]
+	local before = plank.part.Size.Y
+	if not LTExtra.moveOwned(plank.model, CFrame.new(part.Position), alive) then return false, "Plank could not be moved" end
+	-- A move is only a delivery attempt. Confirm server consumption or progress.
+	local deadline = os.clock() + 4
+	while alive() and os.clock() < deadline do
+		if not blueprint.Parent or not LTExtra.isBlueprint(blueprint) then return true, "Blueprint completed" end
+		if not plank.model.Parent or not plank.part.Parent or plank.part.Size.Y < before - 0.01 then return true, "Plank consumed" end
+		task.wait(0.1)
+	end
+	return false, alive() and "No fill progress confirmed; check plank size and blueprint requirements" or "Stopped"
+end
+local fillSection = Section(PlotTab, "Blueprint Filling", "Deliver your selected planks to your own blueprints", "magnet")
+classDropdown = Dropdown(fillSection, "Plank Wood Type", classNames, 1, function(i)
+	Build.class = i > 1 and classNames[i] or nil
+	refreshBuildStatus()
+end)
+Button(fillSection, "Refresh Owned Planks", "Scan", function() refreshPlankTypes() end)
+Button(fillSection, "Pick Plank Type By Clicking", "Pick", function()
+	LTExtra.activatePicker("planktype")
+	Build.pick = true
+	notify("Click one of your planks to select its wood type", T.Sub)
+end)
+Slider(fillSection, "Min Plank Length (x0.1 stud)", 0, 1000, 0, function(v) Build.minY = v / 10 refreshBuildStatus() end)
+Slider(fillSection, "Max Plank Length (x0.1 stud)", 1, 1000, 1000, function(v) Build.maxY = v / 10 refreshBuildStatus() end)
+buildRow = InfoRow(fillSection, "Planks: press Scan")
+local function stopFillClick()
+	Build.click = false
+	if fillToggle then fillToggle.Set(false) end
+end
+LTExtra.pickers.blueprint = stopFillClick
+LTExtra.pickers.planktype = function() Build.pick = false end
+table.insert(LTExtra.stopHooks, stopFillClick)
+table.insert(LTExtra.stopHooks, LTExtra.pickers.planktype)
+fillToggle = Toggle(fillSection, "Click To Fill Blueprint", false, function(v)
+	if v then LTExtra.activatePicker("blueprint") end
+	Build.click = v
+end, nil, nil, "Click an owned blueprint to deliver one matching plank")
+bind(UIS.InputBegan, function(input, processed)
+	if processed or Live.BindingActive or not Live.Unlocked or UIS:GetFocusedTextBox() or
+		input.UserInputType ~= Enum.UserInputType.MouseButton1 then return end
+	local model = topModel(mouse.Target, Workspace:FindFirstChild("PlayerModels"))
+	if Build.pick then
+		if model and model.Name == "Plank" and ownedByMe(model) and classOf(model) then
+			Build.pick = false refreshPlankTypes(classOf(model))
+		end
+	elseif Build.click and not LT.busy and LTExtra.isBlueprint(model) then
+		runJob("Filling blueprint", function(alive)
+			LTExtra.withReturn(function()
+				local ok, reason = feedBlueprint(model, alive)
+				if alive() then notify(reason, ok and T.Good or T.Warn) end
+			end)
+			refreshBuildStatus()
+		end)
+	end
+end)
+Button(fillSection, "Fill All My Blueprints", "Fill", function()
+	if Build.minY > Build.maxY then notify("Minimum plank length is above maximum", T.Warn) return end
+	runJob("Filling blueprints", function(alive)
+		LTExtra.withReturn(function()
+			local list = blueprints()
+			if #list == 0 then notify("No owned blueprints found", T.Warn) return end
+			local delivered, failed = 0, 0
+			for index, blueprint in ipairs(list) do
+				if not alive() then break end
+				-- Multiple planks may be needed. Each successful iteration must consume
+				-- material; failures stop that blueprint instead of looping forever.
+				for attempt = 1, 100 do
+					if not alive() or not blueprint.Parent or not LTExtra.isBlueprint(blueprint) then break end
+					setStatus("Blueprint " .. index .. " / " .. #list .. " | delivery " .. attempt)
+					local ok, reason = feedBlueprint(blueprint, alive)
+					if not ok then failed = failed + 1 if alive() then notify(reason, T.Warn) end break end
+					delivered = delivered + 1
+				end
+			end
+			if alive() then notify("Confirmed deliveries: " .. delivered .. " | stalled blueprints: " .. failed, delivered > 0 and T.Good or T.Warn) end
+		end)
+		refreshBuildStatus()
+	end)
+end)
+Button(fillSection, "Stop Blueprint Job", "Stop", stopAll)
+addCleanup(function() Build.pick = false stopFillClick() end)
+task.delay(1, function() if Live.Running then refreshPlankTypes() end end)
 end
 
 -- ---------------------------------------------------- VEHICLE
