@@ -1,6 +1,8 @@
 """Local text editing. Documents never use the key API or execute their contents."""
 from bisect import bisect_right
 import ast
+import sys
+import importlib.metadata
 import json
 import queue
 import re
@@ -20,6 +22,8 @@ FG = "#F0F2FA"
 MUTED = "#9AA3BA"
 PURPLE = "#9B87F5"
 
+
+EDITOR_REVISION = "editor-3"
 
 LANGUAGES = ["Luau", "Python", "JSON", "JavaScript", "Plain text"]
 COLORS = {"keyword": "#BDA7FF", "string": "#91D9B1", "comment": "#697892",
@@ -47,8 +51,8 @@ def analyze_code(source, language):
                 if token in family:
                     highlights.append((kind, offset, offset + len(value)))
                     break
-    except ImportError:
-        notice = "Install requirements.txt to enable syntax colors"
+    except ImportError as error:
+        notice = "Highlighting unavailable: " + str(error)
     except Exception as error:
         notice = "Highlighting unavailable: " + str(error)
     try:
@@ -80,8 +84,8 @@ def analyze_code(source, language):
         problems.append((error.lineno or 1, error.offset or 1, error.msg))
     except json.JSONDecodeError as error:
         problems.append((error.lineno, error.colno, error.msg))
-    except ImportError:
-        notice = "Luau checks unavailable · run python -m pip install -r requirements.txt"
+    except ImportError as error:
+        notice = "Luau checks unavailable: " + str(error)
     except Exception as error:
         notice = "Syntax checker unavailable: " + str(error)
     return highlights, problems, notice
@@ -236,7 +240,11 @@ class EditorTab:
         # Workers only handle strings. Tk calls stay on the UI thread.
         results = self.workspace.analysis_results
         def work():
-            results.put((self, revision, analyze_code(source, language)))
+            try:
+                result = analyze_code(source, language)
+            except Exception as error:
+                result = ([], [], "Checker unavailable: " + str(error))
+            results.put((self, revision, result))
         threading.Thread(target=work, daemon=True).start()
 
     def apply_analysis(self, result):
@@ -350,12 +358,21 @@ class CodeWorkspace(ctk.CTkFrame):
         self.notebook.pack(fill="both", expand=True)
         problems_panel = ctk.CTkFrame(editor_area, fg_color="#131722", corner_radius=0, height=120)
         problems_panel.pack(fill="x", pady=(1, 0))
-        self.problem_heading = ctk.CTkLabel(problems_panel, text="PROBLEMS", text_color=MUTED, anchor="w", font=("Segoe UI", 11, "bold"))
-        self.problem_heading.pack(fill="x", padx=14, pady=(6, 2))
+        problem_bar = ctk.CTkFrame(problems_panel, fg_color="transparent")
+        problem_bar.pack(fill="x", padx=14, pady=(6, 2))
+        ctk.CTkButton(problem_bar, text="Check setup", width=96, height=26,
+                      fg_color="#241B45", command=self.check_setup).pack(side="right")
+        ctk.CTkButton(problem_bar, text="Check code", width=96, height=26,
+                      fg_color="#171B28", command=self.check_now).pack(side="right", padx=6)
+        self.problem_heading = ctk.CTkLabel(problem_bar, text="PROBLEMS", text_color=MUTED, anchor="w", font=("Segoe UI", 11, "bold"))
+        self.problem_heading.pack(side="left", fill="x", expand=True)
         self.problem_list = tk.Listbox(problems_panel, height=3, bg="#131722", fg="#FB7185", font=("Segoe UI", 11),
                                       selectbackground="#302748", activestyle="none", bd=0, highlightthickness=0)
         self.problem_list.pack(fill="x", padx=14, pady=(0, 10))
         self.problem_list.bind("<<ListboxSelect>>", self.jump_problem)
+        self.problem_detail = ctk.CTkLabel(problems_panel, text="", text_color=MUTED, anchor="w",
+                                          justify="left", wraplength=680)
+        self.problem_detail.pack(fill="x", padx=14, pady=(0, 6))
         body.add(sidebar, width=230, minsize=160)
         body.add(editor_area, minsize=400, stretch="always")
         self.notebook.bind("<<NotebookTabChanged>>", lambda e: self.update_status())
@@ -380,10 +397,50 @@ class CodeWorkspace(ctk.CTkFrame):
             while True:
                 tab, revision, result = self.analysis_results.get_nowait()
                 if str(tab.frame) in self.tabs and tab.revision == revision:
-                    tab.apply_analysis(result)
+                    try:
+                        tab.apply_analysis(result)
+                    except Exception as error:
+                        tab.notice = "Editor display unavailable: " + str(error)
+                        if self.active() is tab:
+                            self.update_status()
         except queue.Empty:
             pass
         self.after(100, self.poll_analysis)
+
+    def check_now(self):
+        tab = self.active()
+        if tab:
+            tab.schedule_analysis()
+            tab.text.after_cancel(tab.analysis_job)
+            tab.start_analysis()
+            self.update_status()
+
+    def check_setup(self):
+        colors, _, valid_notice = analyze_code('local value: number = 2', "Luau")
+        _, errors, invalid_notice = analyze_code('local value = )', "Luau")
+        versions = []
+        for package in ("Pygments", "tree-sitter", "tree-sitter-luau"):
+            try:
+                version = importlib.metadata.version(package)
+            except importlib.metadata.PackageNotFoundError:
+                version = "NOT INSTALLED"
+            versions.append(package + ": " + version)
+        tab = self.active()
+        report = "\n".join([
+            "Solos Code Workspace " + EDITOR_REVISION,
+            "Python: " + sys.version.split()[0], "Interpreter: " + sys.executable,
+            "Editor file: " + str(Path(__file__).resolve()), *versions,
+            "Luau color test: " + ("PASS" if colors else "FAIL"),
+            "Luau error test: " + ("PASS" if errors else "FAIL"),
+            "Color test status: " + valid_notice, "Error test status: " + invalid_notice,
+            "Selected language: " + (tab.language if tab else "none"),
+            "Current status: " + (tab.notice if tab else "no file open"),
+        ])
+        self.clipboard_clear()
+        self.clipboard_append(report)
+        messagebox.showinfo("Editor setup · report copied", report +
+                            "\n\nReport copied to clipboard. No document contents are included.", parent=self)
+        return report
 
     def change_language(self, language):
         tab = self.active()
@@ -565,12 +622,25 @@ class CodeWorkspace(ctk.CTkFrame):
         tab = self.active()
         if not tab:
             self.problem_list.delete(0, "end")
-            self.problem_heading.configure(text="PROBLEMS · Open a file to check syntax")
+            self.problem_heading.configure(text="PROBLEMS · Open a file to check syntax", text_color=MUTED)
+            self.problem_detail.configure(text="")
             self.status.configure(text="New or Open files to start editing · Ctrl+N / Ctrl+O")
             return
         self.language_menu.set(tab.language)
-        self.problem_heading.configure(text="PROBLEMS  ·  %d syntax issue%s   /   %s" %
-                                       (len(tab.problems), "" if len(tab.problems) == 1 else "s", tab.notice))
+        unavailable = "unavailable" in tab.notice.lower()
+        if unavailable:
+            headline, color = "CHECKER / HIGHLIGHTING UNAVAILABLE", "#FB7185"
+            detail = tab.notice + "\nRun python -m pip install -r requirements.txt, then restart the app. Use Check setup to copy details."
+        elif tab.notice == "Checking syntax…":
+            headline, color, detail = "CHECKING…", MUTED, ""
+        elif tab.notice.startswith("Highlighting only"):
+            headline, color, detail = "SYNTAX CHECKING OFF", "#F4BD6A", tab.notice
+        else:
+            headline = "%d SYNTAX ISSUE%s" % (len(tab.problems), "" if len(tab.problems) == 1 else "S")
+            color = "#FB7185" if tab.problems else "#43D9AC"
+            detail = "Syntax only · misspelled names, invalid game APIs and logic bugs are not checked."
+        self.problem_heading.configure(text=headline, text_color=color)
+        self.problem_detail.configure(text=detail)
         self.problem_list.delete(0, "end")
         for row, col, detail in tab.problems:
             self.problem_list.insert("end", "  Line %d:%d   %s" % (row, col, detail))

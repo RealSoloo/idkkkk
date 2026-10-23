@@ -48,7 +48,12 @@ entry in **Problems** to jump to it. Luau checks support Roblox type annotations
 and `continue`. JavaScript has highlighting only. These checks do not execute
 code, validate Roblox APIs, or detect runtime/logic errors. Install the updated
 `requirements.txt` to enable highlighting and Luau parsing; missing packages
-are reported in the Problems header.
+are reported prominently as **CHECKER / HIGHLIGHTING UNAVAILABLE** rather than
+zero errors. **Check code** requests an immediate check. **Check setup** tests
+Luau coloring and error detection, then copies a report with the editor revision,
+loaded file path, Python interpreter, and dependency versions. Document contents
+are excluded from that report. This helps identify stale copies or dependencies
+installed for a different Python interpreter.
 
 **Save**, **Save as**, and **Save all**
 write to your computer. Files are not uploaded, synced to GitHub, or executed.

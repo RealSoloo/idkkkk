@@ -200,6 +200,44 @@ class GuiTests(unittest.TestCase):
         self.assertFalse(tab.text.tag_ranges("error"))
         self.assertIn("Syntax checked", tab.notice)
 
+    def test_missing_parser_is_visible(self):
+        import sys
+        tab = self.workspace.active()
+        with patch.dict(sys.modules, {"tree_sitter_luau": None}):
+            result = analyze_code("local x = )", "Luau")
+        tab.apply_analysis(result)
+        self.assertIn("UNAVAILABLE", self.workspace.problem_heading.cget("text"))
+        self.assertNotIn("0 SYNTAX", self.workspace.problem_heading.cget("text"))
+        self.assertIn("pip install", self.workspace.problem_detail.cget("text"))
+
+    def test_setup_report_and_txt_language(self):
+        path = self.path.with_suffix(".txt")
+        path.write_text("local x = )")
+        tab = self.workspace.open_path(path)
+        self.assertEqual(tab.language, "Luau")
+        tab.apply_analysis(analyze_code(tab.content(), tab.language))
+        self.assertTrue(tab.problems)
+        self.assertTrue(tab.text.tag_ranges("keyword"))
+        with patch("code_workspace.messagebox.showinfo"):
+            report = self.workspace.check_setup()
+        self.assertIn("editor-3", report)
+        self.assertIn("Luau color test: PASS", report)
+        self.assertIn("Luau error test: PASS", report)
+        self.assertNotIn("local x = )", report)
+
+    def test_display_failure_does_not_stop_later_checks(self):
+        ws = self.workspace
+        tab = ws.active()
+        result = analyze_code("local x = )", "Luau")
+        ws.analysis_results.put((tab, tab.revision, result))
+        with patch.object(tab, "apply_analysis", side_effect=RuntimeError("display test")):
+            ws.poll_analysis()
+        self.assertIn("display test", tab.notice)
+        ws.analysis_results.put((tab, tab.revision, result))
+        ws.poll_analysis()
+        self.assertTrue(tab.problems)
+        self.assertNotIn("unavailable", tab.notice)
+
     def test_large_script(self):
         text = "local example = 'a line of Lua'\n" * 17000
         self.path.write_text(text)
