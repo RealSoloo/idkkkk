@@ -16,20 +16,20 @@ import customtkinter as ctk
 
 ctk.set_appearance_mode("Dark")
 
-# ---- palette (unchanged) ----
-BG_MAIN = "#08070E"
-BG_SIDEBAR = "#100E1A"
-BG_WORKSPACE = "#0D0C15"
-CARD_SURFACE = "#151324"
-ACCENT_PURPLE = "#8B5CF6"
-ACCENT_HOVER = "#7C3AED"
-TEXT_WHITE = "#FFFFFF"
-TEXT_MUTED = "#6B6982"
-BORDER_TINT = "#1F1C36"
-RED_DANGER = "#EF4444"
-GREEN_ONLINE = "#10B981"
-AMBER_PROGRESS = "#F59E0B"
-INPUT_CANVAS = "#050408"
+# ---- midnight / lavender palette ----
+BG_MAIN = "#0B0D14"
+BG_SIDEBAR = "#11141F"
+BG_WORKSPACE = "#131722"
+CARD_SURFACE = "#171B28"
+ACCENT_PURPLE = "#9B87F5"
+ACCENT_HOVER = "#8470DF"
+TEXT_WHITE = "#F0F2FA"
+TEXT_MUTED = "#9AA3BA"
+BORDER_TINT = "#2B3247"
+RED_DANGER = "#FB7185"
+GREEN_ONLINE = "#43D9AC"
+AMBER_PROGRESS = "#F4BD6A"
+INPUT_CANVAS = "#10131E"
 
 # tinted extras used for pills / permanent keys
 PERM_LAVENDER = "#C4B5FD"
@@ -101,8 +101,8 @@ class App:
         self.toast_job = None
 
         self.root.title(APP_NAME)
-        self.root.geometry("1180x760")
-        self.root.minsize(1000, 640)
+        self.root.geometry("1440x900")
+        self.root.minsize(1280, 820)
         self.root.configure(bg=BG_MAIN)
 
         self.build_ui()
@@ -149,10 +149,11 @@ class App:
 
         self.build_topbar()
         self.build_connection_strip()
+        self.build_page_heading()
 
         body = ctk.CTkFrame(self.main, fg_color="transparent")
         body.pack(fill="both", expand=True, padx=24, pady=(8, 24))
-        body.grid_columnconfigure(0, weight=0, minsize=310)
+        body.grid_columnconfigure(0, weight=0, minsize=320)
         body.grid_columnconfigure(1, weight=1)
         body.grid_rowconfigure(0, weight=1)
 
@@ -160,9 +161,19 @@ class App:
         self.build_registry(body)
         self.update_summary()
 
+    def build_page_heading(self):
+        heading = ctk.CTkFrame(self.main, fg_color="transparent")
+        heading.pack(fill="x", padx=28, pady=(16, 14))
+        title = ctk.CTkFrame(heading, fg_color="transparent")
+        title.pack(side="left")
+        self.label(title, "Key workspace", 28, color=TEXT_WHITE).pack(anchor="w")
+        self.label(title, "Create access. Manage connections. Stay in control.",
+                   13, False).pack(anchor="w", pady=(2, 0))
+        self.label(heading, "F5  /  Refresh keys", 12, False).pack(side="right")
+
     def card(self, parent):
         return ctk.CTkFrame(parent, fg_color=CARD_SURFACE, border_color=BORDER_TINT,
-                            border_width=1, corner_radius=14)
+                            border_width=1, corner_radius=16)
 
     def label(self, parent, text, size=10, bold=True, color=TEXT_MUTED, **kw):
         return ctk.CTkLabel(parent, text=text, font=(FONT, size, "bold" if bold else "normal"),
@@ -176,9 +187,9 @@ class App:
 
         brand = ctk.CTkFrame(bar, fg_color="transparent")
         brand.pack(side="left", padx=26)
-        ctk.CTkLabel(brand, text="SOLOS HUB", font=(FONT, 21, "bold"),
+        ctk.CTkLabel(brand, text="S / SOLOS", font=(FONT, 21, "bold"),
                      text_color=ACCENT_PURPLE, anchor="w").pack(anchor="w", pady=(11, 0))
-        self.label(brand, "Key Manager", 11, False).pack(anchor="w")
+        self.label(brand, "ACCESS MANAGEMENT", 10, False).pack(anchor="w")
 
         right = ctk.CTkFrame(bar, fg_color="transparent")
         right.pack(side="right", padx=26)
@@ -191,7 +202,7 @@ class App:
         self.status_lbl.pack(padx=16, pady=4)
 
         self.conn_toggle_btn = ctk.CTkButton(
-            right, text="⚙  Connection", width=120, height=32, corner_radius=16,
+            right, text="Connection", width=120, height=32, corner_radius=16,
             fg_color=CARD_SURFACE, border_color=BORDER_TINT, border_width=1,
             hover_color=BORDER_TINT, font=(FONT, 12), command=self.toggle_conn_strip)
         self.conn_toggle_btn.pack(side="left")
@@ -255,7 +266,9 @@ class App:
 
     # ------------------------------------------------------- generator
     def build_generator(self, body):
-        gen = self.card(body)
+        gen = ctk.CTkScrollableFrame(
+            body, fg_color=CARD_SURFACE, border_color=BORDER_TINT,
+            border_width=1, corner_radius=16, width=300)
         gen.grid(row=0, column=0, sticky="nsew", padx=(0, 16))
 
         ctk.CTkLabel(gen, text="Generate Keys", font=(FONT, 17, "bold"),
@@ -314,7 +327,7 @@ class App:
         self.summary_lbl = self.label(gen, "", 11, False, color=PERM_LAVENDER)
         self.summary_lbl.pack(fill="x", padx=24, pady=(14, 0))
 
-        self.gen_btn = ctk.CTkButton(gen, text="Generate", height=46, corner_radius=10,
+        self.gen_btn = ctk.CTkButton(gen, text="+  Generate keys", height=46, corner_radius=10,
                                      fg_color=ACCENT_PURPLE, hover_color=ACCENT_HOVER,
                                      font=(FONT, 14, "bold"), command=self.generate,
                                      state="disabled")
@@ -322,11 +335,11 @@ class App:
 
         ctk.CTkFrame(gen, height=1, fg_color=BORDER_TINT).pack(fill="x", padx=24, pady=22)
 
-        self.label(gen, "TIPS").pack(fill="x", padx=24)
+        self.label(gen, "QUICK GUIDE").pack(fill="x", padx=24)
         self.label(
             gen,
             "Click a key to copy it.\nReset frees a key for another account.\n"
-            "Revoke kills a key immediately.\nF5 syncs the list.",
+            "Revoke removes access immediately.\nF5 refreshes your registry.",
             11, False, justify="left").pack(fill="x", padx=24, pady=(6, 0))
 
     def on_perm(self):
@@ -364,7 +377,7 @@ class App:
     def stat_card(self, parent, title, color=TEXT_WHITE):
         f = ctk.CTkFrame(parent, fg_color=INPUT_CANVAS, border_color=BORDER_TINT,
                          border_width=1, corner_radius=12)
-        val = ctk.CTkLabel(f, text="0", font=(FONT, 24, "bold"), text_color=color, anchor="w")
+        val = ctk.CTkLabel(f, text="0", font=(FONT, 28, "bold"), text_color=color, anchor="w")
         val.pack(anchor="w", padx=16, pady=(12, 0))
         self.label(f, title).pack(anchor="w", padx=16, pady=(0, 12))
         return f, val
@@ -376,7 +389,7 @@ class App:
         stats = ctk.CTkFrame(reg, fg_color="transparent")
         stats.pack(fill="x", padx=24, pady=(24, 0))
         stats.grid_columnconfigure((0, 1, 2, 3), weight=1, uniform="s")
-        cards = [("ACTIVE KEYS", TEXT_WHITE), ("IN USE", ACCENT_PURPLE),
+        cards = [("TOTAL KEYS", TEXT_WHITE), ("IN USE", ACCENT_PURPLE),
                  ("AVAILABLE", GREEN_ONLINE), ("PERMANENT", PERM_LAVENDER)]
         self.stat_vals = []
         for i, (t, c) in enumerate(cards):
@@ -386,7 +399,7 @@ class App:
 
         tb = ctk.CTkFrame(reg, fg_color="transparent")
         tb.pack(fill="x", padx=24, pady=(20, 0))
-        ctk.CTkLabel(tb, text="Keys", font=(FONT, 17, "bold"),
+        ctk.CTkLabel(tb, text="Key registry", font=(FONT, 19, "bold"),
                      text_color=TEXT_WHITE).pack(side="left")
         self.count_lbl = self.label(tb, "", 11, False)
         self.count_lbl.pack(side="left", padx=10, pady=(4, 0))
@@ -396,7 +409,7 @@ class App:
                                          hover_color=BORDER_TINT, font=(FONT, 12),
                                          command=self.refresh, state="disabled")
         self.refresh_btn.pack(side="right")
-        self.search_entry = ctk.CTkEntry(tb, placeholder_text="🔍  Search keys...", width=210,
+        self.search_entry = ctk.CTkEntry(tb, placeholder_text="Search keys…", width=200,
                                          height=34, fg_color=INPUT_CANVAS,
                                          border_color=BORDER_TINT, text_color=TEXT_WHITE,
                                          font=(FONT, 12), corner_radius=8)
@@ -418,7 +431,7 @@ class App:
         hdr.pack(fill="x", padx=24)
         hdr.pack_propagate(False)
         self.setup_cols(hdr)
-        for i, t in enumerate(("KEY", "STATUS", "ACCOUNT", "TIME LEFT")):
+        for i, t in enumerate(("KEY", "STATUS", "ACCOUNT", "TIME LEFT", "ACTIONS")):
             self.label(hdr, t).grid(row=0, column=i + 1, sticky="w", padx=(6, 4))
 
         self.scroll_list = ctk.CTkScrollableFrame(reg, fg_color="transparent", label_text="")
@@ -426,11 +439,11 @@ class App:
 
     def setup_cols(self, f):
         f.grid_columnconfigure(0, weight=0, minsize=12)
-        f.grid_columnconfigure(1, weight=3, minsize=220)
-        f.grid_columnconfigure(2, weight=1, minsize=110)
-        f.grid_columnconfigure(3, weight=1, minsize=90)
-        f.grid_columnconfigure(4, weight=1, minsize=100)
-        f.grid_columnconfigure(5, weight=0, minsize=200)
+        f.grid_columnconfigure(1, weight=3, minsize=160)
+        f.grid_columnconfigure(2, weight=0, minsize=110)
+        f.grid_columnconfigure(3, weight=0, minsize=80)
+        f.grid_columnconfigure(4, weight=0, minsize=90)
+        f.grid_columnconfigure(5, weight=0, minsize=194)
         f.grid_rowconfigure(0, weight=1)
 
     # ---------------------------------------------------------- helpers
@@ -657,8 +670,14 @@ class App:
             msg = ("No keys match your filter." if self.keys else
                    "No active keys yet. Generate some on the left." if self.connected
                    else "Connect to your worker to see your keys.")
-            ctk.CTkLabel(self.scroll_list, text=msg, font=(FONT, 12),
-                         text_color=TEXT_MUTED).pack(pady=60)
+            empty = ctk.CTkFrame(self.scroll_list, fg_color="transparent")
+            empty.pack(fill="x", pady=58)
+            ctk.CTkLabel(empty, text="◇", font=(FONT, 44),
+                         text_color=ACCENT_PURPLE).pack()
+            title = "No matching keys" if self.keys else "Your keys live here"
+            self.label(empty, title, 19, color=TEXT_WHITE).pack(pady=(10, 6))
+            ctk.CTkLabel(empty, text=msg, font=(FONT, 13), wraplength=420,
+                         text_color=TEXT_MUTED).pack()
             return
 
         styles = {
@@ -674,7 +693,7 @@ class App:
             color, pill_bg, pill_txt = styles[state]
             copy_cmd = lambda e=None, s=key_str: self.copy_text(s)
 
-            row = ctk.CTkFrame(self.scroll_list, fg_color=BG_WORKSPACE, height=54,
+            row = ctk.CTkFrame(self.scroll_list, fg_color=BG_WORKSPACE, height=62,
                                corner_radius=10, border_color=BORDER_TINT, border_width=1)
             row.pack(fill="x", pady=3, padx=4)
             row.pack_propagate(False)
@@ -685,7 +704,8 @@ class App:
             bar = ctk.CTkFrame(inner, width=4, fg_color=color, corner_radius=2)
             bar.grid(row=0, column=0, sticky="ns", padx=(8, 2), pady=10)
 
-            kl = ctk.CTkLabel(inner, text=key_str, font=("Consolas", 13, "bold"),
+            kl = ctk.CTkLabel(inner, text=key_str if len(key_str) <= 20 else key_str[:17] + "…",
+                              width=150, font=("Consolas", 12, "bold"),
                               text_color=TEXT_WHITE, anchor="w")
             kl.grid(row=0, column=1, sticky="w", padx=(8, 4))
             kl.bind("<Button-1>", copy_cmd)
@@ -695,7 +715,8 @@ class App:
                          ).grid(row=0, column=2, sticky="w", padx=4)
 
             uid = k.get("uid") or k.get("hwid")
-            ctk.CTkLabel(inner, text=str(uid) if uid else "—", font=(FONT, 11),
+            ctk.CTkLabel(inner, text=(str(uid)[:9] + "…" if len(str(uid)) > 10 else str(uid)) if uid else "—",
+                         width=75, font=(FONT, 11),
                          text_color=TEXT_WHITE if uid else TEXT_MUTED, anchor="w"
                          ).grid(row=0, column=3, sticky="w", padx=4)
 
@@ -715,10 +736,10 @@ class App:
                           fg_color=BORDER_TINT, hover_color="#2E2A52", font=(FONT, 11),
                           command=copy_cmd).pack(side="left", padx=2)
             ctk.CTkButton(acts, text="Reset", width=54, height=30, corner_radius=8,
-                          fg_color="#1E3A8A", hover_color="#1E40AF", font=(FONT, 11),
+                          fg_color="#25354B", hover_color="#354965", font=(FONT, 11),
                           command=lambda s=key_str: self.reset_hwid(s)).pack(side="left", padx=2)
             ctk.CTkButton(acts, text="Revoke", width=60, height=30, corner_radius=8,
-                          fg_color="#7F1D1D", hover_color="#991B1B", font=(FONT, 11),
+                          fg_color=PILL_RED, text_color=RED_DANGER, hover_color="#4B252F", font=(FONT, 11),
                           command=lambda s=key_str: self.delete_key(s)).pack(side="left", padx=2)
 
     # ----------------------------------------------------------- popup
