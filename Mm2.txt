@@ -1,0 +1,1059 @@
+-- Solos Hub game module: mm2.lua
+-- Loaded by the main hub script (picker -> loadstring). Do not run this file on its own.
+--
+-- Roles are detected from tools: whoever owns a "Knife" is the Murderer, a "Gun" is the Sheriff.
+
+local Hub, S, T, C = ...
+local API = Hub.API
+local Live = API.Live -- live values: Live.Running, Live.Unlocked, Live.BindingActive
+local Dropdown, Collapse, PlayerList = API.Dropdown, API.Collapse, API.PlayerList
+
+local AddTab = API.AddTab
+local Button = API.Button
+local Esp = API.Esp
+local EspGui = API.EspGui
+local InfoRow = API.InfoRow
+local LocalPlayer = API.LocalPlayer
+local PlayerGui = API.PlayerGui
+local Players = API.Players
+local RunService = API.RunService
+local Section = API.Section
+local Slider = API.Slider
+local TabButtons = API.TabButtons
+local Tabs = API.Tabs
+local Toggle = API.Toggle
+local TweenService = API.TweenService
+local Workspace = API.Workspace
+local bind = API.bind
+local cam = API.cam
+local filterTabs = API.filterTabs
+local getChar = API.getChar
+local getHum = API.getHum
+local getRoot = API.getRoot
+local nearestPlayer = API.nearestPlayer
+local new = API.new
+local notify = API.notify
+local onUnload = API.onUnload
+local spectate = API.spectate
+local stopSpectate = API.stopSpectate
+
+if game.PlaceId ~= 142823291 then notify("You're not in Murder Mystery 2 - this module needs that game", T.Warn) end
+local Panel = Hub.GamePanel("Murder Mystery 2", "attack", "Round info, loot and attack tools.")
+local RoundTab = Panel.Sub("Round", "round", "Live round info, spectating and role ESP.")
+local LootTab = Panel.Sub("Loot", "loot", "Gun, coins and sheriff tools.")
+local AttackTab = Panel.Sub("Attack", "attack", "Pick a target, fling and kill.")
+Hub.gameHeader("MURDER MYSTERY 2")
+TabButtons["Murder Mystery 2"].Btn.LayoutOrder = -19
+filterTabs({ "Murder Mystery 2", "Dashboard", "Player", "ESP", "Players", "Teleports", "Commands", "Hub Chat", "Theme", "Settings" })
+
+local M = {
+	esp = false, showInno = true, names = true, fill = 0.6, gunEsp = true, alert = false, alertR = 40, announce = true,
+	autoGun = false, coinFarm = false, coinDelay = 0.12, walkFling = false, antiFling = false, aura = false, auraR = 12,
+	busy = false, token = 0, vel = Vector3.zero,
+}
+local COLORS = { Murderer = Color3.fromRGB(255, 60, 60), Sheriff = Color3.fromRGB(70, 140, 255), Innocent = Color3.fromRGB(70, 220, 120) }
+
+-- ---------------------------------------------------- helpers
+local function rootOf(p) return p and p.Character and p.Character:FindFirstChild("HumanoidRootPart") end
+local function alive(p)
+	local h = p and p.Character and p.Character:FindFirstChildOfClass("Humanoid")
+	return h ~= nil and h.Health > 0
+end
+local function hasTool(p, name)
+	local ch, bp = p.Character, p:FindFirstChildOfClass("Backpack")
+	return (ch and ch:FindFirstChild(name)) or (bp and bp:FindFirstChild(name))
+end
+local function roleOf(p)
+	if hasTool(p, "Knife") then return "Murderer" end
+	if hasTool(p, "Gun") then return "Sheriff" end
+	return "Innocent"
+end
+local function findRole(role)
+	for _, p in ipairs(Players:GetPlayers()) do
+		if alive(p) and roleOf(p) == role and hasTool(p, role == "Murderer" and "Knife" or "Gun") then return p end
+	end
+	return nil
+end
+local function gunDrop()
+	local g = Workspace:FindFirstChild("GunDrop", true)
+	return g and g:IsA("BasePart") and g or nil
+end
+local function toolNamed(n)
+	local ch, bp = LocalPlayer.Character, LocalPlayer:FindFirstChildOfClass("Backpack")
+	local t = (ch and ch:FindFirstChild(n)) or (bp and bp:FindFirstChild(n))
+	return t and t:IsA("Tool") and t or nil
+end
+local function equip(tool)
+	if tool.Parent ~= LocalPlayer.Character then
+		local h = getHum()
+		if h then h:EquipTool(tool) else tool.Parent = LocalPlayer.Character end
+	end
+end
+local lastWarn = 0
+local function warn2(text) if os.clock() - lastWarn > 2 then lastWarn = os.clock() notify(text, T.Warn) end end
+local function stopAll() M.token = M.token + 1 M.busy = false end
+local function runSeq(fn)
+	if M.busy then notify("Already running - press Stop first", T.Warn) return end
+	M.token = M.token + 1
+	local my = M.token
+	M.busy = true
+	task.spawn(function()
+		local good, err = pcall(fn, function() return Live.Running and M.token == my end)
+		if not good then warn2("Error: " .. tostring(err):sub(1, 60)) end
+		if M.token == my then M.busy = false end
+	end)
+end
+
+-- ---------------------------------------------------- role ESP (highlight + name tag)
+local objs = {}
+local function clearEsp()
+	for p, o in pairs(objs) do
+		if o.hl then o.hl:Destroy() end
+		if o.bb then o.bb:Destroy() end
+		objs[p] = nil
+	end
+end
+local gunHl, gunBb
+local function clearGun()
+	if gunHl then gunHl:Destroy() gunHl = nil end
+	if gunBb then gunBb:Destroy() gunBb = nil end
+end
+local function updateEsp()
+	local myRoot = getRoot()
+	for _, p in ipairs(Players:GetPlayers()) do
+		local o = objs[p]
+		local show = M.esp and p ~= LocalPlayer and alive(p) and p.Character
+		local role = show and roleOf(p)
+		if show and role == "Innocent" and not M.showInno then show = false end
+		if not show then
+			if o then o.hl.Enabled = false o.bb.Enabled = false end
+		else
+			if not o then
+				o = {}
+				o.hl = new("Highlight", { FillTransparency = M.fill, OutlineTransparency = 0, DepthMode = Enum.HighlightDepthMode.AlwaysOnTop }, EspGui)
+				o.bb = new("BillboardGui", { Size = UDim2.fromOffset(160, 36), StudsOffset = Vector3.new(0, 3.2, 0), AlwaysOnTop = true }, EspGui)
+				o.lbl = new("TextLabel", { Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, Font = Enum.Font.GothamBold, TextSize = 13, TextStrokeTransparency = 0.4 }, o.bb)
+				objs[p] = o
+			end
+			local col = COLORS[role]
+			o.hl.Adornee = p.Character
+			o.hl.FillColor, o.hl.OutlineColor, o.hl.FillTransparency, o.hl.Enabled = col, col, M.fill, true
+			local head = p.Character:FindFirstChild("Head") or rootOf(p)
+			o.bb.Adornee = head
+			o.bb.Enabled = M.names
+			local dist = (myRoot and rootOf(p)) and math.floor((rootOf(p).Position - myRoot.Position).Magnitude) or 0
+			o.lbl.Text = (role == "Innocent" and p.DisplayName or (role .. " - " .. p.DisplayName)) .. "  [" .. dist .. "]"
+			o.lbl.TextColor3 = col
+		end
+	end
+	for p, o in pairs(objs) do
+		if not p.Parent then o.hl:Destroy() o.bb:Destroy() objs[p] = nil end
+	end
+	-- dropped gun
+	local g = M.gunEsp and gunDrop()
+	if g then
+		if not gunHl then
+			gunHl = new("Highlight", { FillColor = Color3.fromRGB(255, 220, 60), OutlineColor = Color3.fromRGB(255, 220, 60), FillTransparency = 0.3, DepthMode = Enum.HighlightDepthMode.AlwaysOnTop }, EspGui)
+			gunBb = new("BillboardGui", { Size = UDim2.fromOffset(120, 24), AlwaysOnTop = true, StudsOffset = Vector3.new(0, 2, 0) }, EspGui)
+			new("TextLabel", { Name = "T", Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, Font = Enum.Font.GothamBold, TextSize = 13, TextColor3 = Color3.fromRGB(255, 220, 60), TextStrokeTransparency = 0.4 }, gunBb)
+		end
+		gunHl.Adornee, gunBb.Adornee = g, g
+		local d = myRoot and math.floor((g.Position - myRoot.Position).Magnitude) or 0
+		gunBb.T.Text = "DROPPED GUN [" .. d .. "]"
+	else
+		clearGun()
+	end
+end
+onUnload(function() clearEsp() clearGun() end)
+
+-- ---------------------------------------------------- state / info + alerts
+local infoMurd, infoSher, infoMe, infoGun
+local lastMurd, lastSher, lastAlert = nil, nil, 0
+task.spawn(function()
+	while Live.Running do
+		local murd, sher = findRole("Murderer"), findRole("Sheriff")
+		if infoMurd then
+			infoMurd.Set(murd and (murd.DisplayName .. " (@" .. murd.Name .. ")") or "-", murd and COLORS.Murderer or T.Sub)
+			infoSher.Set(sher and (sher.DisplayName .. " (@" .. sher.Name .. ")") or "-", sher and COLORS.Sheriff or T.Sub)
+			local myRole = roleOf(LocalPlayer)
+			infoMe.Set(myRole, COLORS[myRole] or T.Text)
+			local g, r = gunDrop(), getRoot()
+			infoGun.Set(g and ((r and math.floor((g.Position - r.Position).Magnitude) or "?") .. " studs away") or "None", g and T.Warn or T.Sub)
+		end
+		if M.announce then
+			if murd and murd ~= lastMurd then notify("Murderer: " .. murd.DisplayName, COLORS.Murderer) end
+			if sher and sher ~= lastSher then notify("Sheriff: " .. sher.DisplayName, COLORS.Sheriff) end
+		end
+		lastMurd, lastSher = murd, sher
+		if M.alert and murd and murd ~= LocalPlayer and os.clock() - lastAlert > 3 then
+			local r, mr = getRoot(), rootOf(murd)
+			if r and mr and (mr.Position - r.Position).Magnitude <= M.alertR then
+				lastAlert = os.clock()
+				notify("Murderer is " .. math.floor((mr.Position - r.Position).Magnitude) .. " studs away!", COLORS.Murderer)
+			end
+		end
+		task.wait(0.5)
+	end
+end)
+task.spawn(function()
+	while Live.Running do
+		pcall(updateEsp)
+		task.wait(0.2)
+	end
+end)
+
+-- ---------------------------------------------------- gun grab
+local function grabGun(ok)
+	local g, r = gunDrop(), getRoot()
+	if not g or not r then notify("No dropped gun right now", T.Warn) return false end
+	local home = r.CFrame
+	r.CFrame = g.CFrame + Vector3.new(0, 1.5, 0)
+	r.AssemblyLinearVelocity = Vector3.zero
+	local t0 = os.clock()
+	while (not ok or ok()) and gunDrop() and os.clock() - t0 < 1 do task.wait(0.05) end
+	local root = getRoot()
+	if root then root.CFrame = home root.AssemblyLinearVelocity = Vector3.zero end
+	return true
+end
+task.spawn(function()
+	while Live.Running do
+		if M.autoGun and not M.busy and gunDrop() and roleOf(LocalPlayer) ~= "Sheriff" and alive(LocalPlayer) then
+			grabGun()
+			task.wait(2)
+		end
+		task.wait(0.3)
+	end
+end)
+
+-- ---------------------------------------------------- coins
+local function coins()
+	local list, r = {}, getRoot()
+	for _, d in ipairs(Workspace:GetDescendants()) do
+		if d:IsA("BasePart") and d.Name == "Coin_Server" and d.Parent then table.insert(list, d) end
+	end
+	if r then table.sort(list, function(a, b) return (a.Position - r.Position).Magnitude < (b.Position - r.Position).Magnitude end) end
+	return list
+end
+local function collectCoins(ok)
+	local list = coins()
+	if #list == 0 then notify("No coins found", T.Warn) return end
+	local r = getRoot()
+	local home = r and r.CFrame
+	local n = 0
+	for _, c in ipairs(list) do
+		if ok and not ok() then break end
+		local root = getRoot()
+		if not root then break end
+		if c.Parent then
+			root.CFrame = c.CFrame
+			root.AssemblyLinearVelocity = Vector3.zero
+			n = n + 1
+			task.wait(M.coinDelay)
+		end
+	end
+	local root = getRoot()
+	if root and home then root.CFrame = home end
+	notify("Visited " .. n .. " coins", T.Good)
+end
+task.spawn(function()
+	while Live.Running do
+		if M.coinFarm and not M.busy and alive(LocalPlayer) then
+			local list = coins()
+			local r = getRoot()
+			if #list > 0 and r then
+				local c = list[1]
+				r.CFrame = c.CFrame
+				r.AssemblyLinearVelocity = Vector3.zero
+			end
+		end
+		task.wait(math.max(M.coinDelay, 0.05))
+	end
+end)
+
+-- ---------------------------------------------------- fling / anti-fling
+bind(RunService.Heartbeat, function()
+	if not M.walkFling then return end
+	local r = getRoot()
+	if not r then return end
+	M.vel = r.AssemblyLinearVelocity
+	r.AssemblyLinearVelocity = M.vel * 10000 + Vector3.new(0, 10000, 0)
+end)
+bind(RunService.RenderStepped, function()
+	if not M.walkFling then return end
+	local r = getRoot()
+	if r then r.AssemblyLinearVelocity = M.vel end
+end)
+local noCol = setmetatable({}, { __mode = "k" })
+local function restoreCol()
+	for p in pairs(noCol) do if p.Parent then p.CanCollide = true end end
+	table.clear(noCol)
+end
+bind(RunService.Stepped, function()
+	if not M.antiFling then return end
+	for _, pl in ipairs(Players:GetPlayers()) do
+		if pl ~= LocalPlayer and pl.Character then
+			for _, d in ipairs(pl.Character:GetDescendants()) do
+				if d:IsA("BasePart") and d.CanCollide then d.CanCollide = false noCol[d] = true end
+			end
+		end
+	end
+	local r = getRoot()
+	if r and (r.AssemblyLinearVelocity.Magnitude > 250 or r.AssemblyAngularVelocity.Magnitude > 100) then
+		r.AssemblyLinearVelocity = Vector3.zero
+		r.AssemblyAngularVelocity = Vector3.zero
+	end
+end)
+-- ---------------------------------------------------- target tracker + aim solver (auto shoot AND fling use this)
+-- Other players are drawn a little in the past (network + interpolation), but the server judges shots, and the physics
+-- contact that flings someone, against where they REALLY are. So every target gets a short history of the positions we
+-- see, and solve() predicts where they will be when the shot / contact lands:
+--   * horizontal: a fast fit (last ~0.14 s) blended with a slow fit (last ~0.45 s). A runner is extrapolated; someone
+--     spamming A/D is aimed at the middle of their wobble instead of a point they are about to leave.
+--   * vertical: a real jump arc (gravity) that stops at the floor, so a jumping target is aimed at where they will be
+--     in the air, not where they were.
+--   * confidence 0..1: low for erratic strafing, for a jump spammer standing on the ground (they can take off at any
+--     moment) and for a target that will land before the shot does. The shooter waits for a good moment.
+local TRK = {}
+local rpFloor = RaycastParams.new()
+rpFloor.FilterType = Enum.RaycastFilterType.Exclude
+local StatsSvc = game:GetService("Stats")
+local function pingTime() -- round trip in seconds
+	local rtt
+	pcall(function() rtt = StatsSvc.Network.ServerStatsItem["Data Ping"]:GetValue() / 1000 end)
+	if not rtt or rtt <= 0 then
+		local one = 0.06
+		pcall(function() one = LocalPlayer:GetNetworkPing() end)
+		rtt = one * 2
+	end
+	return math.clamp(rtt, 0.02, 1)
+end
+-- how far behind the server the positions we see are: our ping (x tuning) + the interpolation delay
+local function lagTime()
+	return math.clamp(pingTime() * M.lagMul + M.interp, 0, 0.9)
+end
+local function trackerOf(p)
+	local k = TRK[p]
+	if not k then
+		k = { s = {}, jumps = {}, lastVy = 0, floorY = nil, floorT = 0 }
+		TRK[p] = k
+	end
+	k.want = os.clock()
+	return k
+end
+bind(RunService.Heartbeat, function()
+	local now = os.clock()
+	for p, k in pairs(TRK) do
+		if not p.Parent or now - k.want > 2 then
+			TRK[p] = nil
+		else
+			local r = rootOf(p)
+			if r then
+				local s = k.s
+				local last = s[#s]
+				if last and (r.Position - last.pos).Magnitude > 40 then table.clear(s) end -- respawn / teleport: start over
+				table.insert(s, { t = now, pos = r.Position })
+				while #s > 0 and now - s[1].t > 0.6 do table.remove(s, 1) end
+			end
+		end
+	end
+end)
+-- least-squares line through the newest `w` seconds of samples: velocity + fitted position at the newest sample
+local function lsq(s, w)
+	local n = #s
+	if n < 3 then return nil end
+	local tn = s[n].t
+	local i0 = n
+	while i0 > 1 and tn - s[i0 - 1].t <= w do i0 = i0 - 1 end
+	local cnt = n - i0 + 1
+	if cnt < 3 then return nil end
+	local st, stt, sp, stp = 0, 0, Vector3.zero, Vector3.zero
+	for i = i0, n do
+		local d = s[i]
+		local tt = d.t - tn
+		st = st + tt
+		stt = stt + tt * tt
+		sp = sp + d.pos
+		stp = stp + d.pos * tt
+	end
+	local den = cnt * stt - st * st
+	if math.abs(den) < 1e-9 then return nil end
+	local v = (stp * cnt - sp * st) / den
+	return v, (sp - v * st) / cnt
+end
+local function floorOf(k, r)
+	local now = os.clock()
+	if now - k.floorT > 0.12 then
+		k.floorT = now
+		local ex = {}
+		for _, pl in ipairs(Players:GetPlayers()) do if pl.Character then table.insert(ex, pl.Character) end end
+		rpFloor.FilterDescendantsInstances = ex
+		local res = Workspace:Raycast(r.Position, Vector3.new(0, -60, 0), rpFloor)
+		k.floorY = res and res.Position.Y or nil
+	end
+	return k.floorY
+end
+-- where will `p` be `horizon` seconds from now? returns position, confidence (0..1), short description
+local function solve(p, horizon)
+	local r = rootOf(p)
+	if not r then return nil end
+	local k = trackerOf(p)
+	local s = k.s
+	local vS, aS = lsq(s, 0.14)
+	local vL = lsq(s, 0.45)
+	if not (vS and vL) then
+		local v = r.AssemblyLinearVelocity -- no history yet: replicated velocity, low confidence
+		return r.Position + Vector3.new(v.X, 0, v.Z) * horizon, 0.25, "warming up"
+	end
+	-- horizontal: steady runner = trust the fast fit, wobbling strafer = trust the slow (averaged) fit
+	local hS, hL = Vector3.new(vS.X, 0, vS.Z), Vector3.new(vL.X, 0, vL.Z)
+	local steadyH = math.clamp(1 - (hS - hL).Magnitude / (hL.Magnitude + 10), 0, 1)
+	local hv = hL:Lerp(hS, steadyH)
+	if hv.Magnitude > 60 then hv = hv.Unit * 60 end
+	local x, z = aS.X + hv.X * horizon, aS.Z + hv.Z * horizon
+	-- vertical: jump arc with the floor as a stop
+	local g = Workspace.Gravity
+	local fy = floorOf(k, r)
+	local dist = fy and (aS.Y - fy) or nil
+	if dist and math.abs(vS.Y) < 3 and dist < 8 then k.stand = math.min(k.stand or dist, dist) end -- learn their standing height
+	local stand = k.stand or 3.1
+	local airborne
+	if dist then airborne = dist > stand + 0.9 else airborne = math.abs(vS.Y) > 8 end
+	local now = os.clock()
+	if vS.Y > 28 and k.lastVy <= 28 then table.insert(k.jumps, now) end -- a takeoff
+	k.lastVy = vS.Y
+	while #k.jumps > 0 and now - k.jumps[1] > 2 do table.remove(k.jumps, 1) end
+	local y, conf, state = aS.Y, steadyH, "grounded"
+	if M.ballistic and (airborne or vS.Y > 6) then
+		y = aS.Y + vS.Y * horizon - 0.5 * g * horizon * horizon
+		local tLand = math.huge
+		if fy then
+			local floorCenter = fy + stand
+			local disc = vS.Y * vS.Y + 2 * g * (aS.Y - floorCenter)
+			if disc > 0 then tLand = (vS.Y + math.sqrt(disc)) / g end
+			if y < floorCenter then y = floorCenter end
+		end
+		if tLand - horizon < 0.06 then conf, state = conf * 0.3, "landing" else conf, state = conf * 0.95, "airborne" end
+	elseif #k.jumps >= 2 then
+		conf, state = conf * 0.3, "jump spam" -- on the ground but about to take off again: wait for them to be in the air
+	elseif steadyH < 0.5 then
+		state = "strafing"
+	end
+	return Vector3.new(x, y, z), conf, state
+end
+
+-- one fling attempt. Sits where the target will REALLY be and sweeps a volume around that point; the sweep grows when
+-- the target is hard to predict (jump spam / strafing), so they still get touched.
+local function flingOnce(p, ok)
+	local r, tr = getRoot(), rootOf(p)
+	if not r or not tr then return false end
+	local home, t0, p0, phase, flung = r.CFrame, os.clock(), tr.Position, 0, false
+	trackerOf(p)
+	local conn
+	conn = RunService.Heartbeat:Connect(function(dt)
+		local root, troot = getRoot(), rootOf(p)
+		if not ok() or not root or not troot or os.clock() - t0 > (M.flingTime or 4) then conn:Disconnect() return end
+		-- target flew away = success
+		if (troot.Position - p0).Magnitude > 120 or troot.AssemblyLinearVelocity.Magnitude > 300 then flung = true conn:Disconnect() return end
+		local pos, conf = solve(p, lagTime() + M.flingLead)
+		if not pos then conn:Disconnect() return end
+		phase = phase + dt
+		local loose, sc = 1 - conf, M.flingSweep
+		local off = Vector3.new(
+			math.sin(phase * 37) * (1.2 + 2.2 * loose) * sc,
+			math.sin(phase * 23 + 1.3) * (2.2 + 3.5 * loose) * sc + loose * 2,
+			math.cos(phase * 31 + 2.1) * (1.2 + 2.2 * loose) * sc)
+		root.CFrame = CFrame.new(pos + off)
+		root.AssemblyLinearVelocity = Vector3.new(9e5, 9e5, 9e5)
+		root.AssemblyAngularVelocity = Vector3.new(9e5, 9e5, 9e5)
+	end)
+	while conn.Connected do task.wait(0.05) end
+	local root = getRoot()
+	if root then
+		root.AssemblyLinearVelocity, root.AssemblyAngularVelocity = Vector3.zero, Vector3.zero
+		root.CFrame = home
+	end
+	return flung
+end
+local function flingPlayer(p)
+	local r, tr = getRoot(), rootOf(p)
+	if not r or not tr then notify("Target has no character", T.Warn) return end
+	runSeq(function(ok)
+		local flung = false
+		for attempt = 1, (M.flingRetries or 1) + 1 do
+			if not ok() then break end
+			flung = flingOnce(p, ok)
+			if flung then break end
+			task.wait(0.15)
+		end
+		if not M.loopFling then notify(flung and "Flung them" or "Fling timed out", flung and T.Good or T.Warn) end
+	end)
+end
+
+-- ---------------------------------------------------- murderer tools
+local function stab(p, ok, maxTime)
+	local t0 = os.clock()
+	while ok() and alive(p) and os.clock() - t0 < (maxTime or 2) do
+		local r, tr = getRoot(), rootOf(p)
+		local knife = toolNamed("Knife")
+		if not r or not tr or not knife then return false end
+		equip(knife)
+		local back = tr.CFrame * CFrame.new(0, 0, 2.5)
+		r.CFrame = CFrame.lookAt(back.Position, tr.Position)
+		r.AssemblyLinearVelocity = Vector3.zero
+		pcall(function() knife:Activate() end)
+		task.wait(0.04)
+	end
+	return not alive(p)
+end
+local function killAll()
+	if not toolNamed("Knife") then notify("You need the Knife (be the Murderer)", T.Warn) return end
+	runSeq(function(ok)
+		local r = getRoot()
+		if not r then return end
+		local home, n = r.CFrame, 0
+		for _, p in ipairs(Players:GetPlayers()) do
+			if not ok() then break end
+			if p ~= LocalPlayer and alive(p) and rootOf(p) and stab(p, ok) then n = n + 1 end
+		end
+		local root = getRoot()
+		if root then root.CFrame = home end
+		notify("Eliminated " .. n, n > 0 and T.Good or T.Warn)
+	end)
+end
+task.spawn(function()
+	while Live.Running do
+		if M.aura and not M.busy then
+			local knife, r = toolNamed("Knife"), getRoot()
+			if knife and r then
+				for _, p in ipairs(Players:GetPlayers()) do
+					local pr = p ~= LocalPlayer and alive(p) and rootOf(p)
+					if pr and (pr.Position - r.Position).Magnitude <= M.auraR then
+						equip(knife)
+						pcall(function() knife:Activate() end)
+						break
+					end
+				end
+			end
+		end
+		task.wait(0.05)
+	end
+end)
+
+-- ---------------------------------------------------- escape platform
+local platform, platHome
+local function platformOff()
+	if platform then platform:Destroy() platform = nil end
+	local r = getRoot()
+	if r and platHome then r.CFrame = platHome end
+	platHome = nil
+end
+onUnload(function() M.walkFling, M.antiFling, M.aura, M.autoGun, M.coinFarm = false, false, false, false, false stopAll() restoreCol() platformOff() end)
+
+-- ====================================================== UI
+local Info = Section(RoundTab, "Round Info", "Who has what this round", "info")
+infoMe = Hub.Stat(Info, "Your role", "-")
+infoMurd = Hub.Stat(Info, "Murderer", "-")
+infoSher = Hub.Stat(Info, "Sheriff", "-")
+infoGun = Hub.Stat(Info, "Dropped gun", "None")
+Toggle(Info, "Announce Roles", true, function(v) M.announce = v end, nil, "mmannounce", "Notify when the murderer or sheriff is revealed")
+local specDd
+specDd = Dropdown(Info, "Spectate", { "Off", "Murderer", "Sheriff" }, 1, function(i, name)
+	if i == 1 then stopSpectate() return end
+	local p = findRole(name)
+	if p then
+		spectate(p)
+	else
+		notify("No " .. name:lower() .. " yet", T.Warn)
+		specDd.Set(1, true)
+		stopSpectate()
+	end
+end)
+
+local Esp = Section(RoundTab, "Role ESP", "Murderer = red, Sheriff = blue, Innocent = green", "esp")
+Toggle(Esp, "Role ESP", false, function(v) M.esp = v if not v then clearEsp() end end, nil, "mmesp")
+local EspOpt = Collapse(Esp, "ESP Options")
+Toggle(EspOpt, "Show Innocents", true, function(v) M.showInno = v end, nil, "mminno")
+Toggle(EspOpt, "Name Tags", true, function(v) M.names = v end, nil, "mmnames")
+Toggle(EspOpt, "Dropped Gun ESP", true, function(v) M.gunEsp = v if not v then clearGun() end end, nil, "mmgunesp")
+Toggle(EspOpt, "Murderer Proximity Alert", false, function(v) M.alert = v end, nil, "mmalert")
+Slider(EspOpt, "Fill Transparency %", 0, 100, 60, function(v) M.fill = v / 100 end, "mmfill")
+Slider(EspOpt, "Alert Distance", 10, 150, 40, function(v) M.alertR = v end, "mmalertr")
+
+local Gun = Section(LootTab, "Gun", "Grab the dropped gun", "loot")
+Button(Gun, "Grab Dropped Gun", "Grab", function() runSeq(function(ok) grabGun(ok) end) end)
+Toggle(Gun, "Auto Grab Dropped Gun", false, function(v) M.autoGun = v end, nil, "mmautogun")
+Button(Gun, "Teleport To Dropped Gun (stay)", "Go", function()
+	local g, r = gunDrop(), getRoot()
+	if g and r then r.CFrame = g.CFrame + Vector3.new(0, 2, 0) else notify("No dropped gun right now", T.Warn) end
+end)
+
+local Coin = Section(LootTab, "Coins", "Teleports to coins for you", "loot")
+Button(Coin, "Collect All Coins", "Collect", function() runSeq(function(ok) collectCoins(ok) end) end)
+Toggle(Coin, "Auto Coin Farm", false, function(v) M.coinFarm = v end, nil, "mmcoinfarm")
+local CoinOpt = Collapse(Coin, "Farm Options")
+Slider(CoinOpt, "Delay Between Coins (x0.01s)", 5, 100, 12, function(v) M.coinDelay = v / 100 end, "mmcoindelay")
+
+local Tg = Section(AttackTab, "Target", "Pick who Fling and Kill hit - no need to open the Players tab", "players")
+local tgInfo = InfoRow(Tg, "Selected: none")
+PlayerList(Tg, 150)
+local function tgUpdate()
+	local p = S.Target
+	tgInfo.Text = (p and p.Parent) and ("Selected: " .. p.DisplayName .. "  (@" .. p.Name .. ")") or "Selected: none"
+end
+do
+	local prev = S.OnTargetChanged
+	S.OnTargetChanged = function() if prev then pcall(prev) end tgUpdate() end
+end
+tgUpdate()
+
+local Fl = Section(AttackTab, "Fling", "Physics based - works best when you touch the player", "attack")
+Toggle(Fl, "Walk Fling", false, function(v) M.walkFling = v end, nil, "mmwalkfling", "Fling players you walk into")
+Toggle(Fl, "Anti-Fling", false, function(v) M.antiFling = v if not v then restoreCol() end end, nil, "mmantifling", "Others can't push you")
+local flingDd = Dropdown(Fl, "Fling Target", { "Selected Player", "Murderer", "Sheriff" }, 1)
+Button(Fl, "Fling", "Fling", function()
+	local i, p = flingDd.Get(), nil
+	if i == 1 then
+		p = S.Target
+		if not (p and p.Parent) then notify("Pick a player in the Target list first", T.Warn) return end
+	else
+		local role = (i == 2) and "Murderer" or "Sheriff"
+		p = findRole(role)
+		if not p then notify("No " .. role:lower() .. " yet", T.Warn) return end
+	end
+	flingPlayer(p)
+end)
+Button(Fl, "Stop", "Stop", function() stopAll() end)
+local FlOpt = Collapse(Fl, "Fling Options")
+
+local Sf = Section(RoundTab, "Safety", "Stay away from the murderer", "warning")
+Toggle(Sf, "Sky Platform (hide up high)", false, function(v)
+	if v then
+		local r = getRoot()
+		if not r then return end
+		platHome = r.CFrame
+		platform = new("Part", { Anchored = true, Size = Vector3.new(40, 1, 40), Transparency = 0.6, Material = Enum.Material.Neon, Color = T.Accent, CFrame = r.CFrame + Vector3.new(0, 300, 0) }, Workspace)
+		r.CFrame = platform.CFrame + Vector3.new(0, 4, 0)
+	else
+		platformOff()
+	end
+end, nil, "mmplatform")
+Button(Sf, "Teleport Away From Murderer", "Go", function()
+	local m, r = findRole("Murderer"), getRoot()
+	local mr = rootOf(m)
+	if not (mr and r) then notify("No murderer found", T.Warn) return end
+	local dir = (r.Position - mr.Position)
+	dir = dir.Magnitude > 1 and dir.Unit or Vector3.new(1, 0, 0)
+	r.CFrame = CFrame.new(r.Position + dir * 80 + Vector3.new(0, 6, 0))
+end)
+
+-- ====================================================== extra features (v3.17)
+M.tracers, M.coinEsp, M.autoEscape, M.escapeR, M.gunAlert = false, false, false, 25, false
+M.autoShoot, M.loopKill, M.loopFling, M.safeFarm, M.tweenSpd = false, false, false, false, 60
+M.leadT, M.autoRage, M.rageDist, M.rageGap = 0.05, false, 3, 0.35
+M.shootRange, M.shotCd, M.retreat, M.lastShot = 40, 2.5, true, 0
+M.flingTime = 4
+-- aim solver / fling tuning (see solve())
+M.lagMul, M.interp, M.ballistic, M.waitGood, M.minConf, M.patience, M.keepGun = 1, 0.1, true, true, 0.6, 3, true
+M.flingRetries, M.flingSweep, M.flingLead = 1, 1, 0
+local sg = new("ScreenGui", { Name = "SolosMM2", ResetOnSpawn = false, IgnoreGuiInset = true, DisplayOrder = 3 }, PlayerGui)
+local lines, coinHl = {}, {}
+local rpGround = RaycastParams.new()
+rpGround.FilterType = Enum.RaycastFilterType.Exclude
+
+-- tracers to the murderer / sheriff
+bind(RunService.RenderStepped, function()
+	local c = cam()
+	if not c then return end
+	local vp = c.ViewportSize
+	local from = Vector2.new(vp.X / 2, vp.Y)
+	for _, p in ipairs(Players:GetPlayers()) do
+		if p ~= LocalPlayer then
+			local l = lines[p]
+			local role = M.tracers and alive(p) and roleOf(p)
+			local r = role and role ~= "Innocent" and rootOf(p)
+			if r then
+				local sp, on = c:WorldToViewportPoint(r.Position)
+				if on then
+					if not l then
+						l = new("Frame", { AnchorPoint = Vector2.new(0.5, 0.5), BorderSizePixel = 0 }, sg)
+						lines[p] = l
+					end
+					local to = Vector2.new(sp.X, sp.Y)
+					local d = to - from
+					l.Size = UDim2.fromOffset(d.Magnitude, 2)
+					l.Position = UDim2.fromOffset((from.X + to.X) / 2, (from.Y + to.Y) / 2)
+					l.Rotation = math.deg(math.atan2(d.Y, d.X))
+					l.BackgroundColor3 = COLORS[role]
+					l.Visible = true
+				elseif l then
+					l.Visible = false
+				end
+			elseif l then
+				l.Visible = false
+			end
+		end
+	end
+	for p, l in pairs(lines) do
+		if not p.Parent then l:Destroy() lines[p] = nil end
+	end
+end)
+
+-- coin ESP + dropped gun alert
+local gunWas = false
+task.spawn(function()
+	while Live.Running do
+		if M.coinEsp then
+			local n = 0
+			for _, c in ipairs(coins()) do
+				n = n + 1
+				if n > 60 then break end
+				if not coinHl[c] then
+					coinHl[c] = new("Highlight", { Adornee = c, FillColor = Color3.fromRGB(255, 215, 0), OutlineColor = Color3.fromRGB(255, 215, 0), FillTransparency = 0.4, DepthMode = Enum.HighlightDepthMode.AlwaysOnTop }, EspGui)
+				end
+			end
+			for c, h in pairs(coinHl) do
+				if not c.Parent then h:Destroy() coinHl[c] = nil end
+			end
+		elseif next(coinHl) then
+			for c, h in pairs(coinHl) do h:Destroy() coinHl[c] = nil end
+		end
+		local g = gunDrop() ~= nil
+		if g and not gunWas and M.gunAlert then notify("The sheriff died - gun dropped!", COLORS.Sheriff) end
+		gunWas = g
+		task.wait(0.75)
+	end
+end)
+
+-- escape helpers
+local function groundAt(pos)
+	rpGround.FilterDescendantsInstances = { getChar() or Workspace }
+	local res = Workspace:Raycast(pos + Vector3.new(0, 150, 0), Vector3.new(0, -400, 0), rpGround)
+	return res and (res.Position + Vector3.new(0, 4, 0)) or (pos + Vector3.new(0, 6, 0))
+end
+local function awayFromMurderer(dist)
+	local m, r = findRole("Murderer"), getRoot()
+	local mr = rootOf(m)
+	if not (mr and r) then return false end
+	local dir = r.Position - mr.Position
+	dir = Vector3.new(dir.X, 0, dir.Z)
+	dir = dir.Magnitude > 1 and dir.Unit or Vector3.new(1, 0, 0)
+	r.CFrame = CFrame.new(groundAt(r.Position + dir * dist))
+	r.AssemblyLinearVelocity = Vector3.zero
+	return true
+end
+local lastEscape = 0
+task.spawn(function()
+	while Live.Running do
+		if M.autoEscape and alive(LocalPlayer) and roleOf(LocalPlayer) ~= "Murderer" and os.clock() - lastEscape > 1.5 then
+			local m, r = findRole("Murderer"), getRoot()
+			local mr = rootOf(m)
+			if mr and r and m ~= LocalPlayer and (mr.Position - r.Position).Magnitude <= M.escapeR then
+				lastEscape = os.clock()
+				awayFromMurderer(70)
+			end
+		end
+		task.wait(0.15)
+	end
+end)
+
+-- smooth (tweened) coin farm
+local visited, coinCache, coinCacheT = setmetatable({}, { __mode = "k" }), {}, 0
+local function nextCoin(from)
+	if os.clock() - coinCacheT > 1 then coinCache, coinCacheT = coins(), os.clock() end
+	local best, bd
+	for _, c in ipairs(coinCache) do
+		local seen = visited[c]
+		if c.Parent and not (seen and os.clock() - seen < 3) then
+			local d = (c.Position - from).Magnitude
+			if not bd or d < bd then best, bd = c, d end
+		end
+	end
+	return best, bd
+end
+task.spawn(function()
+	while Live.Running do
+		local moved = false
+		if M.safeFarm and not M.coinFarm and not M.busy and alive(LocalPlayer) then
+			local r = getRoot()
+			local c, d
+			if r then c, d = nextCoin(r.Position) end
+			if c then
+				local t = math.max(d / math.max(M.tweenSpd, 10), 0.03)
+				local tw = TweenService:Create(r, TweenInfo.new(t, Enum.EasingStyle.Linear), { CFrame = c.CFrame })
+				tw:Play()
+				task.wait(t)
+				visited[c] = os.clock() -- move on to the next coin right away
+				moved = true
+			elseif r then
+				coinCacheT = 0
+			end
+		end
+		if not moved then task.wait(0.2) end
+	end
+end)
+
+-- sheriff: shoot the murderer (remote path is a guess - falls back to aiming + clicking)
+-- keep the murderer tracked while auto shoot / rage is on, so the first shot already has a history to aim from
+task.spawn(function()
+	while Live.Running do
+		if M.autoShoot or M.autoRage then
+			local m = findRole("Murderer")
+			if m and m ~= LocalPlayer then trackerOf(m) end
+		end
+		task.wait(0.5)
+	end
+end)
+local rpLos = RaycastParams.new()
+rpLos.FilterType = Enum.RaycastFilterType.Exclude
+local function lineOfSight(mr)
+	local r = getRoot()
+	if not r then return false end
+	rpLos.FilterDescendantsInstances = { getChar() or Workspace }
+	local res = Workspace:Raycast(r.Position, mr.Position - r.Position, rpLos)
+	return res == nil or res.Instance:IsDescendantOf(mr.Parent)
+end
+local function fireAt(gun, pos, conf, state)
+	local ok = pcall(function() gun.KnifeLocal.CreateBeam.RemoteFunction:InvokeServer(1, pos, "AH2") end)
+	if not ok then
+		local c = cam()
+		if c then c.CFrame = CFrame.lookAt(c.CFrame.Position, pos) end
+		pcall(function() gun:Activate() end)
+	end
+	if M.shotRow then M.shotRow.Set(math.floor(conf * 100 + 0.5) .. "% - " .. state, conf >= 0.6 and T.Good or T.Warn) end
+end
+-- equip and give the tool a moment to be ready: a shot fired the instant it is equipped is often ignored
+local function equipGun(gun)
+	if gun.Parent == LocalPlayer.Character then return true end
+	equip(gun)
+	local t0 = os.clock()
+	while os.clock() - t0 < 0.6 and gun.Parent ~= LocalPlayer.Character do task.wait(0.03) end
+	task.wait(0.12)
+	return gun.Parent == LocalPlayer.Character
+end
+-- take ONE shot at a good moment: waits for enough history, then for the solver to be confident (or for the patience
+-- timeout). strict = automatic mode: give up if they leave range / cover while we wait.
+local function takeShot(m, strict)
+	local gun = toolNamed("Gun")
+	if not (gun and m and rootOf(m)) then return false end
+	if not equipGun(gun) then return false end
+	local t0 = os.clock()
+	while Live.Running do
+		local mr, root = rootOf(m), getRoot()
+		if not (mr and root and alive(m) and alive(LocalPlayer) and toolNamed("Gun")) then return false end
+		if strict and ((mr.Position - root.Position).Magnitude > M.shootRange + 8 or not lineOfSight(mr)) then return false end
+		local waited = os.clock() - t0
+		local pos, conf, state = solve(m, lagTime() + M.leadT)
+		local warm = #trackerOf(m).s >= 6
+		if warm and pos and (not M.waitGood or conf >= M.minConf or waited >= M.patience) then
+			M.lastShot = os.clock()
+			fireAt(gun, pos, conf, state)
+			return true
+		end
+		if waited > M.patience + 1.5 then return false end
+		task.wait(0.02)
+	end
+	return false
+end
+local function shootMurderer()
+	if not toolNamed("Gun") then notify("You need the Gun (be the Sheriff)", T.Warn) return end
+	local m = findRole("Murderer")
+	if not (m and rootOf(m)) then notify("No murderer to shoot", T.Warn) return end
+	task.spawn(function()
+		if not takeShot(m, false) then notify("Couldn't take the shot", T.Warn) end
+	end)
+end
+-- rage: stick directly behind the murderer, keep the camera locked on them and keep firing until they die or the gun is lost
+local function rageShoot()
+	runSeq(function(ok)
+		local r = getRoot()
+		if not r then return end
+		local gun0 = toolNamed("Gun")
+		if gun0 then equipGun(gun0) end
+		local home, last, shots = r.CFrame, 0, 0
+		local start = os.clock()
+		-- after teleporting behind them the server still has us at the old spot for a moment: do not fire until it has caught up
+		local settle = math.clamp(pingTime() * 0.6 + 0.08, 0.1, 0.5)
+		local waitSince = start + settle
+		while ok() do
+			local gun, root = toolNamed("Gun"), getRoot()
+			local m = findRole("Murderer")
+			local mr = rootOf(m)
+			if not gun or not root or not mr or m == LocalPlayer or not alive(LocalPlayer) then break end
+			trackerOf(m)
+			local back = mr.CFrame * CFrame.new(0, 0, M.rageDist)
+			root.CFrame = CFrame.lookAt(back.Position, mr.Position)
+			root.AssemblyLinearVelocity = Vector3.zero
+			if gun.Parent ~= LocalPlayer.Character then equip(gun) end
+			local c = cam()
+			if c then c.CFrame = CFrame.lookAt(c.CFrame.Position, mr.Position) end
+			local now = os.clock()
+			if gun.Parent == LocalPlayer.Character and now - start >= settle and now - last >= M.rageGap then
+				local pos, conf, state = solve(m, lagTime())
+				if pos and #trackerOf(m).s >= 6 and (not M.waitGood or conf >= M.minConf or now - waitSince >= M.patience) then
+					last, waitSince, shots = now, now, shots + 1
+					fireAt(gun, pos, conf, state)
+				end
+			end
+			RunService.Heartbeat:Wait()
+		end
+		local root = getRoot()
+		if root and alive(LocalPlayer) then root.CFrame = home root.AssemblyLinearVelocity = Vector3.zero end
+		if shots > 0 then notify("Rage shoot finished (" .. shots .. " shots)", T.Sub) end
+	end)
+end
+task.spawn(function()
+	while Live.Running do
+		if M.autoRage and not M.busy and toolNamed("Gun") and alive(LocalPlayer) and findRole("Murderer") then rageShoot() task.wait(0.5)
+		elseif M.autoShoot and not M.autoRage and toolNamed("Gun") and alive(LocalPlayer) then
+			-- only take shots that are likely to land: close enough, a clear line of sight and (see takeShot) a predictable target
+			local m, r = findRole("Murderer"), getRoot()
+			local mr = rootOf(m)
+			if mr and r and m ~= LocalPlayer and (mr.Position - r.Position).Magnitude <= M.shootRange and lineOfSight(mr) then
+				local gun = toolNamed("Gun")
+				if M.keepGun and gun and gun.Parent ~= LocalPlayer.Character then equip(gun) end -- already in hand when the moment comes
+				if os.clock() - M.lastShot >= M.shotCd and takeShot(m, true) and M.retreat then
+					task.wait(0.4)
+					local m2 = findRole("Murderer")
+					local mr2, r2 = rootOf(m2), getRoot()
+					if mr2 and r2 and alive(m2) and (mr2.Position - r2.Position).Magnitude < 45 then awayFromMurderer(70) end
+				end
+			end
+		end
+		task.wait(0.3)
+	end
+end)
+
+-- knife kill helpers
+local function killList(list, quiet)
+	if not toolNamed("Knife") then if not quiet then notify("You need the Knife (be the Murderer)", T.Warn) end return end
+	runSeq(function(ok)
+		local r = getRoot()
+		if not r then return end
+		local home, n = r.CFrame, 0
+		for _, p in ipairs(list) do
+			if not ok() then break end
+			if p ~= LocalPlayer and alive(p) and rootOf(p) and stab(p, ok) then n = n + 1 end
+		end
+		local root = getRoot()
+		if root then root.CFrame = home end
+		if not quiet then notify("Eliminated " .. n, n > 0 and T.Good or T.Warn) end
+	end)
+end
+task.spawn(function()
+	while Live.Running do
+		if M.loopKill and not M.busy and toolNamed("Knife") and alive(LocalPlayer) then
+			local list = {}
+			for _, p in ipairs(Players:GetPlayers()) do if p ~= LocalPlayer and alive(p) and rootOf(p) then table.insert(list, p) end end
+			if #list > 0 then killList(list, true) end
+		end
+		if M.loopFling and not M.busy then
+			local p = findRole("Murderer")
+			if p and p ~= LocalPlayer then flingPlayer(p) end
+		end
+		task.wait(0.5)
+	end
+end)
+onUnload(function()
+	M.tracers, M.coinEsp, M.autoEscape, M.autoShoot, M.autoRage, M.loopKill, M.loopFling, M.safeFarm = false, false, false, false, false, false, false, false
+	for c, h in pairs(coinHl) do h:Destroy() end
+	table.clear(coinHl)
+	sg:Destroy()
+end)
+
+-- alive counter row (Round tab)
+local infoAlive = Hub.Stat(Info, "Players alive", "-")
+task.spawn(function()
+	while Live.Running do
+		local n, total = 0, 0
+		for _, p in ipairs(Players:GetPlayers()) do
+			total = total + 1
+			if alive(p) then n = n + 1 end
+		end
+		infoAlive.Set(n .. " / " .. total)
+		task.wait(1)
+	end
+end)
+
+-- ---- Round tab
+Toggle(Esp, "Tracers To Murderer / Sheriff", false, function(v) M.tracers = v end, nil, "mmtracers")
+Toggle(Info, "Gun Drop Alert", false, function(v) M.gunAlert = v end, nil, "mmgunalert", "Alert when the sheriff drops the gun")
+Toggle(Sf, "Auto Escape", false, function(v) M.autoEscape = v end, nil, "mmautoescape", "Teleport away when the murderer gets close")
+Slider(Sf, "Auto Escape Distance", 8, 80, 25, function(v) M.escapeR = v end, "mmescaper")
+Button(Sf, "Teleport Far Away From Murderer", "Go", function()
+	if not awayFromMurderer(120) then notify("No murderer found", T.Warn) end
+end)
+
+-- ---- Loot tab
+Toggle(CoinOpt, "Coin ESP", false, function(v) M.coinEsp = v end, nil, "mmcoinesp")
+Toggle(CoinOpt, "Smooth Coin Farm", false, function(v) M.safeFarm = v end, nil, "mmsafefarm", "Tween - turn Auto Coin Farm off")
+Slider(CoinOpt, "Smooth Farm Speed (studs/s)", 20, 200, 60, function(v) M.tweenSpd = v end, "mmtweenspd")
+local Sh = Section(LootTab, "Sheriff Tools", "Needs the Gun", "loot")
+Button(Sh, "Shoot Murderer", "Shoot", shootMurderer)
+Toggle(Sh, "Auto Shoot Murderer", false, function(v) M.autoShoot = v end, nil, "mmautoshoot")
+Button(Sh, "Rage Shoot Murderer", "Start", rageShoot, nil, "Stick behind + lock on")
+Toggle(Sh, "Auto Rage Shoot", false, function(v) M.autoRage = v if not v then stopAll() end end, nil, "mmautorage", "Stick behind + lock on")
+Button(Sh, "Stop", "Stop", function() stopAll() end)
+M.shotRow = Hub.Stat(Sh, "Last shot", "-", T.Sub)
+local ShOpt = Collapse(Sh, "Aim Tuning")
+Slider(ShOpt, "Extra Shot Lead (x0.01s, on top of ping)", 0, 30, 5, function(v) M.leadT = v / 100 end, "mmshotlead2")
+Slider(ShOpt, "Auto Shoot Max Range (studs)", 10, 150, 40, function(v) M.shootRange = v end, "mmshootrange")
+Slider(ShOpt, "Auto Shoot Cooldown (s)", 1, 6, 3, function(v) M.shotCd = v end, "mmshotcd")
+Toggle(ShOpt, "Wait For A Good Shot", true, function(v) M.waitGood = v end, nil, "mmwaitgood", "Holds fire while the target jumps / strafes unpredictably")
+Slider(ShOpt, "Aim Confidence To Fire (%)", 0, 100, 60, function(v) M.minConf = v / 100 end, "mmminconf")
+Slider(ShOpt, "Give Up Waiting After (s)", 1, 10, 3, function(v) M.patience = v end, "mmpatience")
+Toggle(ShOpt, "Predict Jump Arc", true, function(v) M.ballistic = v end, nil, "mmballistic", "Aims where a jumping target will be in the air")
+Toggle(ShOpt, "Keep Gun Equipped", true, function(v) M.keepGun = v end, nil, "mmkeepgun", "Auto shoot holds the gun so the first shot is not delayed")
+Slider(ShOpt, "Ping Multiplier (x0.1)", 0, 30, 10, function(v) M.lagMul = v / 10 end, "mmlag2")
+Slider(ShOpt, "Interpolation Delay (x0.01s)", 0, 30, 10, function(v) M.interp = v / 100 end, "mmlaginterp")
+Toggle(ShOpt, "Retreat After Shooting", true, function(v) M.retreat = v end, nil, "mmretreat", "If murderer survives")
+Slider(ShOpt, "Rage Distance Behind", 1, 10, 3, function(v) M.rageDist = v end, "mmragedist")
+Slider(ShOpt, "Rage Shot Gap (x0.01s)", 10, 100, 35, function(v) M.rageGap = v / 100 end, "mmragegap")
+
+-- ---- Attack tab
+local Mu = Section(AttackTab, "Murderer Tools", "Only works while you hold the Knife", "attack")
+Button(Mu, "Kill Everyone (knife)", "Start", killAll)
+local killDd = Dropdown(Mu, "Kill Target", { "Selected Player", "Sheriff", "Nearest Player" }, 1)
+Button(Mu, "Kill", "Kill", function()
+	local i, p = killDd.Get(), nil
+	if i == 1 then
+		p = S.Target
+		if not (p and p.Parent) then notify("Pick a player in the Target list first", T.Warn) return end
+	elseif i == 2 then
+		p = findRole("Sheriff")
+		if not p then notify("No sheriff found", T.Warn) return end
+	else
+		p = nearestPlayer()
+		if not p then notify("No players found", T.Warn) return end
+	end
+	killList({ p })
+end)
+Button(Mu, "Stop", "Stop", function() stopAll() end)
+local MuOpt = Collapse(Mu, "Knife Options")
+Toggle(MuOpt, "Knife Aura", false, function(v) M.aura = v end, nil, "mmaura")
+Slider(MuOpt, "Aura Range", 4, 30, 12, function(v) M.auraR = v end, "mmaurar")
+Toggle(MuOpt, "Loop Kill Everyone", false, function(v) M.loopKill = v if not v then stopAll() end end, nil, "mmloopkill")
+Slider(FlOpt, "Fling Duration (s)", 2, 8, 4, function(v) M.flingTime = v end, "mmflingtime")
+Slider(FlOpt, "Fling Retries", 0, 5, 1, function(v) M.flingRetries = v end, "mmflingretries")
+Slider(FlOpt, "Fling Sweep Size (%)", 50, 200, 100, function(v) M.flingSweep = v / 100 end, "mmflingsweep")
+Slider(FlOpt, "Fling Extra Lead (x0.01s)", 0, 30, 0, function(v) M.flingLead = v / 100 end, "mmflinglead")
+Toggle(FlOpt, "Loop Fling Murderer", false, function(v) M.loopFling = v if not v then stopAll() end end, nil, "mmloopfling")
+
+-- ---- Teleports tab
+local Tpm = Section(Tabs["Teleports"], "Murder Mystery 2 Teleports", "Jump to round targets", "teleports")
+local tpDd = Dropdown(Tpm, "Teleport To", { "Murderer", "Sheriff", "Nearest Player", "Random Player" }, 1)
+Button(Tpm, "Teleport", "Go", function()
+	local i, target = tpDd.Get(), nil
+	if i == 1 then
+		target = findRole("Murderer")
+	elseif i == 2 then
+		target = findRole("Sheriff")
+	elseif i == 3 then
+		target = nearestPlayer()
+	else
+		local pool = {}
+		for _, p in ipairs(Players:GetPlayers()) do if p ~= LocalPlayer and alive(p) and rootOf(p) then table.insert(pool, p) end end
+		target = pool[math.random(math.max(#pool, 1))]
+	end
+	local tr, r = rootOf(target), getRoot()
+	if tr and r then r.CFrame = tr.CFrame * CFrame.new(0, 0, 4) else notify("No " .. tpDd.Name():lower() .. " found", T.Warn) end
+end)

@@ -1,0 +1,167 @@
+SOLOS HUB - HANDOFF NOTES  (updated for v3.19)
+==============================================
+Give a new Claude chat TWO files: this notes file + SolosHub.lua (the raw script). Then say what you want next.
+Paste this first line to the new chat:
+  "Read INFO.txt fully, then work on SolosHub.lua exactly as described. I want: <your request>"
+(In the uploads the script may be called Script.txt - same thing. Copy it to /home/claude/SolosHub.lua first.)
+
+-----------------------------------------------------------------
+1. WHAT THE PROJECT IS
+-----------------------------------------------------------------
+- Solos Hub: one big Roblox LocalScript (Luau) run by an executor. Admin-style GUI with tabs, sidebar, search,
+  themes, key/license system, game picker and per-game modules. Now ~7950 lines, version in the header (v3.18).
+- Owner/user: builds this for their own hub + Discord community (https://discord.gg/w7X5R7uSxp).
+- Everything runs on the CLIENT. A LocalScript can't change other players for real; effects that work are things the
+  game itself trusts the client for (remotes, tools, own character physics). Say so honestly when a feature depends
+  on how a game works and can't be verified.
+
+-----------------------------------------------------------------
+2. HOW I WORK (follow this every time)
+-----------------------------------------------------------------
+A. Start: copy the script to a working file (/home/claude/SolosHub.lua). Never edit the user's upload in place.
+B. TOOLING - IMPORTANT CHANGE: the sandbox has NO network (bash network disabled), so the Luau CLI download from
+   GitHub does NOT work. Try it once; if it fails use the fallback checks in section 11 (block-balance script +
+   local counter). They catch unclosed blocks and the 200-local limit but NOT undefined names or type errors, so
+   re-read new code carefully for forward references and misspelled helpers. Always tell the user the compile
+   check could not run and what was checked instead.
+   (If a future sandbox has network: luau-compile --null SolosHub.lua and luau-analyze, ignore Roblox/executor
+   globals reported as "Unknown global".)
+C. The file uses CRLF line endings. Edit with python: read with newline='', write a crlf() helper that converts
+   your snippets to \(\r\\)n, and use a rep(old, new) that asserts the anchor appears exactly once. Never rewrite the
+   whole file. Find code with grep (see map below), read only that part (pipe through tr -d \('\r'\)).
+   Gotcha: some helper lines exist in several modules (Arsenal and Phantom Forces both have
+   "bind(RunService.RenderStepped, function() pcall(updateEsp) end)") - include surrounding context in the anchor.
+D. When removing a feature, grep for every id/field/command/function it used (C["id"], S.Field, addCmd lines,
+   keybinds, onUnload hooks) and remove or fix all references.
+E. Deliver: copy to /mnt/user-data/outputs/SolosHub.lua and present_files it, with a SHORT summary (what changed,
+   what is unverified). User prefers: quick results, plain short replies, no long recaps, files delivered. Be honest
+   that in-game behaviour can't be tested here and list the specific guesses.
+F. Big tasks: write the new module as a patch file (do ... end style function), splice it in with python, run the
+   section 11 checks, deliver.
+
+-----------------------------------------------------------------
+3. HARD RULES / PITFALLS
+-----------------------------------------------------------------
+- LUAU LIMIT: max 200 local variables active in the main chunk and 60 upvalues per function. CURRENT COUNT:
+  146 top-level locals + 50 locals in the key-window do-block = 196 of 200. THERE IS ALMOST NO ROOM. Each new game
+  module costs exactly one (`local function loadXxx()`); everything else must live INSIDE that function or in
+  tables. If more room is needed, move things into tables (e.g. put helpers in Hub or a module table) or wrap
+  top-level code in do ... end blocks. The script silently fails to show if the limit is exceeded.
+- NEW MODULAR REFACTOR (v3.19+): Because of the 200-local limit and to save token usage/credits, the project is 
+  split up. Individual game modules (mm2.lua, lt2.lua, etc.) are hosted remotely and loaded on-demand via loadstring.
+  When writing or updating features for a specific game, NEVER edit or add code to SolosHub.lua. Keep changes entirely 
+  isolated to that separate game module file.
+- Forward references: a local used before its declaration becomes a nil global. Define helpers above their use.
+- `a and nil or b` idiom is buggy - use if/else.
+- new(class, props, parent) assigns every prop with o[k]=v, so an invalid property name ERRORS the whole call.
+- Don't use `rbxassetid` images the user didn't ask for; web images must be downloaded with the executor
+  (request/HttpGet -> writefile -> getcustomasset). See Hub.logoAsset().
+- Client HttpService is disabled: network calls go through executor `request`/`http_request`/`syn.request`.
+- Executor functions are read through `env` (getgenv() or _G), e.g. env.mouse1click, env.mousemoverel,
+  env.mouse1press/mouse1release - always check type(...) == "function" first.
+- Anything that talks to a 3rd party (chat relay, key server) must be opt-in/disclosed honestly.
+- Don't put keys/secrets in the script. Keys are validated by the user's Cloudflare Worker (VERIFY_URL).
+- Don't build anything meant to impersonate real sites/people or steal credentials.
+- Toggles with an id are saved to config and re-applied on load. For anything risky pass NO id (like the
+  Phantom Forces toggles) or add the id to CONFIG_SKIP so it never auto-enables.
+
+-----------------------------------------------------------------
+4. SCRIPT ARCHITECTURE (find things with grep; line numbers drift)
+-----------------------------------------------------------------
+Order in the file (grep the banner text "-- TAB: NAME" etc.):
+  header + changelog -> services/locals -> Hub table (data folder helpers, sounds) -> CONFIG/STATE (RANKS, rank,
+  hasRank, T theme table, S state table, C registry, Running/Unlocked/Unloading flags, bind(), onUnload()) -> UI
+  HELPERS (new, round, Gui, EspGui, notify, copyText, Label, Row) -> MAIN WINDOW -> TABS + COMPONENTS (AddTab,
+  selectTab, Section, Toggle, Slider, Button, Input, Keybind, InfoRow, Thumb, PlayerList) -> CHARACTER HELPERS
+  (getChar/getHum/getRoot/cam/findPlayer/nearestPlayer/spectate/stopSpectate) -> FEATURE LOGIC -> SLOW TICK ->
+  TABS (each in do...end): Dashboard, Player, ESP, Visuals, Players, Teleports, World, Tools, Commands, Settings,
+  Chat, Macros, Explorer, Toolbox, Theme, Hub Chat, Combat -> GUI ORGANIZATION (favorites, grouped sidebar) ->
+  GLOBAL SEARCH -> HOTKEYS -> KEY WINDOW + LOADING (key window, game picker, game modules, Hub.Games) -> UNLOAD.
+
+Core API (defined near the top; use these, don't reinvent):
+  new(class, props, parent)        round(obj, radius)         notify(text, color)       copyText(text)
+  bind(signal, fn)                 -> stores connection, auto-disconnected on unload (ALWAYS use for events)
+  onUnload(fn)                     -> cleanup callback (restore anything you changed; stop loops via `Running`)
+  while Running do ... end         -> loops must check Running so they stop on unload
+  AddTab(name, icon) -> page       Section(page, title, subtitle) -> frame
+  Tabs[name] = page of any tab     TabButtons[name].Btn = sidebar button   -> game modules add sections to shared
+                                   tabs with Section(Tabs["Teleports"], ...), Section(Tabs["Player"], ...)
+  Toggle(parent, text, default, cb, minRank, id)  -> obj .Set/.Get/.Fire ; id registers in C[id] (config + commands)
+  Slider(parent, text, min, max, default, cb, id) -> obj .Set/.SetSilent/.Get   (integer steps: use v/100 for decimals)
+  Button(parent, text, actionText, cb, minRank) -> returns the TextButton (change .Text for cycle buttons)
+  Input(parent, label, placeholder, actionText, cb(text, enterPressed)) -> TextBox
+  Keybind(parent, text, defaultKeyCode, cb(key), allowClear)   (Enum.KeyCode.Unknown default is fine)
+  InfoRow(parent, text) -> TextLabel (update .Text)
+  Ranks: "Free User" < "Premium User" < "Owner"; hasRank(min); pass minRank to Toggle/Button to gate.
+  T = theme colors (T.Accent, T.Good, T.Warn, T.Bad, T.Sub, T.Text, T.Row, T.Side, T.Hover, T.Btn, T.Off).
+  S = shared state; S.Target = selected player; S.SameTeam(p)/S.TeamKey(p)/S.TeamColorOf(p) = team helpers;
+  S.Panic() turns universal features off.
+
+REMOTE MODULE SPECIFICATIONS:
+  - Game module scripts are loaded dynamically and must accept the core engine environment context. 
+  - Every external game script file must strictly unpack the passed parameters at the very first line:
+    `local Hub, S, T, C = ...`
+  - Modules interact directly with the core layout by referencing the shared global UI tables (e.g. `Tabs["Teleports"]`).
+
+-----------------------------------------------------------------
+12. MODULES - AS BUILT IN v3.21 (this supersedes the "remote module" notes above where they differ)
+-----------------------------------------------------------------
+- SolosHub.lua = main hub + Universal only. Games are separate files: mm2.lua, arsenal.lua, pf.lua, lt2.lua, doomspire.lua.
+- Hub.ModuleURLs (key-window block, just above Hub.Games) maps game id -> RAW url. Empty url = try the local file
+  workspace/SolosHub/mod_<id>.lua (for testing). On pick: Hub.loadGameModule(game) downloads, loadstring()s and runs it
+  as fn(Hub, S, T, C). On any failure the hub toasts the reason and falls back to Universal.
+- Games in Hub.Games use `remote = true` (no more `load = fn`). To add a game: new entry + new ModuleURLs key + new file.
+- Each module starts with:  local Hub, S, T, C = ...  /  local API = Hub.API  /  local Live = API.Live
+  then `local X = API.X` lines. Hub.API (built in the main file) exposes: AddTab Button Esp EspGui ICONS InfoRow Input
+  Keybind LocalPlayer PlayerGui Players RunService Section Slider TabButtons Tabs Toggle TweenService UIS Workspace bind
+  cam copyText env filterTabs getChar getHum getRoot nearestPlayer new notify onUnload round spectate stopSpectate.
+  Need another main-file local in a module? Add it to the Hub.API table (costs no local slot) and read it as API.<name>.
+- Values that change at runtime must NOT be copied: use Live.Running, Live.Unlocked, Live.BindingActive
+  (e.g. `while Live.Running do`, `if Live.BindingActive then return end`).
+- Main file is now ~5940 lines; the 5 removed module functions freed 5 local slots in the key-window block.
+- Compile check could not run (no Luau in sandbox). Done instead: block-balance check on all 6 files, undefined-name scan on
+  the modules, and every Hub.API name confirmed declared before the table is built.
+
+-----------------------------------------------------------------
+13. UI REWORK - v3.22
+-----------------------------------------------------------------
+- GAME PANELS: each game is ONE sidebar tab. In a module: local Panel = Hub.GamePanel(title, iconFile, emoji);
+  local X = Panel.Sub("Name") returns a page for Section(X, ...). Then Hub.gameHeader(...), set
+  TabButtons[title].Btn.LayoutOrder = -19, and filterTabs({ title, "Dashboard", ... }). Hub.Games `home` = the panel title.
+- Sidebar: game header + game tab on top, then a "UNIVERSAL" divider, then the global groups (Dashboard, Player, ESP,
+  Players, Teleports, Hub Chat, Theme, Settings ...).
+- New components (also in Hub.API): Dropdown(parent, text, options, defaultIdx, cb(idx,name)) -> .Get/.Name/.Set(i,silent)/
+  .SetOptions;  Collapse(parent, title) -> content frame (parent of Toggle/Slider inside it; shows "n of m on").
+  Neither is saved to config; toggles inside a Collapse keep their ids/config/commands. Both are searchable (global search
+  opens the group / sub-tab).  PlayerList is in the API: several lists stay in sync through S.ListRefresh.
+- Icons: icons/<name>.png (128px, transparent) in the repo; Hub.Icons.base + Hub.Icons.ver. Hub.Icons.Map maps tab names to
+  file names. Hub.Icons.button(btn, file, fallbackText, size) puts an icon on a button. Bump Hub.Icons.ver after changing PNGs.
+- Section.setCollapsed respects the attribute "SolosClosed" (closed dropdown lists / groups stay closed).
+- Local slots: ~193 of 200 estimated (top-level 147 + largest block 46). Dropdown/Collapse cost 2 slots.
+- Not run: no Luau in the sandbox. Checked: block balance on all 6 files + undefined-name scan on the modules.
+
+-----------------------------------------------------------------
+14. CARD STYLE + GAME LAYOUTS - v3.23
+-----------------------------------------------------------------
+- Section(page, title, sub, iconFile) is now a CARD (rounded, outlined, header with optional icon, divider). Rows inside
+  a card are flat with thin dividers (Row() checks the parent's "SolosCard" attribute; flat rows get "SolosRow").
+- Toggle(..., minRank, id, desc), Button(..., minRank, desc), Dropdown(..., minRank, desc): optional grey description line.
+  Hub.titled(row, text, rightPad, desc) draws title/description. Hub.Stat(parent, label, value, color) = label + coloured
+  value pill, obj.Set(text, color) (used by MM2 Round Info).
+- Toggle "on" colour is now T.Accent (was T.Good); Collapse counts toggles by T.Accent. Default palette = purple-navy
+  ("Solos Purple" is preset #1 in the Theme tab).
+- Game scripts: cycle buttons became Dropdowns, long toggle/slider lists sit in Collapse groups (end of each card),
+  button lists became Dropdown + one button, Doomspire has Target cards (PlayerList) in Bombs and Fighting,
+  LT2 teleports + tree type are dropdowns. Section titles got icons (icon file names from icons/).
+- Dashboard stat cards have icons (players, time, active, speed).
+- Not run in-game (no Luau here): block balance on all 6 files + undefined-name scan of the modules only.
+
+-----------------------------------------------------------------
+15. ICONS = ONE SPRITE SHEET (replaces the icons/ folder in sections 13-14)
+-----------------------------------------------------------------
+- Repo root has ONE file: icons.png (1024x896, 8 columns x 7 rows of 128px icons, alphabetical by name).
+  Hub.Icons.url points at it; it is downloaded once and cached as workspace/SolosHub/icons_v<ver>.png.
+- Hub.Icons.Atlas = { name = index }; position = (index % 8, index // 8) * 128.
+- Hub.Icons.get(name, cb) now calls cb(asset, rectOffset, rectSize): set Image, ImageRectOffset and ImageRectSize.
+- To add an icon: append it to the sheet (new cells at the end would break alphabetical order, so just add it with the next
+  free index) and add it to Hub.Icons.Atlas. Bump Hub.Icons.ver when icons.png changes.

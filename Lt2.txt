@@ -1,0 +1,2287 @@
+-- Solos Hub game module: lt2.lua
+-- Loaded by the main hub script (picker -> loadstring). Do not run this file on its own.
+--
+-- Mechanics ported from the user's previous script: cut = Interaction.RemoteProxy:FireServer(CutEvent, args),
+-- logs live in Workspace.LogModels, trees in Workspace.*TreeRegion* folders, ownership of a log is claimed by
+-- spamming Interaction.ClientIsDragging before moving its parts. UNTESTED in game.
+--
+-- v2: tabs and features ported from the Dynxe script - Wood (get trees x quantity, chop logs into sections),
+-- Logs (click to sell), Plot, Shop, Tools (selection + sorting), Vehicle, World, Protection (axe recovery),
+-- plus player / waypoint / vehicle-aware teleports. Dynxe's duplication, 1x1 cutter, lasso, tree server search
+-- and blueprint / Rukiry purchases are NOT ported (see the notes in the chat).
+
+local Hub, S, T, C = ...
+local API = Hub.API
+local Live = API.Live -- live values: Live.Running, Live.Unlocked, Live.BindingActive
+local Dropdown, Collapse, PlayerList = API.Dropdown, API.Collapse, API.PlayerList
+local Input = API.Input
+
+local AddTab = API.AddTab
+local Button = API.Button
+local EspGui = API.EspGui
+local InfoRow = API.InfoRow
+local Keybind = API.Keybind
+local LocalPlayer = API.LocalPlayer
+local Players = API.Players
+local round = API.round
+local RunService = API.RunService
+local Section = API.Section
+local Slider = API.Slider
+local TabButtons = API.TabButtons
+local Tabs = API.Tabs
+local Toggle = API.Toggle
+local UIS = API.UIS
+local Workspace = API.Workspace
+local bind = API.bind
+local filterTabs = API.filterTabs
+local getChar = API.getChar
+local getHum = API.getHum
+local getRoot = API.getRoot
+local new = API.new
+local notify = API.notify
+local onUnload = API.onUnload
+
+if game.PlaceId ~= 13822889 then notify("You're not in Lumber Tycoon 2 - this module needs that game", T.Warn) end
+local Panel = Hub.GamePanel("Lumber Tycoon 2", "autofarm", "Trees, logs and base tools.")
+local TreeTab = Panel.Sub("Wood", "autofarm", "Find, chop and collect trees.")
+local LogTab = Panel.Sub("Logs", "loot", "Move and sell logs.")
+local PlotTab = Panel.Sub("Plot", "lock", "Land, save slots and cleanup.")
+local ShopTab = Panel.Sub("Shop", "premium", "Buy from the stores.")
+local ToolsTab = Panel.Sub("Tools", "magnet", "Select, move and sort objects.")
+local VehicleTab = Panel.Sub("Vehicle", "speed", "Vehicle tuning and pad spawner.")
+local WorldTab = Panel.Sub("World", "night", "Map scenery toggles.")
+local ProtTab = Panel.Sub("Protection", "godmode", "Axe recovery.")
+Hub.gameHeader("LUMBER TYCOON 2")
+TabButtons["Lumber Tycoon 2"].Btn.LayoutOrder = -19
+filterTabs({ "Lumber Tycoon 2", "Dashboard", "Player", "ESP", "Players", "Teleports", "Commands", "Hub Chat", "Theme", "Settings" })
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Interaction = ReplicatedStorage:FindFirstChild("Interaction")
+local RemoteProxy = Interaction and Interaction:FindFirstChild("RemoteProxy")
+local DragRemote = Interaction and Interaction:FindFirstChild("ClientIsDragging")
+
+local LT = {
+	class = nil, classes = {}, pick = 1, busy = false, token = 0, lock = nil,
+	fires = 60, fireDelay = 1, sweep = 1, back = true, bring = true,
+	sellPos = Vector3.new(315, 0, 88), sellWrap = 8,
+	esp = false, espAll = false, espMax = 1500, stopKey = Enum.KeyCode.X,
+}
+local PICK_MODES = { "Biggest Tree", "Nearest Tree" }
+local statusRow, axeRow, countRow, logRow
+local showTreePreview
+
+-- ---------------------------------------------------- axe data (from the old script's LT2Axes module)
+-- { baseDamage, [TreeClass] = damage against that class }
+local AXES = {
+	["The Many Axe"] = { 10.2 }, ["Amber Axe"] = { 3.39 }, ["Bluesteel Axe"] = { 2.8, BlueSpruce = 12.1 },
+	["Johiro"] = { 1.8 }, ["Candy Corn Axe"] = { 1.75 }, ["Rukiryaxe"] = { 1.68 },
+	["Bird Axe"] = { 1.65, CaveCrawler = 3.9, Volcano = 2.5 }, ["Silver Axe"] = { 1.6 },
+	["End Times Axe"] = { 1.58, LoneCave = 1e7 }, ["Alpha Axe of Testing"] = { 1.5 }, ["Pig Axe"] = { 1.5 },
+	["Hardened Axe"] = { 1.45 }, ["Beta Axe of Bosses"] = { 1.45 }, ["Beesaxe"] = { 1.4 },
+	["Gingerbread Axe"] = { 1.2, Koa = 11, Walnut = 8.5 }, ["Pie Axe"] = { 0.95, Cherry = 1.9 },
+	["Steel Axe"] = { 0.93 }, ["CHICKEN AXE"] = { 0.9 }, ["OverGrown Axe"] = { 0.8, GreenSwampy = 7, GoldSwampy = 5.3 },
+	["Spearmint Axe"] = { 0.8 }, ["Fire Axe"] = { 0.6, Volcano = 6.35 }, ["Plain Axe"] = { 0.55 },
+	["Rusty Axe"] = { 0.55 }, ["Cave Axe"] = { 0.4, CaveCrawler = 7.2 }, ["Frost Axe"] = { 0.36, Frost = 6 },
+	["Basic Hatchet"] = { 0.2 }, ["Candy Cane Axe"] = { 0 }, ["Refined Axe"] = { 0 }, ["Inverse Axe"] = { -1 },
+}
+local function axeDamage(name, class)
+	local a = AXES[name]
+	if not a then return 1 end
+	local v = class and a[class]
+	if v == nil then v = a[1] end
+	return v
+end
+local function axeNameOf(tool)
+	local v = tool:FindFirstChild("ToolTip")
+	if v and v:IsA("StringValue") then return v.Value end
+	local ok, tip = pcall(function() return tool.ToolTip end)
+	if ok and type(tip) == "string" then return tip end
+	return nil
+end
+local function bestAxe(class)
+	local best, bestName, bestScore
+	local function try(tool)
+		if not tool:IsA("Tool") or tool.Name == "BlueprintTool" then return end
+		local nm = axeNameOf(tool)
+		if not nm or nm == "" then return end
+		local low = nm:lower()
+		if not AXES[nm] and not low:find("axe", 1, true) and not low:find("hatchet", 1, true) then return end
+		local score = axeDamage(nm, class)
+		if not bestScore or score > bestScore then best, bestName, bestScore = tool, nm, score end
+	end
+	local ch = getChar()
+	if ch then for _, c in ipairs(ch:GetChildren()) do try(c) end end
+	local bp = LocalPlayer:FindFirstChildOfClass("Backpack")
+	if bp then for _, c in ipairs(bp:GetChildren()) do try(c) end end
+	return best, bestName, bestScore
+end
+
+-- ---------------------------------------------------- tree / log helpers
+local function regions()
+	local out = {}
+	for _, f in ipairs(Workspace:GetChildren()) do
+		if f.Name:lower():find("treeregion", 1, true) then table.insert(out, f) end
+	end
+	return out
+end
+local function classOf(tree)
+	local tc = tree:FindFirstChild("TreeClass")
+	return tc and tc:IsA("StringValue") and tc.Value or nil
+end
+local function sectionsOf(tree)
+	local s = {}
+	for _, p in ipairs(tree:GetChildren()) do
+		if p.Name == "WoodSection" and p:IsA("BasePart") then table.insert(s, p) end
+	end
+	table.sort(s, function(a, b) return a.Position.Y < b.Position.Y end)
+	return s
+end
+local function baseSection(tree)
+	local list = sectionsOf(tree)
+	local base = list[1]
+	for _, s in ipairs(list) do
+		local id = s:FindFirstChild("ID")
+		if id and id.Value == 1 then base = s break end
+	end
+	return base
+end
+local function scanClasses()
+	local seen, list = {}, {}
+	for _, f in ipairs(regions()) do
+		for _, m in ipairs(f:GetChildren()) do
+			if m:IsA("Model") then
+				local c = classOf(m)
+				if c and not seen[c] and #sectionsOf(m) > 1 then seen[c] = true table.insert(list, c) end
+			end
+		end
+	end
+	table.sort(list)
+	LT.classes = list
+	return list
+end
+-- class == nil means any class. mode 1 = most sections, 2 = closest to you.
+local function pickTree(class, mode)
+	local r = getRoot()
+	local best, bestV
+	for _, f in ipairs(regions()) do
+		for _, m in ipairs(f:GetChildren()) do
+			if m:IsA("Model") and (class == nil or classOf(m) == class) and classOf(m) then
+				local n = #sectionsOf(m)
+				local skip = n < 2 or (mode == 1 and classOf(m) == "Generic" and n < 12)
+				if not skip then
+					local v
+					if mode == 1 and class ~= nil then
+						v = -n
+					else
+						local ok, pv = pcall(function() return m:GetPivot().Position end)
+						v = (ok and r) and (pv - r.Position).Magnitude or math.huge
+					end
+					if not bestV or v < bestV then best, bestV = m, v end
+				end
+			end
+		end
+	end
+	return best
+end
+local function ownedByMe(model)
+	local o = model:FindFirstChild("Owner")
+	if o then
+		if o:IsA("ObjectValue") and o.Value == LocalPlayer then return true end
+		if o:IsA("StringValue") and o.Value == LocalPlayer.Name then return true end
+		local os2 = o:FindFirstChild("OwnerString")
+		if os2 and os2:IsA("StringValue") and os2.Value == LocalPlayer.Name then return true end
+	end
+	local s = model:FindFirstChild("OwnerString")
+	return s ~= nil and s:IsA("StringValue") and s.Value == LocalPlayer.Name
+end
+local function myLogs()
+	local out = {}
+	local lm = Workspace:FindFirstChild("LogModels")
+	if lm then for _, m in ipairs(lm:GetChildren()) do if m:IsA("Model") and ownedByMe(m) then table.insert(out, m) end end end
+	return out
+end
+local function snapshotLogs()
+	local snap, lm = {}, Workspace:FindFirstChild("LogModels")
+	if lm then for _, m in ipairs(lm:GetChildren()) do snap[m] = true end end
+	return snap
+end
+-- new log models of this class that are mine (or whose owner label hasn't loaded yet)
+local function newLogs(class, snap)
+	local out, lm = {}, Workspace:FindFirstChild("LogModels")
+	if not lm then return out end
+	for _, m in ipairs(lm:GetChildren()) do
+		if not snap[m] and m:IsA("Model") then
+			local c = m:FindFirstChild("TreeClass")
+			if c and c.Value == class and (m:FindFirstChild("Owner") == nil or ownedByMe(m)) then table.insert(out, m) end
+		end
+	end
+	return out
+end
+
+-- ---------------------------------------------------- preview widget (rotating 3D model or an image, with a caption)
+local function makePreview(parent, height, caption)
+	local f = new("Frame", { Size = UDim2.new(1, 0, 0, height), BackgroundTransparency = 1 }, parent)
+	local box = new("Frame", { Size = UDim2.new(1, -28, 1, -26), Position = UDim2.fromOffset(14, 6), BackgroundColor3 = T.Bg, BorderSizePixel = 0, ClipsDescendants = true }, f)
+	round(box, 8)
+	local vp = new("ViewportFrame", { Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, Ambient = Color3.fromRGB(190, 190, 190), LightColor = Color3.new(1, 1, 1), Visible = false }, box)
+	local cam = new("Camera", { FieldOfView = 50 }, vp)
+	vp.CurrentCamera = cam
+	local img = new("ImageLabel", { Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, ScaleType = Enum.ScaleType.Fit, Visible = false }, box)
+	local cap = new("TextLabel", { Size = UDim2.new(1, -28, 0, 16), Position = UDim2.new(0, 14, 1, -19), BackgroundTransparency = 1, Text = caption, TextColor3 = T.Sub, Font = Enum.Font.Gotham, TextSize = 11, TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd }, f)
+	local obj, shown = {}, nil
+	local center, dist, rad, ang = Vector3.zero, 10, 5, 0
+	local function clear()
+		if shown then shown:Destroy() shown = nil end
+		vp.Visible = false
+		img.Visible = false
+	end
+	function obj.Clear(text) clear() cap.Text = text or caption end
+	function obj.Caption(text) cap.Text = text end
+	function obj.Image(asset, text)
+		clear()
+		img.Image = asset
+		img.Visible = true
+		cap.Text = text or ""
+	end
+	function obj.Model(model, text)
+		clear()
+		cap.Text = text or ""
+		if not model then return end
+		if LT.previews == false then cap.Text = (text or "") .. "  (preview off)" return end
+		local ok, c = pcall(function() return model:Clone() end)
+		if not (ok and c) then cap.Text = (text or "") .. "  (no preview)" return end
+		for _, d in ipairs(c:GetDescendants()) do
+			if d:IsA("BaseScript") or d:IsA("Sound") then d:Destroy() end
+		end
+		local cf, size
+		if c:IsA("BasePart") then
+			cf, size = c.CFrame, c.Size
+		else
+			local okb, a, b = pcall(c.GetBoundingBox, c)
+			if okb then cf, size = a, b end
+		end
+		if not cf then c:Destroy() cap.Text = (text or "") .. "  (no preview)" return end
+		c.Parent = vp
+		shown = c
+		center = cf.Position
+		rad = math.max(size.Magnitude / 2, 1)
+		dist = rad / math.tan(math.rad(cam.FieldOfView / 2)) * 1.1
+		vp.Visible = true
+	end
+	local conn
+	conn = RunService.Heartbeat:Connect(function(dt)
+		if not f.Parent then conn:Disconnect() return end
+		if not shown or not vp.Visible then return end
+		ang = ang + dt * 0.7
+		cam.CFrame = CFrame.lookAt(center + Vector3.new(math.cos(ang) * dist, rad * 0.4, math.sin(ang) * dist), center)
+	end)
+	return obj
+end
+
+-- ---------------------------------------------------- status / job runner
+local function setStatus(text) if statusRow then statusRow.Text = "Status: " .. text end end
+local function dropLock() if LT.lock then LT.lock:Disconnect() LT.lock = nil end end
+local function stopAll() LT.token = LT.token + 1 LT.busy = false dropLock() setStatus("Idle") end
+local function runJob(label, fn)
+	if LT.busy then notify("Already running - press Stop first", T.Warn) return end
+	if not RemoteProxy or not DragRemote then
+		Interaction = ReplicatedStorage:FindFirstChild("Interaction")
+		RemoteProxy = Interaction and Interaction:FindFirstChild("RemoteProxy")
+		DragRemote = Interaction and Interaction:FindFirstChild("ClientIsDragging")
+	end
+	if not RemoteProxy or not DragRemote then notify("LT2 remotes not found - are you in Lumber Tycoon 2?", T.Bad) return end
+	LT.token = LT.token + 1
+	local my = LT.token
+	LT.busy = true
+	setStatus(label)
+	task.spawn(function()
+		local alive = function() return Live.Running and LT.token == my end
+		local good, err = pcall(fn, alive)
+		if not good then notify("LT2 error: " .. tostring(err):sub(1, 70), T.Bad) end
+		if LT.token == my then LT.busy = false dropLock() setStatus("Idle") end
+	end)
+end
+local function waitRespawn(alive)
+	local deadline = os.clock() + 30
+	repeat task.wait(0.2) until not alive() or os.clock() > deadline or (getHum() and getHum().Health > 0 and getRoot())
+	task.wait(1)
+end
+
+-- ---------------------------------------------------- cutting
+local function cutSection(section, tool, axeName, class, stop)
+	if not section or not section.Parent then return end
+	local idObj = section:FindFirstChild("ID")
+	if not idObj then return end
+	local cutEvent = section:FindFirstChild("CutEvent") or section.Parent:FindFirstChild("CutEvent") or (section.Parent.Parent and section.Parent.Parent:FindFirstChild("CutEvent"))
+	if not cutEvent then return end
+	local sizeY = section.Size.Y
+	local args = {
+		sectionId = idObj.Value, faceVector = Vector3.new(0, 0, -1),
+		height = sizeY * math.clamp(0.1 + (8 - sizeY) / 60, 0.1, 0.2),
+		hitPoints = axeDamage(axeName, class), cooldown = 0, cuttingClass = "Axe", tool = tool,
+	}
+	for _ = 1, LT.fires do
+		if not section.Parent or stop() then break end
+		RemoteProxy:FireServer(cutEvent, args)
+		task.wait(math.max(LT.fireDelay / 100, 0.005))
+	end
+end
+
+-- ---------------------------------------------------- moving logs (claim ownership, then set CFrame)
+local function claimDrag(model, timeout)
+	local owner = model:FindFirstChild("Owner")
+	local li = (owner and owner:FindFirstChild("LastInteraction")) or model:FindFirstChild("LastInteraction")
+	local changed, conn = false, nil
+	if li then conn = li:GetPropertyChangedSignal("Value"):Connect(function() changed = true end) end
+	local deadline = os.clock() + timeout
+	while Live.Running and os.clock() < deadline and not changed do
+		pcall(DragRemote.FireServer, DragRemote, model)
+		task.wait()
+	end
+	if conn then conn:Disconnect() end
+	return changed
+end
+local function moveLog(part, goalCF)
+	if not part or not part.Parent then return false end
+	local model = part:FindFirstAncestorOfClass("Model") or part.Parent
+	local r = getRoot()
+	if r then
+		local flat = (r.Position - part.Position) * Vector3.new(1, 0, 1)
+		if flat.Magnitude > 10 then r.CFrame = CFrame.new(part.Position + Vector3.new(0, 3, 0)) task.wait(0.05) end
+	end
+	claimDrag(model, 1)
+	if part.Parent then part.CFrame = goalCF end
+	task.wait(0.1)
+	return true
+end
+local function bringParts(parts, alive, center)
+	local r = getRoot()
+	if not r then return end
+	local home = r.CFrame
+	center = center or home
+	for i, p in ipairs(parts) do
+		if not alive() then break end
+		local col, row = (i - 1) % 5, math.floor((i - 1) / 5)
+		moveLog(p, center * CFrame.new(col * 5, 0, -6 - row * 6))
+	end
+	local rr = getRoot()
+	if rr and LT.back then rr.CFrame = home end
+end
+local function innerWoods(models)
+	local out = {}
+	for _, m in ipairs(models) do
+		local iw = m:FindFirstChild("InnerWood")
+		if iw and iw:IsA("BasePart") then table.insert(out, iw) end
+	end
+	return out
+end
+
+-- ---------------------------------------------------- chop one tree (teleport onto the base, cut until it falls)
+local function chopTree(tree, alive)
+	local class = classOf(tree)
+	if not class then return false end
+	local tool, axeName = bestAxe(class)
+	if not tool then notify("No axe found in your backpack", T.Warn) return false end
+	if showTreePreview then showTreePreview(tree, "Chopping") end
+	local r = getRoot()
+	if not r or #sectionsOf(tree) == 0 then return false end
+	local snap = snapshotLogs()
+	local origin = r.CFrame
+	local base = baseSection(tree)
+	r.CFrame = base.CFrame
+	r.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+	dropLock()
+	LT.lock = RunService.Heartbeat:Connect(function()
+		local rr = getRoot()
+		if rr and base and base.Parent then rr.CFrame = base.CFrame rr.AssemblyLinearVelocity = Vector3.new(0, 0, 0) end
+	end)
+	task.wait(0.1)
+	local lastCheck, fellNow = 0, false
+	local function fell()
+		if fellNow then return true end
+		if os.clock() - lastCheck > 0.25 then
+			lastCheck = os.clock()
+			fellNow = tree.Parent == nil or #newLogs(class, snap) > 0
+		end
+		return fellNow
+	end
+	while alive() and not fell() do
+		local h = getHum()
+		if not h or h.Health <= 0 then
+			waitRespawn(alive)
+			if not alive() then break end
+			tool, axeName = bestAxe(class)
+			if not tool then notify("No axe after respawn - stopped", T.Warn) break end
+		end
+		base = baseSection(tree)
+		if not base then break end
+		cutSection(base, tool, axeName, class, function() return not alive() or fell() end)
+		task.wait(LT.sweep / 10)
+	end
+	dropLock()
+	if not alive() then return false end
+	task.wait(0.3)
+	local rr = getRoot()
+	if rr and LT.back then rr.CFrame = origin end
+	if LT.bring then
+		local stumps = innerWoods(newLogs(class, snap))
+		if #stumps > 0 then setStatus("Bringing logs") bringParts(stumps, alive) end
+	end
+	return true
+end
+
+-- ---------------------------------------------------- selling (sections one by one onto the sell spot)
+local function sellLogs(alive)
+	local models = myLogs()
+	if #models == 0 then notify("You have no logs to sell", T.Warn) return end
+	local r = getRoot()
+	local home = r and r.CFrame
+	local idx = 0
+	for _, m in ipairs(models) do
+		if not alive() then break end
+		local secs = {}
+		for _, d in ipairs(m:GetDescendants()) do
+			if d:IsA("BasePart") and d.Name == "WoodSection" then table.insert(secs, d) end
+		end
+		table.sort(secs, function(a, b) return a.Position.Y < b.Position.Y end)
+		for _, s in ipairs(secs) do
+			if not alive() then break end
+			if s.Parent then
+				for _, d in ipairs(m:GetDescendants()) do
+					if (d:IsA("Weld") or d:IsA("WeldConstraint") or d:IsA("ManualWeld")) and (d.Part0 == s or d.Part1 == s) then pcall(function() d:Destroy() end) end
+				end
+				task.wait(0.1)
+				idx = idx + 1
+				local slot = (idx - 1) % LT.sellWrap
+				moveLog(s, CFrame.new(LT.sellPos.X + slot * 3, LT.sellPos.Y, LT.sellPos.Z))
+			end
+		end
+	end
+	local rr = getRoot()
+	if rr and home and LT.back then rr.CFrame = home end
+end
+
+-- ====================================================== UI : Trees tab
+local Tf = Section(TreeTab, "Tree Finder", "Pick what to chop - the best axe in your backpack is chosen automatically", "autofarm")
+statusRow = InfoRow(Tf, "Status: Idle")
+axeRow = InfoRow(Tf, "Best axe: -")
+countRow = InfoRow(Tf, "Trees of this type: -")
+local typeDd
+local treePrev = makePreview(Tf, 170, "Next tree preview")
+local typeSearch = ""
+local function shownClasses()
+	local all = LT.classes or {}
+	if typeSearch == "" then return all end
+	local out = {}
+	for _, c in ipairs(all) do
+		if c:lower():find(typeSearch, 1, true) then table.insert(out, c) end
+	end
+	return out
+end
+showTreePreview = function(tree, prefix)
+	if not tree or not tree.Parent then treePrev.Clear("No tree found") LT.prevTree = nil return end
+	local class = classOf(tree) or "?"
+	local ok, pv = pcall(function() return tree:GetPivot().Position end)
+	local r = getRoot()
+	local text = (prefix and (prefix .. ": ") or "") .. class .. "  -  " .. #sectionsOf(tree) .. " sections"
+	if ok and r then text = text .. "  -  " .. math.floor((pv - r.Position).Magnitude) .. "m away" end
+	if LT.prevTree == tree then treePrev.Caption(text) return end
+	LT.prevTree = tree
+	treePrev.Model(tree, text)
+end
+local function refreshInfo()
+	local c = LT.class
+	if not c then
+		axeRow.Text = "Best axe: -"
+		countRow.Text = "Trees of this type: -"
+		treePrev.Clear("Pick a tree type")
+		LT.prevTree = nil
+		return
+	end
+	local _, nm, dmg = bestAxe(c)
+	axeRow.Text = nm and ("Best axe: " .. nm .. "  (damage " .. tostring(dmg) .. ")") or "Best axe: none found in your backpack"
+	local n = 0
+	for _, f in ipairs(regions()) do for _, m in ipairs(f:GetChildren()) do if m:IsA("Model") and classOf(m) == c and #sectionsOf(m) > 1 then n = n + 1 end end end
+	countRow.Text = "Trees of this type: " .. n
+	if not LT.busy then showTreePreview(pickTree(c, LT.pick)) end
+end
+local function syncType()
+	if not typeDd then return end
+	local shown = shownClasses()
+	local opts = shown
+	if #opts == 0 then opts = { (LT.classes and #LT.classes > 0) and "No match" or "None" } end
+	typeDd.SetOptions(opts, true)
+	local at = 1
+	for i, c in ipairs(opts) do if c == LT.class then at = i end end
+	typeDd.Set(at, true)
+end
+local function setClass(c)
+	LT.class = c
+	syncType()
+	refreshInfo()
+end
+local function refreshTypes()
+	local list = scanClasses()
+	local keep = false
+	for _, c in ipairs(list) do if c == LT.class then keep = true end end
+	if not keep then setClass(list[1]) else refreshInfo() end
+	notify("Found " .. #list .. " tree type(s)", T.Good)
+end
+local function applyTypeSearch(text)
+	typeSearch = (text or ""):lower()
+	local shown = shownClasses()
+	local has = false
+	for _, c in ipairs(shown) do if c == LT.class then has = true end end
+	if not has and shown[1] then LT.class = shown[1] LT.prevTree = nil end
+	syncType()
+	refreshInfo()
+end
+local typeBox = Input(Tf, "Search Tree Types", "type to filter", "Search", function(text) applyTypeSearch(text) end)
+bind(typeBox:GetPropertyChangedSignal("Text"), function() applyTypeSearch(typeBox.Text) end)
+typeDd = Dropdown(Tf, "Tree Type", { "None" }, 1, function(i)
+	local c = shownClasses()[i]
+	if c then LT.class = c LT.prevTree = nil refreshInfo() end
+end, nil, "Press Scan to list the tree types in this server")
+Button(Tf, "Refresh Tree Types", "Scan", refreshTypes)
+Dropdown(Tf, "Which Tree First", PICK_MODES, LT.pick, function(i) LT.pick = i LT.prevTree = nil refreshInfo() end)
+Button(Tf, "Teleport To Selected Tree", "Go", function()
+	local tree, r = pickTree(LT.class, LT.pick), getRoot()
+	local b = tree and baseSection(tree)
+	if b and r then r.CFrame = b.CFrame + Vector3.new(0, 6, 0) else notify("No tree of that type found", T.Warn) end
+end)
+
+local Ch = Section(TreeTab, "Auto Chop", "Teleports onto the tree, cuts until it falls, then brings the logs back to you", "autofarm")
+Button(Ch, "Chop Selected Tree Type  (once)", "Chop", function()
+	local c = LT.class
+	if not c then notify("Pick a tree type first (Refresh Tree Types)", T.Warn) return end
+	runJob("Chopping " .. c, function(alive)
+		local tree = pickTree(c, LT.pick)
+		if not tree then notify("No " .. c .. " tree found", T.Warn) return end
+		chopTree(tree, alive)
+	end)
+end)
+Button(Ch, "Chop Nearest Tree  (any type)", "Chop", function()
+	runJob("Chopping nearest tree", function(alive)
+		local tree = pickTree(nil, 2)
+		if not tree then notify("No trees found", T.Warn) return end
+		chopTree(tree, alive)
+	end)
+end)
+Button(Ch, "Auto Chop Selected Type  (loop)", "Start", function()
+	local c = LT.class
+	if not c then notify("Pick a tree type first (Refresh Tree Types)", T.Warn) return end
+	runJob("Auto chopping " .. c, function(alive)
+		while alive() do
+			local tree = pickTree(c, LT.pick)
+			if not tree then notify("No more " .. c .. " trees - stopped", T.Warn) return end
+			chopTree(tree, alive)
+			task.wait(0.5)
+		end
+	end)
+end)
+Button(Ch, "Stop", "Stop", function() stopAll() notify("Stopped", T.Sub) end)
+Toggle(Ch, "Bring Logs To Me After Each Tree", true, function(v) LT.bring = v end)
+Toggle(Ch, "Return To Start Position After", true, function(v) LT.back = v end)
+Keybind(Ch, "Stop Key  (Backspace = none)", LT.stopKey, function(k) LT.stopKey = k end, true)
+local ChOpt = Collapse(Ch, "Settings")
+Slider(ChOpt, "Cuts Per Sweep", 10, 200, 60, function(v) LT.fires = v end)
+Slider(ChOpt, "Delay Between Cuts (x0.01s)", 1, 20, 1, function(v) LT.fireDelay = v end)
+Slider(ChOpt, "Delay Between Sweeps (x0.1s)", 1, 20, 1, function(v) LT.sweep = v end)
+
+local Te = Section(TreeTab, "Tree ESP", "Labels trees with their type and size", "esp")
+Toggle(Te, "Tree ESP", false, function(v) LT.esp = v end, nil, "lt2esp")
+Toggle(Te, "Show All Types", false, function(v) LT.espAll = v end, nil, "lt2espall", "Off = selected type only")
+Slider(Te, "ESP Range", 100, 3000, 1500, function(v) LT.espMax = v end, "lt2espmax")
+
+-- ====================================================== UI : Logs tab
+local Lg = Section(LogTab, "My Logs", "Works on logs you own - ownership is claimed the same way the game does when you drag", "loot")
+logRow = InfoRow(Lg, "Logs: -")
+Button(Lg, "Bring All My Logs To Me", "Bring", function()
+	runJob("Bringing logs", function(alive)
+		local parts = innerWoods(myLogs())
+		if #parts == 0 then notify("You have no logs", T.Warn) return end
+		bringParts(parts, alive)
+	end)
+end)
+Button(Lg, "Sell All My Logs  (section by section)", "Sell", function()
+	runJob("Selling logs", sellLogs)
+end)
+Button(Lg, "Stop", "Stop", function() stopAll() notify("Stopped", T.Sub) end)
+Slider(Lg, "Sell Spot Spacing Slots", 2, 20, 8, function(v) LT.sellWrap = v end)
+Button(Lg, "Teleport To Sell Spot", "Go", function()
+	local r = getRoot()
+	if r then r.CFrame = CFrame.new(LT.sellPos + Vector3.new(0, 6, 0)) end
+end)
+
+-- ====================================================== extra sections in Teleports
+-- vehicle-aware teleport: when you sit in a vehicle it is moved with you (loose cargo on known pickups / trucks too)
+local VEHICLE_PRESETS = {
+	Pickup1_Vehicle = { Size = Vector3.new(10, 6, 18), Offset = CFrame.new(0, 3, 11.5) },
+	UtilityTruck_Vehicle = { Size = Vector3.new(7, 3, 10), Offset = CFrame.new(0, 1.75, 5.75) },
+	UtilityTruck2_Vehicle = { Size = Vector3.new(8, 3, 11), Offset = CFrame.new(0, 1.75, 6) },
+}
+local function vehicleTp(veh, pos)
+	local target = CFrame.new(pos + Vector3.new(0, 1, 0))
+	local anch = {}
+	for _, d in ipairs(veh:GetDescendants()) do
+		if d:IsA("BasePart") then anch[d] = d.Anchored d.Anchored = true end
+	end
+	local nameV = veh:FindFirstChild("ItemName")
+	local preset = nameV and nameV:IsA("StringValue") and VEHICLE_PRESETS[nameV.Value]
+	if preset then
+		local pivot = veh:GetPivot()
+		local move = target * pivot:Inverse()
+		local op = OverlapParams.new()
+		op.FilterType = Enum.RaycastFilterType.Exclude
+		op.FilterDescendantsInstances = { veh, getChar() }
+		op.RespectCanCollide = false
+		local done = {}
+		for _, part in ipairs(Workspace:GetPartBoundsInBox(pivot * preset.Offset, preset.Size, op)) do
+			if not part.Anchored then
+				local m = part:FindFirstAncestorOfClass("Model")
+				if m and m ~= Workspace then
+					if not done[m] then done[m] = true m:PivotTo(move * m:GetPivot()) end
+				elseif not done[part] then
+					done[part] = true
+					part.CFrame = move * part.CFrame
+				end
+			end
+		end
+	end
+	veh:PivotTo(target)
+	task.wait(0.05)
+	for p, a in pairs(anch) do if p.Parent then p.Anchored = a end end
+end
+local function tpTo(v)
+	local r, h = getRoot(), getHum()
+	if not r then return end
+	local seat = h and h.SeatPart
+	local veh = seat and seat:FindFirstAncestorOfClass("Model")
+	if veh and LT.carry ~= false and veh ~= getChar() and (veh:FindFirstChild("Configuration", true) or veh:FindFirstChild("ItemName")) then
+		vehicleTp(veh, v)
+		return
+	end
+	if h and h.SeatPart then h.Sit = false task.wait(0.05) end
+	r.CFrame = CFrame.new(v + Vector3.new(0, 3, 0))
+end
+local function tpSection(title, sub, list)
+	local sec = Section(Tabs["Teleports"], title, sub, "teleports")
+	local names = {}
+	for i, e in ipairs(list) do names[i] = e[1] end
+	local dd = Dropdown(sec, "Destination", names, 1)
+	Button(sec, "Teleport", "Go", function() local e = list[dd.Get()] if e then tpTo(e[2]) end end)
+end
+tpSection("LT2 Shops", "Stores and NPCs", {
+	{ "Wood R Us", Vector3.new(265, 3, 57) }, { "Land Store", Vector3.new(257, 3, -99) },
+	{ "Boxed Cars", Vector3.new(510, 3, -1465) }, { "Fancy Furnishings", Vector3.new(500, 3, -1720) },
+	{ "Links Logic", Vector3.new(4607, 7, -795) }, { "Fine Arts Shop", Vector3.new(5207, -166, 719) },
+	{ "Bob's Shack", Vector3.new(260, 8.4, -2542) },
+})
+tpSection("LT2 Tree Biomes", "Where the special trees grow", {
+	{ "Cherry Meadow", Vector3.new(220.9, 59.8, 1305.8) }, { "Volcano", Vector3.new(-1585, 622, 1140) },
+	{ "Swamp", Vector3.new(-1209, 132, -801) }, { "Tiaga Peak", Vector3.new(1448, 413, 3186) },
+	{ "Snow Biome", Vector3.new(890, 59.8, 1195.6) }, { "SnowGlow Biome", Vector3.new(-1087.3, -5.9, -946.2) },
+	{ "Cave", Vector3.new(3581, -179.5, 430) }, { "Palm Island", Vector3.new(2000, -6, -1500) },
+	{ "Lone Cave", Vector3.new(115, -214, -1095) },
+})
+tpSection("LT2 Landmarks", "Other places", {
+	{ "Bridge", Vector3.new(112.3, 11, -782.4) }, { "Docks", Vector3.new(1114, -1.2, -197) },
+	{ "The Den", Vector3.new(323, 41.8, 1930) }, { "Safari", Vector3.new(111.9, 11, -998.8) },
+	{ "The Cabin", Vector3.new(1244, 63.6, 2306) }, { "Bird Cave", Vector3.new(4813.1, 17.7, -978.8) },
+	{ "Strange Man", Vector3.new(1061, 16.8, 1131) }, { "Green Box", Vector3.new(-1668.1, 349.6, 1475.4) },
+	{ "Light House", Vector3.new(1464.8, 355.2, 3257.2) }, { "Shrine of Sight", Vector3.new(-1600, 195.4, 919) },
+	{ "Fridge", Vector3.new(550.17, -1, -1714.16) },
+})
+local Ld = Section(Tabs["Teleports"], "LT2 Land", "Your plot", "teleports")
+Button(Ld, "Claim A Free Plot", "Claim", function()
+	local props = Workspace:FindFirstChild("Properties")
+	local pp = ReplicatedStorage:FindFirstChild("PropertyPurchasing")
+	local claim = pp and pp:FindFirstChild("ClientPurchasedProperty")
+	if not props or not claim then notify("Property system not found", T.Bad) return end
+	for _, plot in ipairs(props:GetChildren()) do
+		local owner, origin = plot:FindFirstChild("Owner"), plot:FindFirstChild("OriginSquare")
+		if owner and origin and owner.Value == nil then
+			claim:FireServer(plot, origin.OriginCFrame.Value.Position + Vector3.new(0, 3, 0))
+			notify("Claim sent", T.Good)
+			task.wait(0.5)
+			local ch = getChar()
+			if ch then ch:MoveTo(origin.Position) end
+			return
+		end
+	end
+	notify("No free plot found", T.Warn)
+end)
+Button(Ld, "Teleport To My Plot", "Go", function()
+	local props = Workspace:FindFirstChild("Properties")
+	for _, plot in ipairs(props and props:GetChildren() or {}) do
+		local owner, origin = plot:FindFirstChild("Owner"), plot:FindFirstChild("OriginSquare")
+		if owner and origin and owner.Value == LocalPlayer then tpTo(origin.Position) return end
+	end
+	notify("You don't own a plot yet", T.Warn)
+end)
+
+-- ====================================================== v2: new tabs ported from the Dynxe script (UNTESTED in game)
+-- Everything below finds its remotes / folders defensively. If the game changed, you get a toast instead of an error.
+local function commas(n)
+	local s = tostring(math.floor(n))
+	local out = s:reverse():gsub("(%d%d%d)", "%1,"):reverse()
+	return (out:gsub("^,", ""))
+end
+local cleanups = {}
+local function addCleanup(f) table.insert(cleanups, f) end
+local Lighting = game:GetService("Lighting")
+local mouse = LocalPlayer:GetMouse()
+
+local function mainPartOf(m)
+	if not m then return nil end
+	if m:IsA("BasePart") then return m end
+	return m:FindFirstChild("Main") or m.PrimaryPart or m:FindFirstChildWhichIsA("BasePart", true)
+end
+local function topModel(inst, pm, lmf)
+	local cur = inst
+	while cur and cur ~= Workspace do
+		local p = cur.Parent
+		if p and ((pm and p == pm) or (lmf and p == lmf)) then return cur end
+		cur = p
+	end
+	return nil
+end
+local function myPlot()
+	local props = Workspace:FindFirstChild("Properties")
+	if not props then return nil end
+	for _, plot in ipairs(props:GetChildren()) do
+		local o = plot:FindFirstChild("Owner")
+		if o and o.Value == LocalPlayer then return plot end
+	end
+	return nil
+end
+local function async(fn)
+	task.spawn(function()
+		local ok, err = pcall(fn)
+		if not ok then notify("LT2 error: " .. tostring(err):sub(1, 70), T.Bad) end
+	end)
+end
+
+-- ---------------------------------------------------- WOOD: get trees (quantity) + chop logs into sections
+local function cutAtHeight(section, tool, axeName, class, height, stop)
+	local idObj = section:FindFirstChild("ID")
+	if not idObj then return end
+	local cutEvent = section:FindFirstChild("CutEvent") or section.Parent:FindFirstChild("CutEvent") or (section.Parent.Parent and section.Parent.Parent:FindFirstChild("CutEvent"))
+	if not cutEvent then return end
+	local args = {
+		sectionId = idObj.Value, faceVector = Vector3.new(0, 0, -1), height = height,
+		hitPoints = axeDamage(axeName, class), cooldown = 0, cuttingClass = "Axe", tool = tool,
+	}
+	for _ = 1, LT.fires do
+		if not section.Parent or stop() then break end
+		RemoteProxy:FireServer(cutEvent, args)
+		task.wait(math.max(LT.fireDelay / 100, 0.005))
+	end
+end
+local function woodCount(model)
+	local n = 0
+	for _, d in ipairs(model:GetDescendants()) do
+		if d:IsA("BasePart") and d.Name == "WoodSection" then n = n + 1 end
+	end
+	return n
+end
+local function chopLogsIntoSections(alive)
+	local lm = Workspace:FindFirstChild("LogModels")
+	if not lm then notify("No LogModels folder", T.Warn) return end
+	local queue = myLogs()
+	if #queue == 0 then notify("None of your logs found", T.Warn) return end
+	local cuts = 0
+	while #queue > 0 and alive() do
+		local model = table.remove(queue, 1)
+		if model and model.Parent then
+			local tc = model:FindFirstChild("TreeClass")
+			local class = tc and tc.Value or "Generic"
+			local tool, axeName = bestAxe(class)
+			if not tool then notify("No axe in your backpack", T.Warn) return end
+			local iw = model:FindFirstChild("InnerWood", true)
+			local stump
+			for _, d in ipairs(model:GetDescendants()) do
+				if d:IsA("Weld") or d:IsA("ManualWeld") then
+					local p0, p1 = d.Part0, d.Part1
+					if iw and p0 == iw and p1 and p1.Name == "WoodSection" then stump = p1 end
+					if iw and p1 == iw and p0 and p0.Name == "WoodSection" then stump = p0 end
+				end
+			end
+			local guard = 0
+			while model.Parent and woodCount(model) > 1 and alive() and guard < 200 do
+				guard = guard + 1
+				local conn = {}
+				for _, d in ipairs(model:GetDescendants()) do
+					if (d:IsA("Weld") or d:IsA("ManualWeld")) and d.Name == "Tree Weld" then
+						local p0, p1 = d.Part0, d.Part1
+						if p0 and p1 and p0.Name == "WoodSection" and p1.Name == "WoodSection" then
+							conn[p0] = (conn[p0] or 0) + 1
+							conn[p1] = (conn[p1] or 0) + 1
+						end
+					end
+				end
+				local tip
+				for sec, n in pairs(conn) do
+					if n == 1 and sec ~= stump and sec.Parent then tip = sec break end
+				end
+				if not tip then break end
+				local weld, partner
+				for _, d in ipairs(model:GetDescendants()) do
+					if (d:IsA("Weld") or d:IsA("ManualWeld")) and d.Name == "Tree Weld" then
+						local p0, p1 = d.Part0, d.Part1
+						if p0 == tip and p1 and p1.Name == "WoodSection" then weld, partner = d, p1 break end
+						if p1 == tip and p0 and p0.Name == "WoodSection" then weld, partner = d, p0 break end
+					end
+				end
+				if not weld then break end
+				local cutPart = partner:FindFirstChild("ID") and partner or tip
+				local jointPos = (weld.Part0.CFrame * weld.C0).Position
+				local localY = (cutPart.CFrame:Inverse() * CFrame.new(jointPos)).Position.Y
+				local height = math.clamp(localY + cutPart.Size.Y / 2, 0.05, cutPart.Size.Y - 0.05)
+				local r = getRoot()
+				if r then
+					r.CFrame = CFrame.new(jointPos + cutPart.CFrame.RightVector * 4)
+					r.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+					task.wait(0.1)
+				end
+				local before = {}
+				for _, m in ipairs(lm:GetChildren()) do before[m] = true end
+				cutAtHeight(cutPart, tool, axeName, class, height, function() return not alive() end)
+				cuts = cuts + 1
+				task.wait(0.1)
+				for _, m in ipairs(lm:GetChildren()) do
+					if not before[m] and m:IsA("Model") and ownedByMe(m) and woodCount(m) > 1 then table.insert(queue, m) end
+				end
+				setStatus("Chopping logs - " .. cuts .. " cut(s), " .. #queue .. " queued")
+			end
+		end
+	end
+end
+
+local Qt = Section(TreeTab, "Get Trees", "Chop several trees of the selected type in a row", "autofarm")
+LT.qty = 1
+Slider(Qt, "Quantity", 1, 25, 1, function(v) LT.qty = v end)
+Button(Qt, "Get Trees  (selected type x quantity)", "Start", function()
+	local c = LT.class
+	if not c then notify("Pick a tree type first (Refresh Tree Types)", T.Warn) return end
+	runJob("Getting " .. LT.qty .. " x " .. c, function(alive)
+		for i = 1, LT.qty do
+			if not alive() then break end
+			setStatus("Tree " .. i .. " / " .. LT.qty)
+			local tree = pickTree(c, LT.pick)
+			if not tree then notify("No more " .. c .. " trees", T.Warn) break end
+			chopTree(tree, alive)
+			task.wait(0.5)
+		end
+	end)
+end, nil, "Chops, brings the logs, repeats")
+Button(Qt, "Chop All My Logs Into Sections", "Chop", function()
+	runJob("Chopping logs into sections", chopLogsIntoSections)
+end, nil, "Cuts every log of yours into single sections, joint by joint")
+Button(Qt, "Stop", "Stop", function() stopAll() notify("Stopped", T.Sub) end)
+
+-- ---------------------------------------------------- chop audio + preview switch
+do
+	local Au = Section(TreeTab, "Audio And Previews", "Quiet the chopping spam and switch the previews off if they cause trouble", "settings")
+	local muteOn, muted = true, {}
+	local function muteS(s)
+		if muted[s] == nil then muted[s] = s.Volume end
+		s.Volume = 0
+	end
+	Toggle(Au, "Mute Sounds While A Job Runs", true, function(v) muteOn = v end, nil, "lt2mute", "Silences sounds from the axe, your character and new world sounds while chopping / buying")
+	local addConn = game.DescendantAdded:Connect(function(d)
+		if muteOn and LT.busy and d:IsA("Sound") then
+			d.Volume = 0
+			pcall(function() d:Stop() end)
+		end
+	end)
+	addCleanup(function() addConn:Disconnect() end)
+	task.spawn(function()
+		local was = false
+		while Live.Running do
+			task.wait(0.25)
+			local on = muteOn and LT.busy
+			if on then
+				for _, root in ipairs({ getChar(), LocalPlayer:FindFirstChildOfClass("Backpack") }) do
+					if root then
+						for _, d in ipairs(root:GetDescendants()) do
+							if d:IsA("Sound") then muteS(d) end
+						end
+					end
+				end
+			elseif was then
+				for s, v in pairs(muted) do
+					if s.Parent then s.Volume = v end
+					muted[s] = nil
+				end
+			end
+			was = on
+		end
+	end)
+	addCleanup(function() for s, v in pairs(muted) do if s.Parent then s.Volume = v end end end)
+	Toggle(Au, "Show 3D / Item Previews", true, function(v)
+		LT.previews = v
+		LT.prevTree = nil
+		if not v then treePrev.Clear("Previews off") else refreshInfo() end
+	end, nil, "lt2previews", "Turn off if anything lags or sounds odd")
+end
+
+-- ---------------------------------------------------- LOGS: click to sell
+local sellClick
+local Sc = Section(LogTab, "Click To Sell", "Click a log or plank of yours and it is moved onto the sell spot", "loot")
+Toggle(Sc, "Click To Sell (logs / planks)", false, function(v)
+	if sellClick then sellClick:Disconnect() sellClick = nil end
+	if not v then return end
+	sellClick = UIS.InputBegan:Connect(function(i, gp)
+		if gp or i.UserInputType ~= Enum.UserInputType.MouseButton1 then return end
+		local t = mouse.Target
+		if not t or not DragRemote then return end
+		local model = topModel(t, Workspace:FindFirstChild("PlayerModels"), Workspace:FindFirstChild("LogModels"))
+		if not (model and model:IsA("Model") and ownedByMe(model)) then return end
+		local part = mainPartOf(model)
+		if not part then return end
+		async(function()
+			moveLog(part, CFrame.new(LT.sellPos + Vector3.new(0, 4, 0)))
+			notify("Sent " .. model.Name .. " to the sell spot", T.Good)
+		end)
+	end)
+end, nil, nil, "Only works on things you own")
+addCleanup(function() if sellClick then sellClick:Disconnect() end end)
+
+-- ---------------------------------------------------- PLOT
+local plotCool = false
+local plotStatus
+local function loadSaveRemote(name)
+	local f = ReplicatedStorage:FindFirstChild("LoadSaveRequests")
+	return f and f:FindFirstChild(name)
+end
+local Pm = Section(PlotTab, "Save Slots", "Load or save your base", "lock")
+local slotDd = Dropdown(Pm, "Slot", { "1", "2", "3", "4", "5", "6" }, 1)
+Button(Pm, "Load Selected Slot", "Load", function()
+	local r = loadSaveRemote("RequestLoad")
+	if not r then notify("RequestLoad remote not found", T.Bad) return end
+	local slot = slotDd.Get()
+	async(function() r:InvokeServer(slot) end)
+	notify("Loading slot " .. slot, T.Good)
+end)
+Button(Pm, "Save Slot", "Save", function()
+	if plotCool then notify("Save is on cooldown", T.Warn) return end
+	local cur = LocalPlayer:FindFirstChild("CurrentSaveSlot")
+	if not cur or cur.Value <= 0 then notify("No active slot - load a slot first", T.Warn) return end
+	local r = loadSaveRemote("RequestSave")
+	if not r then notify("RequestSave remote not found", T.Bad) return end
+	local slot = cur.Value
+	async(function()
+		local ok, res = pcall(function() return r:InvokeServer(slot) end)
+		if not ok then notify("Save failed: " .. tostring(res):sub(1, 60), T.Bad) return end
+		notify("Save request sent for slot " .. slot, T.Good)
+		plotCool = true
+		for s = 60, 1, -1 do
+			if not Live.Running then return end
+			if plotStatus then plotStatus.Text = "Save cooldown: " .. s .. "s" end
+			task.wait(1)
+		end
+		plotCool = false
+		if plotStatus then plotStatus.Text = "Save ready" end
+	end)
+end, nil, "Forces a save of the slot you have loaded (60s cooldown)")
+plotStatus = InfoRow(Pm, "Save ready")
+
+local Pl = Section(PlotTab, "Property", "Land and cleanup", "lock")
+Button(Pl, "Claim Free Land", "Claim", function()
+	local props = Workspace:FindFirstChild("Properties")
+	local pp = ReplicatedStorage:FindFirstChild("PropertyPurchasing")
+	local claim = pp and pp:FindFirstChild("ClientPurchasedProperty")
+	if not props or not claim then notify("Property system not found", T.Bad) return end
+	for _, plot in ipairs(props:GetChildren()) do
+		local owner, origin = plot:FindFirstChild("Owner"), plot:FindFirstChild("OriginSquare")
+		if owner and origin and owner.Value == nil then
+			claim:FireServer(plot, origin.OriginCFrame.Value.Position + Vector3.new(0, 3, 0))
+			notify("Claim sent", T.Good)
+			task.wait(0.5)
+			local ch = getChar()
+			if ch then ch:MoveTo(origin.Position) end
+			return
+		end
+	end
+	notify("No free plot found", T.Warn)
+end)
+Button(Pl, "Max Land (Full Expand)", "Expand", function()
+	local pp = ReplicatedStorage:FindFirstChild("PropertyPurchasing")
+	local expand = pp and pp:FindFirstChild("ClientExpandedProperty")
+	local plot = myPlot()
+	local origin = plot and plot:FindFirstChild("OriginSquare")
+	if not (expand and origin) then notify("You need a plot first", T.Warn) return end
+	local sp = origin.Position
+	local offsets = {
+		{ 0, 40 }, { 0, -40 }, { 40, 0 }, { -40, 0 }, { 40, 40 }, { 40, -40 }, { -40, 40 }, { -40, -40 },
+		{ 80, 0 }, { -80, 0 }, { 0, 80 }, { 0, -80 }, { 80, 80 }, { 80, -80 }, { -80, 80 }, { -80, -80 },
+		{ 40, 80 }, { -40, 80 }, { 80, 40 }, { 80, -40 }, { -80, 40 }, { -80, -40 }, { 40, -80 }, { -40, -80 },
+	}
+	async(function()
+		for _, o in ipairs(offsets) do
+			expand:FireServer(plot, CFrame.new(sp.X + o[1], sp.Y, sp.Z + o[2]))
+			task.wait(0.05)
+		end
+		notify("Expand requests sent", T.Good)
+	end)
+end, nil, "Buys every neighbouring square the game allows")
+Button(Pl, "Delete 'Sold To' Sign", "Delete", function()
+	local interaction = ReplicatedStorage:FindFirstChild("Interaction")
+	local destroy = interaction and interaction:FindFirstChild("DestroyStructure")
+	local pm = Workspace:FindFirstChild("PlayerModels")
+	if not (destroy and pm) then notify("DestroyStructure remote not found", T.Bad) return end
+	for _, m in ipairs(pm:GetChildren()) do
+		if m:IsA("Model") and ownedByMe(m) then
+			local st = m:FindFirstChild("Settings")
+			local flag = st and st:FindFirstChild("PropertySoldSign")
+			if flag and flag.Value == true then
+				destroy:FireServer(m)
+				notify("Sign deleted", T.Good)
+				return
+			end
+		end
+	end
+	notify("No sold sign found", T.Warn)
+end)
+local wipeArmed = 0
+Button(Pl, "Wipe Plot  (press twice)", "Wipe", function()
+	if os.clock() - wipeArmed > 5 then
+		wipeArmed = os.clock()
+		notify("Press Wipe again within 5s to delete EVERYTHING you own on the plot", T.Warn)
+		return
+	end
+	wipeArmed = 0
+	local interaction = ReplicatedStorage:FindFirstChild("Interaction")
+	local destroy = interaction and interaction:FindFirstChild("DestroyStructure")
+	local pm = Workspace:FindFirstChild("PlayerModels")
+	if not (destroy and pm) then notify("Wipe system not available", T.Bad) return end
+	async(function()
+		local todo = {}
+		for _, m in ipairs(pm:GetChildren()) do
+			if m:IsA("Model") and ownedByMe(m) then table.insert(todo, m) end
+		end
+		if #todo == 0 then notify("Nothing to wipe", T.Warn) return end
+		notify("Clearing " .. #todo .. " object(s)...", T.Warn)
+		local gone = 0
+		for _, m in ipairs(todo) do
+			if not Live.Running then return end
+			local t = 0
+			while m.Parent ~= nil and t < 5 do
+				pcall(destroy.FireServer, destroy, m)
+				task.wait(0.05)
+				t = t + 0.05
+			end
+			if m.Parent == nil then gone = gone + 1 end
+		end
+		notify("Wiped " .. gone .. " object(s)", T.Good)
+	end)
+end, nil, "Deletes everything of yours in PlayerModels (items, structures, furniture)")
+
+local Pc = Section(PlotTab, "Plot Color", "Client-side only - recolours every plot square", "esp")
+local pc = { r = 126, g = 104, b = 63, keep = false, conn = nil }
+local function applyPlotColor()
+	local props = Workspace:FindFirstChild("Properties")
+	if not props then return end
+	local col = Color3.fromRGB(pc.r, pc.g, pc.b)
+	for _, plot in ipairs(props:GetChildren()) do
+		for _, ch in ipairs(plot:GetChildren()) do
+			if ch:IsA("BasePart") then ch.Color = col end
+		end
+	end
+end
+Slider(Pc, "Red", 0, 255, 126, function(v) pc.r = v end)
+Slider(Pc, "Green", 0, 255, 104, function(v) pc.g = v end)
+Slider(Pc, "Blue", 0, 255, 63, function(v) pc.b = v end)
+Button(Pc, "Apply Plot Color", "Apply", applyPlotColor)
+Toggle(Pc, "Keep Color On New Squares", false, function(v)
+	pc.keep = v
+	if pc.conn then pc.conn:Disconnect() pc.conn = nil end
+	local props = Workspace:FindFirstChild("Properties")
+	if v and props then
+		pc.conn = props.DescendantAdded:Connect(function(d)
+			if d:IsA("BasePart") then task.defer(function() d.Color = Color3.fromRGB(pc.r, pc.g, pc.b) end) end
+		end)
+		applyPlotColor()
+	end
+end)
+addCleanup(function() if pc.conn then pc.conn:Disconnect() end end)
+
+-- ---------------------------------------------------- SHOP (store NPC dialog purchase flow)
+do
+local STORES = {
+	{ "Wood R Us", "WoodRUs", "Thom", CFrame.new(262.1, 3.2, 64.8) },
+	{ "Fancy Furnishings", "FurnitureStore", "Corey", CFrame.new(481.4, 3.2, -1712.5) },
+	{ "Boxed Cars", "CarStore", "Jenny", CFrame.new(524.9, 3.2, -1466.6) },
+	{ "Bob's Shack", "ShackShop", "Bob", CFrame.new(256.7, 8.4, -2546.7) },
+	{ "Fine Arts Shop", "FineArt", "Timothy", CFrame.new(5232.4, -166.0, 737.3) },
+	{ "Links Logic", "LogicStore", "Lincoln", CFrame.new(4598.4, 7.0, -778.4) },
+}
+local SH = { items = {}, all = {}, qty = 1, npcIds = {}, search = "" }
+local shopStatus, fundsRow
+local storeDd, itemDd, itemPrev
+
+local function storeFolder(e)
+	local s = Workspace:FindFirstChild("Stores")
+	return s and s:FindFirstChild(e[2])
+end
+local function npcOf(e)
+	local f = storeFolder(e)
+	return f and f:FindFirstChild(e[3])
+end
+local function counterPart(e)
+	local f = storeFolder(e)
+	local c = f and f:FindFirstChild("Counter")
+	if not c then return nil end
+	if c:IsA("BasePart") then return c end
+	return c.PrimaryPart or c:FindFirstChildWhichIsA("BasePart", true)
+end
+local function dialogRemotes()
+	local d = ReplicatedStorage:FindFirstChild("NPCDialog")
+	return d and d:FindFirstChild("PromptChat"), d and d:FindFirstChild("PlayerChatted")
+end
+local function fetchFunds()
+	local r = ReplicatedStorage:FindFirstChild("GetFunds", true)
+	if not (r and r:IsA("RemoteFunction")) then return nil end
+	local ok, v = pcall(function() return r:InvokeServer() end)
+	if ok and type(v) == "number" then return v end
+	return nil
+end
+local function fetchNpcId(name, npc)
+	local prompt = dialogRemotes()
+	if not prompt then return nil end
+	if not npc:FindFirstChild("Dialog") then Instance.new("Dialog", npc) end
+	local data
+	local c = prompt.OnClientEvent:Connect(function(active, chat)
+		if active and chat and chat.Character == npc then data = chat end
+	end)
+	pcall(function() prompt:FireServer(true, npc, npc.Dialog) end)
+	local t = os.clock()
+	repeat task.wait(0.05) until data or os.clock() - t > 5
+	c:Disconnect()
+	pcall(function() prompt:FireServer(false, npc, npc.Dialog) end)
+	task.wait(0.2)
+	if data and data.ID then SH.npcIds[name] = data.ID return data.ID end
+	return nil
+end
+local function safeInvoke(chatted, arg, action)
+	local done = false
+	task.spawn(function()
+		pcall(function() chatted:InvokeServer(arg, action) end)
+		done = true
+	end)
+	local t = os.clock()
+	while not done and os.clock() - t < 4 do task.wait(0.03) end
+	return done
+end
+local function inMine(inst)
+	local pm = Workspace:FindFirstChild("PlayerModels")
+	if pm and inst:IsDescendantOf(pm) then return true end
+	local bp = LocalPlayer:FindFirstChildOfClass("Backpack")
+	if bp and inst:IsDescendantOf(bp) then return true end
+	local ch = getChar()
+	return ch ~= nil and inst:IsDescendantOf(ch)
+end
+local function itemState(main)
+	if not main.Parent then
+		task.wait(0.12)
+		if not main.Parent then return "gone" end
+	end
+	return inMine(main) and "success" or "pending"
+end
+-- boxes ("Box" models with BoxItemName + Main) live in Workspace.Stores.ShopItems folders; match a folder to a store by distance to its counter
+local function shopItemsFor(e)
+	local stores = Workspace:FindFirstChild("Stores")
+	local cp = counterPart(e)
+	if not (stores and cp) then return nil end
+	local best, bestD
+	for _, ch in ipairs(stores:GetChildren()) do
+		if ch.Name == "ShopItems" then
+			local sample = ch:FindFirstChildWhichIsA("BasePart", true)
+			if sample then
+				local d = (sample.Position - cp.Position).Magnitude
+				if not bestD or d < bestD then best, bestD = ch, d end
+			end
+		end
+	end
+	return best
+end
+local function scanAllItems()
+	SH.all = {}
+	local info = ReplicatedStorage:FindFirstChild("ClientItemInfo")
+	for si, e in ipairs(STORES) do
+		local cont = shopItemsFor(e)
+		local seen = {}
+		if cont then
+			for _, box in ipairs(cont:GetChildren()) do
+				local nv = box.Name == "Box" and box:FindFirstChild("BoxItemName")
+				if nv and nv:IsA("StringValue") and not seen[nv.Value] then
+					seen[nv.Value] = true
+					local f = info and info:FindFirstChild(nv.Value)
+					local n = f and f:FindFirstChild("ItemName")
+					local p = f and f:FindFirstChild("Price")
+					local im = f and f:FindFirstChild("ItemImage")
+					table.insert(SH.all, {
+						key = nv.Value, name = n and tostring(n.Value) or nv.Value,
+						price = p and tonumber((tostring(p.Value):gsub("[^%d]", ""))) or nil,
+						image = im and im.Value or nil, store = si,
+					})
+				end
+			end
+		end
+	end
+	table.sort(SH.all, function(a, b) return a.name < b.name end)
+end
+local function showItemPreview(i)
+	local it = SH.items[i]
+	if not it then itemPrev.Clear("No item selected") return end
+	local cap = it.name .. (it.price and ("  -  $" .. commas(it.price)) or "") .. "  -  " .. STORES[it.store][1]
+	local img = it.image and tostring(it.image) or ""
+	if img ~= "" then
+		if tonumber(img) then img = "rbxassetid://" .. img end
+		itemPrev.Image(img, cap)
+		return
+	end
+	local cont = shopItemsFor(STORES[it.store])
+	if cont then
+		for _, b in ipairs(cont:GetChildren()) do
+			local nv = b.Name == "Box" and b:FindFirstChild("BoxItemName")
+			if nv and nv.Value == it.key then itemPrev.Model(b, cap) return end
+		end
+	end
+	itemPrev.Clear(cap)
+end
+local function refreshItems(rescan)
+	if rescan or #SH.all == 0 then scanAllItems() end
+	local only = storeDd.Get() - 1 -- 0 = all stores
+	local q = SH.search
+	SH.items = {}
+	local names, total = {}, 0
+	for _, it in ipairs(SH.all) do
+		if (only == 0 or it.store == only) and (q == "" or it.name:lower():find(q, 1, true)) then
+			total = total + 1
+			if #SH.items < 40 then
+				it.label = it.name .. (it.price and (" ($" .. commas(it.price) .. ")") or "") .. (only == 0 and ("  [" .. STORES[it.store][1] .. "]") or "")
+				table.insert(SH.items, it)
+				names[#names + 1] = it.label
+			end
+		end
+	end
+	if #names == 0 then names = { "No items found" } end
+	itemDd.SetOptions(names)
+	if shopStatus then
+		shopStatus.Text = total .. " match(es)" .. (total > #SH.items and (" - showing the first " .. #SH.items .. ", refine your search") or "")
+	end
+	showItemPreview(1)
+end
+-- flow (same order the Dynxe script uses): item onto the counter first, THEN stand at the cashier and get the ID, then confirm,
+-- then bring the item back to dropCF. The cashier ID can only be fetched while you are standing near the cashier.
+local function buyBox(e, box, alive, dropCF)
+	local main = box:FindFirstChild("Main")
+	local npc = npcOf(e)
+	local _, chatted = dialogRemotes()
+	local cp = counterPart(e)
+	if not (main and npc and chatted and cp) then notify("Store parts not found", T.Bad) return false end
+	-- 1. go to the item, take ownership, put it on the counter
+	local r = getRoot()
+	if r then r.CFrame = CFrame.new(main.Position + Vector3.new(0, 4, 0)) task.wait(0.15) end
+	claimDrag(box, 2)
+	if main.Parent then
+		local up = cp.CFrame.UpVector
+		main.CFrame = CFrame.new(cp.Position + up * (cp.Size.Y / 2 + main.Size.Y / 2 + 0.05))
+		main.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+		main.AssemblyAngularVelocity = Vector3.new(0, 0, 0)
+	end
+	task.wait(0.1)
+	-- 2. stand at the cashier, then get the dialog ID
+	r = getRoot()
+	if r then r.CFrame = e[4] task.wait(0.4) end
+	if not npc:FindFirstChild("Dialog") then Instance.new("Dialog", npc) end
+	local id = SH.npcIds[e[3]] or fetchNpcId(e[3], npc)
+	if not id then notify("Could not get the cashier's ID - try again", T.Bad) return false end
+	local arg = { ID = id, Character = npc, Name = e[3], Dialog = npc.Dialog }
+	-- 3. confirm until the item belongs to you
+	local deadline = os.clock() + 30
+	local bought = false
+	while alive() and os.clock() < deadline do
+		local st = itemState(main)
+		if st == "success" then bought = true break end
+		if st == "gone" then break end
+		if not safeInvoke(chatted, arg, "Initiate") then
+			-- cashier did not answer: clear the dialog and fetch a fresh ID
+			task.wait(0.6)
+			for _ = 1, 3 do safeInvoke(chatted, arg, "EndChat") task.wait(0.3) end
+			SH.npcIds[e[3]] = nil
+			local nid = fetchNpcId(e[3], npc)
+			if nid then arg.ID = nid end
+		else
+			local inner = os.clock() + 3
+			while alive() and os.clock() < inner do
+				st = itemState(main)
+				if st ~= "pending" then break end
+				if not safeInvoke(chatted, arg, "ConfirmPurchase") then break end
+				task.wait(0.1)
+			end
+			st = itemState(main)
+			if st == "success" then bought = true end
+			safeInvoke(chatted, arg, "EndChat")
+			if bought or st == "gone" then break end
+			task.wait(0.2)
+		end
+	end
+	safeInvoke(chatted, arg, "EndChat")
+	-- 4. bring the item back to where you started
+	if bought and dropCF and main.Parent then
+		claimDrag(main:FindFirstAncestorOfClass("Model") or box, 1)
+		if main.Parent then
+			main.CFrame = dropCF
+			main.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+		end
+	end
+	return bought
+end
+
+local Sb = Section(ShopTab, "Store Shopping", "Search every store, preview the item, then buy it", "premium")
+local storeNames = { "All Stores" }
+for i, e in ipairs(STORES) do storeNames[i + 1] = e[1] end
+local shopBox = Input(Sb, "Search Items", "type a name", "Search", function(text) SH.search = text:lower() refreshItems(false) end)
+bind(shopBox:GetPropertyChangedSignal("Text"), function() SH.search = shopBox.Text:lower() refreshItems(false) end)
+storeDd = Dropdown(Sb, "Store", storeNames, 1, function() refreshItems(false) end)
+itemDd = Dropdown(Sb, "Item", { "Press Rescan Stores" }, 1, function(i) showItemPreview(i) end)
+itemPrev = makePreview(Sb, 160, "Item preview")
+Button(Sb, "Rescan Stores", "Scan", function() refreshItems(true) end, nil, "Reads every store's shelves again")
+Slider(Sb, "Quantity", 1, 10, 1, function(v) SH.qty = v end)
+Button(Sb, "Purchase", "Buy", function()
+	local it = SH.items[itemDd.Get()]
+	if not it then notify("Search or rescan first", T.Warn) return end
+	local e = STORES[it.store]
+	runJob("Buying " .. it.label, function(alive)
+		local r0 = getRoot()
+		local home = r0 and r0.CFrame
+		local bought = 0
+		local ok, err = pcall(function()
+			for i = 1, SH.qty do
+				if not alive() then break end
+				local cont = shopItemsFor(e)
+				local box
+				if cont then
+					for _, b in ipairs(cont:GetChildren()) do
+						local nv = b.Name == "Box" and b:FindFirstChild("BoxItemName")
+						local m = b:FindFirstChild("Main")
+						if nv and nv.Value == it.key and m and not m.Anchored then box = b break end
+					end
+				end
+				if not box then notify("Ran out of that item", T.Warn) break end
+				setStatus("Buying " .. i .. " / " .. SH.qty)
+				local drop = home and home * CFrame.new(((i - 1) % 5) * 4, -1, -4 - math.floor((i - 1) / 5) * 4)
+				if buyBox(e, box, alive, drop) then bought = bought + 1 end
+			end
+		end)
+		if not ok then notify("Shop error: " .. tostring(err):sub(1, 70), T.Bad) end
+		-- always go back to where you started, even if something failed or you pressed Stop
+		task.wait(0.2)
+		local rr = getRoot()
+		if rr and home then rr.CFrame = home rr.AssemblyLinearVelocity = Vector3.new(0, 0, 0) end
+		notify("Bought " .. bought .. " / " .. SH.qty, bought > 0 and T.Good or T.Warn)
+		local f = fetchFunds()
+		if f and fundsRow then fundsRow.Text = "Funds: $" .. commas(f) end
+	end)
+end, nil, "Teleports to the store, buys, then returns you")
+Button(Sb, "Stop", "Stop", function() stopAll() notify("Stopped", T.Sub) end)
+shopStatus = InfoRow(Sb, "Scanning stores...")
+fundsRow = InfoRow(Sb, "Funds: -")
+Button(Sb, "Check Funds", "Check", function()
+	async(function()
+		local f = fetchFunds()
+		fundsRow.Text = f and ("Funds: $" .. commas(f)) or "Funds: could not read"
+	end)
+end)
+
+task.delay(2, function() if Live.Running then pcall(refreshItems, true) end end)
+
+local Sp = Section(ShopTab, "Special", "One-off purchases", "premium")
+Button(Sp, "Power of Ease ($10,009,000)", "Buy", function()
+	runJob("Buying Power of Ease", function(alive)
+		local funds = fetchFunds()
+		if not funds then notify("Could not read your funds", T.Bad) return end
+		if funds < 10009000 then notify("Not enough money", T.Warn) return end
+		local r = getRoot()
+		if not r then return end
+		local home = r.CFrame
+		for _, e in ipairs(STORES) do
+			local n = npcOf(e)
+			if n and not SH.npcIds[e[3]] then fetchNpcId(e[3], n) task.wait(0.15) end
+		end
+		r.CFrame = CFrame.new(1059.4, 17.2, 1130.3)
+		task.wait(0.15)
+		local best, bestD
+		for _, e in ipairs(STORES) do
+			local cp = counterPart(e)
+			if cp and npcOf(e) then
+				local d = (cp.Position - r.Position).Magnitude
+				if not bestD or d < bestD then best, bestD = e, d end
+			end
+		end
+		local _, chatted = dialogRemotes()
+		local id = best and SH.npcIds[best[3]]
+		if not (best and chatted and id) then notify("No cashier found", T.Bad) r.CFrame = home return end
+		local npc = npcOf(best)
+		local arg = { ID = id, Character = npc, Name = best[3], Dialog = npc:FindFirstChild("Dialog") }
+		local deadline = os.clock() + 60
+		while alive() and os.clock() < deadline do
+			safeInvoke(chatted, arg, "Initiate")
+			safeInvoke(chatted, arg, "ConfirmPurchase")
+			safeInvoke(chatted, arg, "EndChat")
+			local f = fetchFunds()
+			if f and f < funds then notify("Power of Ease purchased", T.Good) break end
+			task.wait(0.2)
+		end
+		local rr = getRoot()
+		if rr then rr.CFrame = home end
+	end)
+end, nil, "Teleports to Strange Man's spot and spams the purchase until your money drops")
+end
+
+-- ---------------------------------------------------- TOOLS: object selection + sorting
+do
+local SEL = { list = {}, hl = {}, click = nil, same = false, keep = true, back = false, timeout = 3, X = 4, Y = 1, Z = 4, pad = 2 }
+local function setSel(model, on)
+	if on and not SEL.list[model] then
+		SEL.list[model] = true
+		SEL.hl[model] = new("Highlight", { Adornee = model, FillColor = T.Accent, FillTransparency = 0.5, OutlineColor = Color3.new(1, 1, 1) }, EspGui)
+	elseif not on and SEL.list[model] then
+		SEL.list[model] = nil
+		if SEL.hl[model] then SEL.hl[model]:Destroy() SEL.hl[model] = nil end
+	end
+end
+local function clearSel()
+	for m in pairs(SEL.list) do setSel(m, false) end
+end
+local function selList()
+	local out = {}
+	for m in pairs(SEL.list) do
+		if m.Parent then table.insert(out, m) else setSel(m, false) end
+	end
+	return out
+end
+local selRow
+local function updSel() if selRow then selRow.Text = "Selected: " .. #selList() .. " object(s)" end end
+local function moveModel(model, goal)
+	local part = mainPartOf(model)
+	if not (part and part.Parent) then return false end
+	local r = getRoot()
+	if r then
+		local flat = (r.Position - part.Position) * Vector3.new(1, 0, 1)
+		if flat.Magnitude > 10 then r.CFrame = CFrame.new(part.Position + Vector3.new(0, 3, 0)) task.wait(0.05) end
+	end
+	claimDrag(model, SEL.timeout)
+	if part.Parent then part.CFrame = goal end
+	task.wait(0.05)
+	return true
+end
+local function sendSelection(centerCF, grid, alive)
+	local list = selList()
+	if #list == 0 then notify("Nothing selected", T.Warn) return end
+	local r = getRoot()
+	local home = r and r.CFrame
+	local cell, cellY = 4, 2
+	if grid then
+		for _, m in ipairs(list) do
+			local ok, sz = pcall(function() return m:GetExtentsSize() end)
+			if ok then cell = math.max(cell, sz.X, sz.Z) cellY = math.max(cellY, sz.Y) end
+		end
+		cell, cellY = cell + SEL.pad, cellY + SEL.pad * 0.5
+	end
+	for i, m in ipairs(list) do
+		if not alive() then break end
+		local k = i - 1
+		local col, row, layer
+		if grid then
+			col, row, layer = k % SEL.X, math.floor(k / SEL.X) % SEL.Z, math.floor(k / (SEL.X * SEL.Z))
+		else
+			col, row, layer = k % 5, math.floor(k / 5), 0
+		end
+		local step = grid and cell or 5
+		local goal = centerCF * CFrame.new(col * step, 1 + layer * (grid and cellY or 3), -row * step)
+		moveModel(m, goal)
+	end
+	if SEL.back and home then local rr = getRoot() if rr then rr.CFrame = home end end
+	if not SEL.keep then clearSel() end
+	updSel()
+end
+local function plotCenter()
+	local plot = myPlot()
+	local o = plot and plot:FindFirstChild("OriginSquare")
+	return o and CFrame.new(o.Position + Vector3.new(0, 3, 0)) or nil
+end
+
+local Sl = Section(ToolsTab, "Selection Tools", "Click things of yours (or anyone's loose items) to select them, then move or sort them", "magnet")
+Toggle(Sl, "Click Selection", false, function(v)
+	if SEL.click then SEL.click:Disconnect() SEL.click = nil end
+	if not v then return end
+	SEL.click = UIS.InputBegan:Connect(function(i, gp)
+		if gp or i.UserInputType ~= Enum.UserInputType.MouseButton1 or not mouse.Target then return end
+		local pm, lmf = Workspace:FindFirstChild("PlayerModels"), Workspace:FindFirstChild("LogModels")
+		local model = topModel(mouse.Target, pm, lmf)
+		if not (model and model:IsA("Model")) then return end
+		local on = not SEL.list[model]
+		if SEL.same then
+			for _, m in ipairs(model.Parent:GetChildren()) do
+				if m:IsA("Model") and m.Name == model.Name and ownedByMe(m) then setSel(m, on) end
+			end
+		else
+			setSel(model, on)
+		end
+		updSel()
+	end)
+end, nil, nil, "Left click an object to add / remove it")
+Toggle(Sl, "Group Selection (same name, yours)", false, function(v) SEL.same = v end, nil, nil, "Clicking selects every object of that name you own")
+Button(Sl, "Select All My Logs", "Select", function()
+	for _, m in ipairs(myLogs()) do setSel(m, true) end
+	updSel()
+end)
+Button(Sl, "Clear Selection", "Clear", function() clearSel() updSel() end)
+selRow = InfoRow(Sl, "Selected: 0 object(s)")
+Button(Sl, "Teleport Selection To Me", "Bring", function()
+	local r = getRoot()
+	if not r then return end
+	local cf = r.CFrame
+	runJob("Moving selection", function(alive) sendSelection(CFrame.new(cf.Position) * CFrame.new(0, 0, -6), false, alive) end)
+end)
+Button(Sl, "Teleport Selection To My Plot", "Send", function()
+	local c = plotCenter()
+	if not c then notify("You don't own a plot yet", T.Warn) return end
+	runJob("Moving selection to plot", function(alive) sendSelection(c, false, alive) end)
+end)
+Button(Sl, "Sort Selection Into A Grid (in front of me)", "Sort", function()
+	local r = getRoot()
+	if not r then return end
+	local look = r.CFrame.LookVector * Vector3.new(1, 0, 1)
+	local base = CFrame.lookAt(r.Position + look.Unit * 8, r.Position + look.Unit * 20)
+	runJob("Sorting selection", function(alive) sendSelection(base * CFrame.new(0, 0, 0), true, alive) end)
+end, nil, "Uses the grid sliders below")
+Button(Sl, "Stop", "Stop", function() stopAll() notify("Stopped", T.Sub) end)
+local SlOpt = Collapse(Sl, "Selection Settings")
+Slider(SlOpt, "Grid Columns (X)", 1, 20, 4, function(v) SEL.X = v end)
+Slider(SlOpt, "Grid Layers (Y)", 1, 10, 1, function(v) SEL.Y = v end)
+Slider(SlOpt, "Grid Rows (Z)", 1, 20, 4, function(v) SEL.Z = v end)
+Slider(SlOpt, "Padding (studs)", 0, 10, 2, function(v) SEL.pad = v end)
+Slider(SlOpt, "Ownership Timeout (s)", 1, 10, 3, function(v) SEL.timeout = v end)
+Toggle(SlOpt, "Keep Selection After Moving", true, function(v) SEL.keep = v end)
+Toggle(SlOpt, "Return To Origin After Moving", false, function(v) SEL.back = v end)
+addCleanup(function() if SEL.click then SEL.click:Disconnect() end clearSel() end)
+end
+
+-- ---------------------------------------------------- VEHICLE
+do
+local VEH = { cfg = nil, veh = nil, defaults = nil, orig = {}, custom = {}, resetOnExit = true, pad = nil, roll = false, color = 1032 }
+local VCOLORS = {
+	{ "Orange-Brown", 345 }, { "Black", 1003 }, { "Muted Red", 154 }, { "Cool Gray", 131 }, { "Chocolate Brown", 25 },
+	{ "Slate Gray", 148 }, { "Dusty Rose", 153 }, { "Earthy Gray", 27 }, { "Pale Mint", 151 }, { "Olive", 200 },
+	{ "Sage Green", 210 }, { "Beige", 5 }, { "Olive-Brown", 108 }, { "Hot Pink", 1032 },
+}
+local vehRow
+local function findVehConfig()
+	local h = getHum()
+	local seat = h and h.SeatPart
+	if not seat then return nil, nil end
+	local v = seat
+	while v.Parent and v.Parent ~= Workspace and v.Parent.Name ~= "PlayerModels" do v = v.Parent end
+	if v and v:IsA("Model") then
+		local c = v:FindFirstChild("Configuration", true)
+		if c and c:FindFirstChild("MaxSpeed") then return c, v end
+	end
+	return nil, nil
+end
+local function readVeh(cfg)
+	local out = {}
+	for _, n in ipairs({ "MaxSpeed", "SteerAngle", "SteerVelocity" }) do
+		local s = cfg:FindFirstChild(n)
+		out[n] = s and s:IsA("ValueBase") and s.Value or nil
+	end
+	return out
+end
+local function writeVeh(cfg, vals)
+	if not (cfg and vals) then return end
+	for n, v in pairs(vals) do
+		local s = cfg:FindFirstChild(n)
+		if s and s:IsA("ValueBase") then s.Value = v end
+	end
+end
+local function applyVeh(name, value)
+	VEH.custom[name] = value
+	if VEH.cfg then
+		local s = VEH.cfg:FindFirstChild(name)
+		if s and s:IsA("ValueBase") then s.Value = value end
+	else
+		notify("Sit in a vehicle first", T.Warn)
+	end
+end
+local function padFire()
+	local i = ReplicatedStorage:FindFirstChild("Interaction")
+	local rp = i and i:FindFirstChild("RemoteProxy")
+	if VEH.pad and rp then rp:FireServer(VEH.pad) end
+end
+
+local Vh = Section(VehicleTab, "Vehicle Modifications", "Works while you are sitting in a vehicle", "speed")
+local vSpeed = Slider(Vh, "Max Speed (x0.1)", 1, 100, 1, function(v) applyVeh("MaxSpeed", v / 10) end)
+local vAngle = Slider(Vh, "Steer Angle (x0.1)", 1, 20, 1, function(v) applyVeh("SteerAngle", v / 10) end)
+local vVel = Slider(Vh, "Steer Velocity (x0.01)", 1, 5, 1, function(v) applyVeh("SteerVelocity", v / 100) end)
+Button(Vh, "Flip Vehicle", "Flip", function()
+	local h = getHum()
+	local seat = h and h.SeatPart
+	if not seat then notify("Sit in a vehicle first", T.Warn) return end
+	local veh = seat.Parent
+	local p = veh:IsA("Model") and (veh.PrimaryPart or seat) or seat
+	p.CFrame = p.CFrame * CFrame.Angles(0, 0, math.pi) + Vector3.new(0, 2, 0)
+end)
+Button(Vh, "Reset Vehicle Modifications", "Reset", function()
+	if VEH.cfg and VEH.defaults then
+		writeVeh(VEH.cfg, VEH.defaults)
+		VEH.custom = {}
+		if VEH.defaults.MaxSpeed then vSpeed.SetSilent(math.clamp(VEH.defaults.MaxSpeed * 10, 1, 100)) end
+		if VEH.defaults.SteerAngle then vAngle.SetSilent(math.clamp(VEH.defaults.SteerAngle * 10, 1, 20)) end
+		if VEH.defaults.SteerVelocity then vVel.SetSilent(math.clamp(VEH.defaults.SteerVelocity * 100, 1, 5)) end
+	else
+		notify("Sit in a vehicle first", T.Warn)
+	end
+end)
+Toggle(Vh, "Reset Modifications On Exit", true, function(v) VEH.resetOnExit = v end)
+vehRow = InfoRow(Vh, "Vehicle: none")
+
+local Vp = Section(VehicleTab, "Vehicle Pad Spawner", "Re-spawn a vehicle from a pad until it rolls the colour you want", "speed")
+local vcNames = {}
+for i, c in ipairs(VCOLORS) do vcNames[i] = c[1] end
+Dropdown(Vp, "Target Color", vcNames, 14, function(i) VEH.color = VCOLORS[i][2] end)
+local padRow = InfoRow(Vp, "Pad: none selected")
+Button(Vp, "Select Vehicle Pad", "Select", function()
+	padRow.Text = "Click the pad..."
+	local conn
+	conn = UIS.InputBegan:Connect(function(i)
+		if i.UserInputType ~= Enum.UserInputType.MouseButton1 then return end
+		conn:Disconnect()
+		local cur = mouse.Target
+		for _ = 1, 10 do
+			if not cur then break end
+			local ev = cur:FindFirstChild("ButtonRemote_SpawnButton")
+			if ev then
+				VEH.pad = ev
+				padRow.Text = "Pad: " .. cur.Name
+				return
+			end
+			cur = cur.Parent
+		end
+		padRow.Text = "Pad not found - try again"
+	end)
+end)
+Button(Vp, "Respawn Vehicle", "Respawn", function()
+	if not VEH.pad then notify("Select a pad first", T.Warn) return end
+	padFire()
+end)
+local function spawnAndGetColor()
+	local watch = Workspace:FindFirstChild("PlayerModels") or Workspace
+	local existing = {}
+	for _, m in ipairs(watch:GetChildren()) do existing[m] = true end
+	local done, result = false, nil
+	local conn = watch.ChildAdded:Connect(function(model)
+		if done or existing[model] or not model:IsA("Model") then return end
+		local st = model:WaitForChild("Settings", 0.5)
+		local cv = st and st:WaitForChild("Color", 0.5)
+		if not cv then return end
+		local dl = os.clock() + 0.4
+		while cv.Value == 0 and os.clock() < dl do task.wait(0.02) end
+		if cv.Value ~= 0 and not done then done = true result = cv.Value end
+	end)
+	padFire()
+	local dl = os.clock() + 0.5
+	while not done and os.clock() < dl and VEH.roll do task.wait(0.02) end
+	conn:Disconnect()
+	return result
+end
+local rollToggle
+rollToggle = Toggle(Vp, "Auto-Roll Color", false, function(v)
+	if v and not VEH.pad then notify("Select a pad first", T.Warn) rollToggle.Set(false) return end
+	VEH.roll = v
+	if not v then return end
+	async(function()
+		while VEH.roll and Live.Running do
+			local col = spawnAndGetColor()
+			if col == VEH.color then
+				VEH.roll = false
+				rollToggle.Set(false)
+				notify("Found the target colour!", T.Good)
+			end
+		end
+	end)
+end, nil, nil, "Keeps respawning until the colour matches")
+addCleanup(function() VEH.roll = false end)
+
+task.spawn(function()
+	local lastSeat
+	while Live.Running do
+		task.wait(0.5)
+		local h = getHum()
+		local seat = h and h.SeatPart
+		if seat ~= lastSeat then
+			lastSeat = seat
+			if seat then
+				VEH.cfg, VEH.veh = nil, nil
+				for _ = 1, 6 do
+					local c, v = findVehConfig()
+					if c then VEH.cfg, VEH.veh = c, v break end
+					task.wait(0.5)
+				end
+				if VEH.cfg then
+					if not VEH.orig[VEH.veh] then VEH.orig[VEH.veh] = readVeh(VEH.cfg) end
+					VEH.defaults = readVeh(VEH.cfg)
+					vehRow.Text = "Vehicle: " .. VEH.veh.Name
+					if VEH.defaults.MaxSpeed then vSpeed.SetSilent(math.clamp(VEH.defaults.MaxSpeed * 10, 1, 100)) end
+					if VEH.defaults.SteerAngle then vAngle.SetSilent(math.clamp(VEH.defaults.SteerAngle * 10, 1, 20)) end
+					if VEH.defaults.SteerVelocity then vVel.SetSilent(math.clamp(VEH.defaults.SteerVelocity * 100, 1, 5)) end
+					for n, v in pairs(VEH.custom) do applyVeh(n, v) end
+				else
+					vehRow.Text = "Vehicle: seated (no config found)"
+				end
+			else
+				if VEH.resetOnExit and VEH.cfg and VEH.veh and VEH.orig[VEH.veh] then writeVeh(VEH.cfg, VEH.orig[VEH.veh]) end
+				VEH.cfg, VEH.veh, VEH.defaults, VEH.custom = nil, nil, nil, {}
+				vehRow.Text = "Vehicle: none"
+			end
+		end
+	end
+end)
+end
+
+-- ---------------------------------------------------- EXTRAS: hard dragger, BTools, water walk, hover info, auto farm, axe tools, logs ESP, hotkeys
+do
+	-- ===== Tools tab: dragging
+	local HD = { P = 120000, D = 1000, conn = nil }
+	local Dg = Section(ToolsTab, "Dragging", "Make the game's own drag tool stronger", "magnet")
+	local hdToggle = Toggle(Dg, "Hard Dragger", false, function(v)
+		if HD.conn then HD.conn:Disconnect() HD.conn = nil end
+		if not v then return end
+		HD.conn = RunService.Stepped:Connect(function()
+			local d = Workspace:FindFirstChild("Dragger")
+			if not d then return end
+			local bp = d:FindFirstChild("BodyPosition")
+			local bg = d:FindFirstChild("BodyGyro")
+			if bp then
+				bp.P = HD.P
+				bp.D = HD.D
+				bp.MaxForce = Vector3.new(1, 1, 1) * math.huge
+			end
+			if bg then
+				bg.MaxTorque = Vector3.new(1, 1, 1) * math.huge
+				bg.P = 1200
+				bg.D = 140
+			end
+		end)
+	end, nil, nil, "Dragged objects follow your mouse tightly and ignore their weight")
+	Slider(Dg, "Drag Strength (x1000)", 10, 500, 120, function(v) HD.P = v * 1000 end)
+	Slider(Dg, "Drag Damping", 100, 3000, 1000, function(v) HD.D = v end)
+	addCleanup(function() if HD.conn then HD.conn:Disconnect() end end)
+
+	-- ===== Tools tab: BTools (client side only - deleted things come back when you rejoin)
+	local BT = { stack = {}, tools = nil, conns = {}, restore = true }
+	local Bt = Section(ToolsTab, "BTools", "Delete tool + Undo tool. Local only - only hides things on your screen", "magnet")
+	local btRow = InfoRow(Bt, "Deleted: 0")
+	local function wholeObject(part)
+		local node = part
+		while node.Parent and node.Parent ~= Workspace and node.Parent:IsA("Model") do node = node.Parent end
+		return node
+	end
+	local function restoreAll()
+		for i = #BT.stack, 1, -1 do
+			local e = BT.stack[i]
+			if e.inst then
+				e.inst.Parent = e.parent
+				if e.cf and e.inst:IsA("BasePart") then e.inst.CFrame = e.cf end
+			end
+			BT.stack[i] = nil
+		end
+		btRow.Text = "Deleted: 0"
+	end
+	local function btoolsOff()
+		for _, c in ipairs(BT.conns) do c:Disconnect() end
+		BT.conns = {}
+		if BT.tools then
+			for _, t in ipairs(BT.tools) do t:Destroy() end
+			BT.tools = nil
+		end
+	end
+	local btToggle = Toggle(Bt, "BTools", false, function(v)
+		btoolsOff()
+		if not v then
+			if BT.restore then restoreAll() end
+			return
+		end
+		local bp = LocalPlayer:FindFirstChildOfClass("Backpack")
+		if not bp then notify("No backpack found", T.Warn) return end
+		local del = Instance.new("Tool")
+		del.Name, del.ToolTip, del.RequiresHandle, del.CanBeDropped = "Delete", "Click an object to hide it (hold Left Alt for the whole object)", false, false
+		del.Parent = bp
+		local undo = Instance.new("Tool")
+		undo.Name, undo.ToolTip, undo.RequiresHandle, undo.CanBeDropped = "Undo", "Click to bring back the last deleted object", false, false
+		undo.Parent = bp
+		BT.tools = { del, undo }
+		table.insert(BT.conns, del.Activated:Connect(function()
+			local t = mouse.Target
+			if not t or t == Workspace.Terrain or not t:IsA("BasePart") then return end
+			local ch = getChar()
+			if ch and t:IsDescendantOf(ch) then return end
+			if t.Parent == Workspace then return end
+			local victim = UIS:IsKeyDown(Enum.KeyCode.LeftAlt) and wholeObject(t) or t
+			table.insert(BT.stack, { inst = victim, parent = victim.Parent, cf = victim:IsA("BasePart") and victim.CFrame or nil })
+			victim.Parent = nil
+			btRow.Text = "Deleted: " .. #BT.stack
+		end))
+		table.insert(BT.conns, undo.Activated:Connect(function()
+			local e = table.remove(BT.stack)
+			if not e then notify("Nothing to undo", T.Warn) return end
+			e.inst.Parent = e.parent
+			if e.cf and e.inst:IsA("BasePart") then e.inst.CFrame = e.cf end
+			btRow.Text = "Deleted: " .. #BT.stack
+		end))
+	end, nil, nil, "Adds Delete and Undo tools to your backpack")
+	Toggle(Bt, "Restore Everything When Turned Off", true, function(v) BT.restore = v end)
+	Button(Bt, "Restore All Deleted", "Restore", restoreAll)
+	addCleanup(function() btoolsOff() restoreAll() end)
+
+	-- ===== Tools tab: water walk + hover info
+	local WW = false
+	local Mv2 = Section(ToolsTab, "Movement Extras", "Walk on the lake surface", "player")
+	local wwToggle = Toggle(Mv2, "Water Walk", false, function(v) WW = v end, nil, nil, "Pushes you back up when you sink to the water surface")
+	bind(RunService.Heartbeat, function()
+		if not WW then return end
+		local r = getRoot()
+		if r and r.Position.Y <= 1 and r.Position.Y >= -5 then
+			local v = r.AssemblyLinearVelocity
+			r.AssemblyLinearVelocity = Vector3.new(v.X, 0, v.Z)
+			r.CFrame = r.CFrame + Vector3.new(0, 0.1, 0)
+		end
+	end)
+
+	local hover = { on = false, hl = nil, last = nil, acc = 0 }
+	local Hv = Section(ToolsTab, "Hover Info", "Point at an object to see its name and owner", "info")
+	local hoverRow = InfoRow(Hv, "Hovering: -")
+	Toggle(Hv, "Hover Info", false, function(v)
+		hover.on = v
+		if not v then
+			hoverRow.Text = "Hovering: -"
+			if hover.hl then hover.hl:Destroy() hover.hl = nil end
+			hover.last = nil
+		end
+	end)
+	bind(RunService.Heartbeat, function(dt)
+		if not hover.on then return end
+		hover.acc = hover.acc + dt
+		if hover.acc < 0.1 then return end
+		hover.acc = 0
+		local t = mouse.Target
+		local m = t and topModel(t, Workspace:FindFirstChild("PlayerModels"), Workspace:FindFirstChild("LogModels"))
+		if m == hover.last then return end
+		hover.last = m
+		if hover.hl then hover.hl:Destroy() hover.hl = nil end
+		if not m then hoverRow.Text = "Hovering: -" return end
+		hover.hl = new("Highlight", { Adornee = m, FillColor = T.Accent, FillTransparency = 0.6, OutlineColor = Color3.new(1, 1, 1) }, EspGui)
+		local of = m:FindFirstChild("Owner")
+		local os2 = of and of:FindFirstChild("OwnerString")
+		local owner = os2 and os2.Value
+		if not owner and of and of:IsA("ObjectValue") and of.Value then owner = of.Value.Name end
+		local tc = m:FindFirstChild("TreeClass")
+		hoverRow.Text = "Hovering: " .. m.Name .. (tc and (" (" .. tostring(tc.Value) .. ")") or "") .. "  -  owner: " .. tostring(owner or "unknown")
+	end)
+	addCleanup(function() if hover.hl then hover.hl:Destroy() end end)
+
+	-- ===== Wood tab: full auto farm + axe tools
+	local AF = { every = 1 }
+	local Af = Section(TreeTab, "Full Auto Farm", "Chop the selected type, collect the logs and sell them, on repeat", "autofarm")
+	local afRow = InfoRow(Af, "Auto farm: idle")
+	Button(Af, "Start Full Auto Farm", "Start", function()
+		local c = LT.class
+		if not c then notify("Pick a tree type first (Refresh Tree Types)", T.Warn) return end
+		runJob("Full auto farm: " .. c, function(alive)
+			local n = 0
+			while alive() do
+				local h = getHum()
+				if not h or h.Health <= 0 then waitRespawn(alive) end
+				local tree = pickTree(c, LT.pick)
+				if not tree then notify("No more " .. c .. " trees - stopped", T.Warn) break end
+				chopTree(tree, alive)
+				n = n + 1
+				afRow.Text = "Auto farm: " .. n .. " tree(s) chopped"
+				if alive() and n % AF.every == 0 then
+					setStatus("Selling logs")
+					sellLogs(alive)
+				end
+				task.wait(0.5)
+			end
+			afRow.Text = "Auto farm: idle"
+		end)
+	end, nil, "Chop -> collect -> sell, repeating until you press Stop")
+	Button(Af, "Stop", "Stop", function() stopAll() afRow.Text = "Auto farm: idle" notify("Stopped", T.Sub) end)
+	Slider(Af, "Sell Every N Trees", 1, 10, 1, function(v) AF.every = v end)
+
+	local Ax = Section(TreeTab, "Axe Tools", "Quick axe helpers", "autofarm")
+	Button(Ax, "Equip Best Axe (selected type)", "Equip", function()
+		local tool, name = bestAxe(LT.class or "Generic")
+		local h = getHum()
+		if tool and h then
+			h:EquipTool(tool)
+			notify("Equipped " .. tostring(name), T.Good)
+		else
+			notify("No axe found in your backpack", T.Warn)
+		end
+	end)
+	Button(Ax, "Unequip Tools", "Unequip", function()
+		local h = getHum()
+		if h then h:UnequipTools() end
+	end)
+
+	-- ===== Logs tab: my logs ESP
+	local LE = { on = false, hl = {} }
+	local Le = Section(LogTab, "Log Highlights", "Outline every log you own so you can find them", "esp")
+	Toggle(Le, "My Logs ESP", false, function(v)
+		LE.on = v
+		if not v then
+			for m, h in pairs(LE.hl) do h:Destroy() LE.hl[m] = nil end
+		end
+	end)
+	task.spawn(function()
+		while Live.Running do
+			task.wait(1)
+			if LE.on then
+				pcall(function()
+					local mine = {}
+					for _, m in ipairs(myLogs()) do
+						mine[m] = true
+						if not LE.hl[m] then
+							LE.hl[m] = new("Highlight", { Adornee = m, FillColor = T.Good, FillTransparency = 0.6, OutlineColor = Color3.new(1, 1, 1) }, EspGui)
+						end
+					end
+					for m, h in pairs(LE.hl) do
+						if not mine[m] or not m.Parent then h:Destroy() LE.hl[m] = nil end
+					end
+				end)
+			end
+		end
+	end)
+	addCleanup(function() for _, h in pairs(LE.hl) do h:Destroy() end end)
+
+	-- ===== Tools tab: hotkeys
+	local HK = { drag = Enum.KeyCode.Unknown, bt = Enum.KeyCode.Unknown, ww = Enum.KeyCode.Unknown }
+	local Hk = Section(ToolsTab, "Hotkeys", "Press the key to flip the feature (Backspace clears a key)", "key")
+	Keybind(Hk, "Hard Dragger", Enum.KeyCode.Unknown, function(k) HK.drag = k end, true)
+	Keybind(Hk, "BTools", Enum.KeyCode.Unknown, function(k) HK.bt = k end, true)
+	Keybind(Hk, "Water Walk", Enum.KeyCode.Unknown, function(k) HK.ww = k end, true)
+	bind(UIS.InputBegan, function(i, gp)
+		if gp or Live.BindingActive or i.UserInputType ~= Enum.UserInputType.Keyboard then return end
+		local k = i.KeyCode
+		if k == Enum.KeyCode.Unknown then return end
+		if k == HK.drag then hdToggle.Fire(not hdToggle.Get()) end
+		if k == HK.bt then btToggle.Fire(not btToggle.Get()) end
+		if k == HK.ww then wwToggle.Fire(not wwToggle.Get()) end
+	end)
+end
+
+-- ---------------------------------------------------- WORLD (LT2-specific scenery toggles, local only)
+local WD = { water = {}, boulders = {}, bridge = nil, volcano = true, scanned = false, enhanced = nil, tundraConn = nil }
+local function scanWorld()
+	if WD.scanned then return end
+	WD.scanned = true
+	local wr = Workspace:FindFirstChild("Water")
+	if wr then
+		for i, o in ipairs(wr:GetDescendants()) do
+			if i % 500 == 0 then task.wait() end
+			if o:IsA("BasePart") and o.Name == "Water" then table.insert(WD.water, { p = o, t = o.Transparency }) end
+		end
+	end
+	local snow = Workspace:FindFirstChild("Region_Snow")
+	local sp = snow and snow:FindFirstChild("PartSpawner")
+	if sp then
+		for i, o in ipairs(sp:GetDescendants()) do
+			if i % 500 == 0 then task.wait() end
+			if o:IsA("BasePart") and (o.Name == "Boulder" or o.Name == "SmallBoulder") and not (o:FindFirstChild("LavaLight") or o:FindFirstChild("Fire")) then
+				table.insert(WD.boulders, { p = o, t = o.Transparency })
+			end
+		end
+	end
+end
+local function sweepVolcano()
+	local r = Workspace:FindFirstChild("Region_Volcano")
+	local sp = r and r:FindFirstChild("PartSpawner")
+	if not sp then return end
+	for _, o in ipairs(sp:GetDescendants()) do
+		if o.Name == "VolcanoBoulder" then pcall(function() o:Destroy() end) end
+	end
+end
+local Wd = Section(WorldTab, "Scenery", "Local-only changes to the LT2 map", "night")
+Toggle(Wd, "Water Visible", true, function(v)
+	async(function()
+		scanWorld()
+		for _, d in ipairs(WD.water) do
+			if d.p.Parent then d.p.Transparency = v and d.t or 1 d.p.CanCollide = false d.p.CanTouch = v end
+		end
+	end)
+end, nil, nil, "Off = invisible and no swimming")
+Toggle(Wd, "Lower Bridge", false, function(v)
+	local bridge = Workspace:FindFirstChild("Bridge")
+	if v then
+		if bridge and not WD.bridge then WD.bridge = bridge:Clone() end
+		local vlb = bridge and bridge:FindFirstChild("VerticalLiftBridge")
+		local lift = vlb and vlb:FindFirstChild("Lift")
+		if lift then
+			for _, c in ipairs(lift:GetChildren()) do
+				if c:IsA("BasePart") and c.Name == "Base" then c.CFrame = CFrame.new(c.Position.X, 6.5, c.Position.Z) * c.CFrame.Rotation end
+			end
+		end
+		if vlb then
+			local kill = { BRope = true, Structure = true, Weight = true, WRope = true }
+			for _, c in ipairs(vlb:GetChildren()) do if kill[c.Name] then c:Destroy() end end
+		end
+	elseif WD.bridge then
+		if bridge then bridge:Destroy() end
+		WD.bridge:Clone().Parent = Workspace
+	end
+end, nil, nil, "Lowers the lift bridge on your screen so you can walk across")
+Toggle(Wd, "Tundra Boulders", true, function(v)
+	async(function()
+		scanWorld()
+		for _, d in ipairs(WD.boulders) do
+			if d.p.Parent then d.p.Transparency = v and d.t or 1 d.p.CanCollide = v end
+		end
+	end)
+end)
+Toggle(Wd, "Volcano Boulders", true, function(v) WD.volcano = v if not v then sweepVolcano() end end, nil, nil, "Off = keeps deleting them locally")
+task.spawn(function()
+	while Live.Running do
+		if not WD.volcano then pcall(sweepVolcano) end
+		task.wait(0.3)
+	end
+end)
+Toggle(Wd, "Spook Event", false, function(v)
+	local s = Lighting:FindFirstChild("Spook")
+	if s then s.Value = v else notify("Spook value not found in Lighting", T.Warn) end
+end)
+local origLight
+Toggle(Wd, "Enhanced Visuals", false, function(v)
+	if v then
+		origLight = origLight or { Brightness = Lighting.Brightness, Exposure = Lighting.ExposureCompensation }
+		Lighting.Brightness = 3
+		Lighting.ExposureCompensation = 0.5
+		local b = Lighting:FindFirstChild("EnhancedBloom") or new("BloomEffect", { Name = "EnhancedBloom" }, Lighting)
+		b.Intensity, b.Size, b.Threshold, b.Enabled = 1, 24, 2, true
+		local c = Lighting:FindFirstChild("EnhancedCC") or new("ColorCorrectionEffect", { Name = "EnhancedCC" }, Lighting)
+		c.Contrast, c.Saturation, c.TintColor, c.Enabled = 0.1, 0.15, Color3.fromRGB(255, 253, 245), true
+		local r = Lighting:FindFirstChild("EnhancedRays") or new("SunRaysEffect", { Name = "EnhancedRays" }, Lighting)
+		r.Intensity, r.Spread, r.Enabled = 0.1, 1, true
+	else
+		if origLight then Lighting.Brightness = origLight.Brightness Lighting.ExposureCompensation = origLight.Exposure end
+		for _, n in ipairs({ "EnhancedBloom", "EnhancedCC", "EnhancedRays" }) do
+			local e = Lighting:FindFirstChild(n)
+			if e then e.Enabled = false end
+		end
+	end
+end, nil, nil, "Bloom, colour correction and sun rays")
+addCleanup(function()
+	if origLight then Lighting.Brightness = origLight.Brightness Lighting.ExposureCompensation = origLight.Exposure end
+	for _, n in ipairs({ "EnhancedBloom", "EnhancedCC", "EnhancedRays" }) do
+		local e = Lighting:FindFirstChild(n)
+		if e then e:Destroy() end
+	end
+end)
+
+-- ---------------------------------------------------- PROTECTION: axe recovery
+local AR = { on = false, conn = nil, diedConn = nil, deathPos = nil, radius = 50, maxAxes = 9, timeout = 3 }
+local function heldToolCount()
+	local n = 0
+	for _, c in ipairs({ LocalPlayer:FindFirstChildOfClass("Backpack"), getChar(), Workspace:FindFirstChild(LocalPlayer.Name) }) do
+		if c then for _, v in ipairs(c:GetChildren()) do if v.Name == "Tool" and v:IsA("Tool") then n = n + 1 end end end
+	end
+	return n
+end
+local function recoverAxes()
+	task.wait(0.1)
+	if not AR.on then return end
+	local interaction = ReplicatedStorage:FindFirstChild("Interaction")
+	local ci = interaction and interaction:FindFirstChild("ClientInteracted")
+	local pm = Workspace:FindFirstChild("PlayerModels")
+	if not (ci and pm) then return end
+	local axes = {}
+	for _, o in ipairs(pm:GetDescendants()) do
+		if o.Name == "Model" and o:IsA("Model") then
+			local of = o:FindFirstChild("Owner")
+			local os2 = of and of:FindFirstChild("OwnerString")
+			if os2 and os2.Value == LocalPlayer.Name then
+				local handle = o:FindFirstChild("Handle") or o.PrimaryPart
+				if handle and (not AR.deathPos or (handle.Position - AR.deathPos).Magnitude <= AR.radius) then table.insert(axes, o) end
+			end
+		end
+		if #axes >= AR.maxAxes then break end
+	end
+	local got = 0
+	for _, axe in ipairs(axes) do
+		local handle = axe:FindFirstChild("Handle") or axe.PrimaryPart
+		if handle then
+			local before = heldToolCount()
+			local dl = os.clock() + AR.timeout
+			while os.clock() < dl and axe.Parent do
+				ci:FireServer(axe, "Pick up tool", handle.CFrame)
+				task.wait(0.15)
+				if heldToolCount() > before then got = got + 1 break end
+			end
+		end
+	end
+	if got > 0 then notify("Recovered " .. got .. " axe(s)", T.Good) end
+end
+local function hookDeath(char)
+	if AR.diedConn then AR.diedConn:Disconnect() end
+	local h = char:WaitForChild("Humanoid", 10)
+	if not h then return end
+	AR.diedConn = h.Died:Connect(function()
+		local r = char:FindFirstChild("HumanoidRootPart")
+		AR.deathPos = r and r.Position or nil
+	end)
+end
+local function setAxeRecovery(v)
+	AR.on = v
+	if AR.conn then AR.conn:Disconnect() AR.conn = nil end
+	if AR.diedConn then AR.diedConn:Disconnect() AR.diedConn = nil end
+	if not v then return end
+	if LocalPlayer.Character then task.spawn(hookDeath, LocalPlayer.Character) end
+	AR.conn = LocalPlayer.CharacterAdded:Connect(function(char)
+		task.spawn(hookDeath, char)
+		task.spawn(recoverAxes)
+	end)
+end
+local Pr = Section(ProtTab, "Axe Recovery", "After you die, picks your axes back up from where you died", "godmode")
+Toggle(Pr, "Axe Recovery", true, setAxeRecovery, nil, "lt2axerecover")
+setAxeRecovery(true)
+local PrOpt = Collapse(Pr, "Recovery Settings")
+Slider(PrOpt, "Search Radius (studs)", 10, 200, 50, function(v) AR.radius = v end)
+Slider(PrOpt, "Max Axes Per Respawn", 1, 20, 9, function(v) AR.maxAxes = v end)
+Slider(PrOpt, "Pickup Timeout (s)", 1, 10, 3, function(v) AR.timeout = v end)
+addCleanup(function() setAxeRecovery(false) end)
+
+-- ---------------------------------------------------- TELEPORTS: players, their plots, waypoints
+local PS = {}
+local function playerNames()
+	local n = {}
+	for _, p in ipairs(Players:GetPlayers()) do if p ~= LocalPlayer then table.insert(n, p.Name) end end
+	table.sort(n)
+	if #n == 0 then n = { "No other players" } end
+	return n
+end
+local Tpl = Section(Tabs["Teleports"], "LT2 Players", "Jump to a player or their plot", "teleports")
+local plDd = Dropdown(Tpl, "Player", playerNames(), 1)
+Button(Tpl, "Teleport To Player", "Go", function()
+	local p = Players:FindFirstChild(plDd.Name())
+	local r = p and p.Character and p.Character:FindFirstChild("HumanoidRootPart")
+	if not r then notify("Player not found", T.Warn) return end
+	tpTo(r.Position)
+end)
+Button(Tpl, "Teleport To Their Plot", "Go", function()
+	local p = Players:FindFirstChild(plDd.Name())
+	local props = Workspace:FindFirstChild("Properties")
+	if not (p and props) then notify("Player not found", T.Warn) return end
+	for _, plot in ipairs(props:GetChildren()) do
+		local o = plot:FindFirstChild("Owner")
+		if o and o.Value == p then
+			local origin = plot:FindFirstChild("OriginSquare") or plot:FindFirstChildWhichIsA("BasePart")
+			if origin then tpTo(origin.Position) return end
+		end
+	end
+	notify("They don't own a plot", T.Warn)
+end)
+Button(Tpl, "Refresh Player List", "Refresh", function() plDd.SetOptions(playerNames()) end)
+bind(Players.PlayerAdded, function() plDd.SetOptions(playerNames(), true) end)
+bind(Players.PlayerRemoving, function() task.defer(function() plDd.SetOptions(playerNames(), true) end) end)
+
+local Wp = Section(Tabs["Teleports"], "LT2 Waypoints", "Save where you are and come back later", "teleports")
+local wps, wpNames = {}, {}
+local wpDd = Dropdown(Wp, "Waypoint", { "None saved" }, 1)
+Toggle(Wp, "Teleport With Vehicle", true, function(v) LT.carry = v end, nil, "lt2carry", "Takes the vehicle (and loose cargo on pickups / trucks) with you")
+Button(Wp, "Save Waypoint Here", "Save", function()
+	local h = getHum()
+	local seat = h and h.SeatPart
+	local veh = seat and seat:FindFirstAncestorOfClass("Model")
+	local pos = veh and veh:GetPivot().Position or (getRoot() and getRoot().Position)
+	if not pos then return end
+	local name = "Waypoint " .. (#wpNames + 1)
+	wps[name] = pos
+	table.insert(wpNames, name)
+	wpDd.SetOptions(wpNames)
+	wpDd.Set(#wpNames, true)
+	notify("Saved " .. name, T.Good)
+end)
+Button(Wp, "Teleport To Waypoint", "Go", function()
+	local p = wps[wpDd.Name()]
+	if p then tpTo(p) else notify("Save a waypoint first", T.Warn) end
+end)
+
+-- ====================================================== loops
+-- Tree ESP: billboards on the closest trees only, rebuilt every 1.5s
+local espGuis = {}
+local function clearEsp() for m, g in pairs(espGuis) do g:Destroy() espGuis[m] = nil end end
+task.spawn(function()
+	while Live.Running do
+		task.wait(1.5)
+		if not LT.esp then
+			if next(espGuis) then clearEsp() end
+		else
+			local r = getRoot()
+			local list = {}
+			if r then
+				for _, f in ipairs(regions()) do
+					for _, m in ipairs(f:GetChildren()) do
+						local c = m:IsA("Model") and classOf(m)
+						if c and (LT.espAll or c == LT.class) then
+							local b = baseSection(m)
+							if b then
+								local d = (b.Position - r.Position).Magnitude
+								if d <= LT.espMax then table.insert(list, { m = m, b = b, d = d, c = c }) end
+							end
+						end
+					end
+				end
+			end
+			table.sort(list, function(a, b) return a.d < b.d end)
+			local want = {}
+			for i = 1, math.min(#list, 60) do
+				local e = list[i]
+				want[e.m] = true
+				local g = espGuis[e.m]
+				if not g then
+					g = new("BillboardGui", { Adornee = e.b, AlwaysOnTop = true, Size = UDim2.fromOffset(130, 18), StudsOffset = Vector3.new(0, 4, 0) }, EspGui)
+					new("TextLabel", { Name = "L", Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, TextColor3 = T.Good, TextStrokeTransparency = 0.4, Font = Enum.Font.GothamBold, TextSize = 12 }, g)
+					espGuis[e.m] = g
+				end
+				g.L.Text = e.c .. " (" .. #sectionsOf(e.m) .. ")  " .. math.floor(e.d) .. "m"
+			end
+			for m, g in pairs(espGuis) do if not want[m] then g:Destroy() espGuis[m] = nil end end
+		end
+	end
+end)
+-- info rows
+task.spawn(function()
+	while Live.Running do
+		local models = myLogs()
+		local secs = 0
+		for _, m in ipairs(models) do for _, d in ipairs(m:GetDescendants()) do if d.Name == "WoodSection" and d:IsA("BasePart") then secs = secs + 1 end end end
+		if logRow then logRow.Text = "Logs: " .. #models .. " log model(s)  /  " .. secs .. " section(s)" end
+		if LT.class then refreshInfo() end
+		task.wait(5)
+	end
+end)
+bind(UIS.InputBegan, function(i, gp)
+	if gp or Live.BindingActive or not Live.Unlocked or i.UserInputType ~= Enum.UserInputType.Keyboard or UIS:GetFocusedTextBox() then return end
+	if LT.stopKey ~= Enum.KeyCode.Unknown and i.KeyCode == LT.stopKey then stopAll() notify("Stopped", T.Sub) end
+end)
+onUnload(function()
+	LT.token = LT.token + 1
+	LT.busy = false
+	dropLock()
+	clearEsp()
+	for _, f in ipairs(cleanups) do pcall(f) end
+end)
+task.defer(refreshTypes)

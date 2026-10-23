@@ -1,0 +1,697 @@
+-- Solos Hub game module: pf.lua
+-- ESP revision: pf-esp-3 (shared team resolution + per-character rendering recovery)
+-- Loaded by the main hub script (picker -> loadstring). Do not run this file on its own.
+--
+-- Built to be low-profile: no teleporting, no speed, no hitboxes, no remote/metatable hooks, no getgc.
+-- Aim assist moves the mouse like a human (mousemoverel) with smoothing + reaction delay; ESP is drawn locally.
+-- Nothing here can be guaranteed undetectable - the game has its own anti-cheat, so use an alt account.
+
+local Hub, S, T, C = ...
+local API = Hub.API
+local Live = API.Live -- live values: Live.Running, Live.Unlocked, Live.BindingActive
+local Dropdown, Collapse, PlayerList = API.Dropdown, API.Collapse, API.PlayerList
+
+local AddTab = API.AddTab
+local Button = API.Button
+local EspGui = API.EspGui
+local InfoRow = API.InfoRow
+local Keybind = API.Keybind
+local LocalPlayer = API.LocalPlayer
+local Players = API.Players
+local RunService = API.RunService
+local Section = API.Section
+local Slider = API.Slider
+local TabButtons = API.TabButtons
+local Toggle = API.Toggle
+local UIS = API.UIS
+local Workspace = API.Workspace
+local bind = API.bind
+local cam = API.cam
+local copyText = API.copyText
+local env = API.env
+local filterTabs = API.filterTabs
+local new = API.new
+local notify = API.notify
+local onUnload = API.onUnload
+local round = API.round
+
+if game.PlaceId ~= 292439477 then notify("You're not in Phantom Forces - this module needs that game", T.Warn) end
+local Panel = Hub.GamePanel("Phantom Forces", "aimbot", "Aim assist, ESP and radar.")
+local AimTab = Panel.Sub("Aim Assist", "aimbot", "Low-profile aim assist and triggerbot.")
+local EspTab3 = Panel.Sub("ESP", "esp", "ESP, radar and visuals.")
+Hub.gameHeader("PHANTOM FORCES")
+TabButtons["Phantom Forces"].Btn.LayoutOrder = -19
+-- movement / teleport tabs are deliberately hidden here: they are the easiest things for the anti-cheat to catch
+filterTabs({ "Phantom Forces", "Dashboard", "Hub Chat", "Theme", "Settings" })
+
+local P = {
+	aim = false, mode = 1, key = Enum.KeyCode.Unknown, part = 1, fov = 110, showFov = true, strength = 0.16, maxStep = 16,
+	deadzone = 2, scale = 1, wall = true, maxDist = 700, sticky = true, humanize = true, delay = 0.12, jitter = 3,
+	trig = false, trigAds = true, trigMin = 0.05, trigMax = 0.12,
+	esp = false, box = true, names = true, dist = true, chams = false, tracers = false, showTeam = false, visColor = true, espMax = 1200,
+	radar = false, radarRange = 250, alert = false, alertDist = 60,
+	target = nil, targetSince = 0, offset = Vector3.zero,
+}
+local AIM_PARTS = { "Head", "Torso", "Closest" }
+local AIM_MODES = { "Hold Right Mouse (ADS)", "Hold Key", "Always On" }
+local tgs = {}
+local function tog(parent, text, default, cb, desc)
+	local o = Toggle(parent, text, default, cb, nil, nil, desc) -- no id on purpose: these never auto-enable from a saved config
+	table.insert(tgs, o)
+	return o
+end
+
+-- ---------------------------------------------------- helpers
+local function playersRoot() return Workspace:FindFirstChild("Players") end
+local function findPart(m, names)
+	for _, n in ipairs(names) do
+		local p = m:FindFirstChild(n)
+		if p and p:IsA("BasePart") then return p end
+	end
+	-- Part casing differs between character versions. Do not recursively match
+	-- weapons/accessories or turn a team container into a character.
+	for _, p in ipairs(m:GetChildren()) do
+		if p:IsA("BasePart") then
+			for _, n in ipairs(names) do
+				if p.Name:lower() == n:lower() then return p end
+			end
+		end
+	end
+	return nil
+end
+local function firstPart(m)
+	if m.PrimaryPart then return m.PrimaryPart end
+	for _, ch in ipairs(m:GetChildren()) do
+		if ch:IsA("BasePart") then return ch end
+	end
+	return nil
+end
+local HEAD_NAMES, TORSO_NAMES = { "Head", "head" }, { "Torso", "UpperTorso", "HumanoidRootPart", "torso", "Chest" }
+local function headOf(m) return findPart(m, HEAD_NAMES) or firstPart(m) end
+local function torsoOf(m) return findPart(m, TORSO_NAMES) or firstPart(m) end
+local function teamKey(value)
+	return tostring(value or ""):lower():gsub("[%s_%-]", "")
+end
+-- PF uses faction names in some places and BrickColor folder names in others.
+-- Compare normalized aliases, not just the literal Player.Team.Name.
+local TEAM_ALIASES = {
+	phantoms = { "Phantoms", "Phantom", "Bright blue" },
+	ghosts = { "Ghosts", "Ghost", "Bright orange" },
+}
+local function addTeamName(set, value)
+	if not value then return end
+	local key = teamKey(value)
+	if key == "" then return end
+	set[key] = true
+	for _, names in pairs(TEAM_ALIASES) do
+		local matches = false
+		for _, name in ipairs(names) do
+			if key == teamKey(name) then matches = true break end
+		end
+		if matches then
+			for _, name in ipairs(names) do set[teamKey(name)] = true end
+		end
+	end
+end
+local function myTeamNames()
+	local set = {}
+	if LocalPlayer.TeamColor then addTeamName(set, LocalPlayer.TeamColor.Name) end
+	local team = LocalPlayer.Team
+	if team then
+		addTeamName(set, team.Name)
+		if team.TeamColor then addTeamName(set, team.TeamColor.Name) end
+	end
+	return set
+end
+local function playerTeamNames(pl)
+	local set = {}
+	if pl.Team then
+		addTeamName(set, pl.Team.Name)
+		if pl.Team.TeamColor then addTeamName(set, pl.Team.TeamColor.Name) end
+	elseif not pl.Neutral and pl.TeamColor then
+		addTeamName(set, pl.TeamColor.Name)
+	end
+	return set
+end
+local function sameKnownTeam(pl)
+	local mine, theirs = playerTeamNames(LocalPlayer), playerTeamNames(pl)
+	if next(mine) == nil or next(theirs) == nil then return nil end
+	for name in pairs(theirs) do if mine[name] then return true end end
+	return false
+end
+local function modelPlayer(m)
+	local pl = Players:GetPlayerFromCharacter(m) or Players:FindFirstChild(m.Name)
+	return pl and pl:IsA("Player") and pl or nil
+end
+local function looksLikeChar(m, loose)
+	if not m:IsA("Model") or m == LocalPlayer.Character or m:IsDescendantOf(cam()) then return false end
+	if loose then return firstPart(m) ~= nil end
+	return findPart(m, HEAD_NAMES) ~= nil and findPart(m, TORSO_NAMES) ~= nil
+end
+-- scan result is cached (refreshed by the loop below) so the per-frame code stays cheap.
+-- Team is taken from the Workspace.Players team folder (own team folder = teammates); falls back to the player's team.
+local cache, cacheSet = {}, {}
+local function scan(loose)
+	P.scanErr = nil
+	local root, mine = playersRoot(), myTeamNames()
+	if loose and not root then return end
+	local base = root or Workspace
+	local found, set, hasMine = {}, {}, false
+	if root then
+		for _, f in ipairs(root:GetChildren()) do
+			if mine[teamKey(f.Name)] then hasMine = true end
+		end
+	end
+	for _, d in ipairs(base:GetDescendants()) do
+		local ok, err = pcall(function()
+			if d.Name == LocalPlayer.Name or not looksLikeChar(d, loose) then return end
+			if d.Parent and d.Parent:IsA("Model") and looksLikeChar(d.Parent, loose) then return end
+			local top = d
+			while top.Parent and top.Parent ~= base do top = top.Parent end
+			local folderName = (top ~= d) and top.Name or (d.Parent and d.Parent.Name) or ""
+			local enemy = nil
+			local pl = modelPlayer(d)
+			if pl == LocalPlayer then return end
+			-- Character ownership is stronger evidence than a containing folder.
+			local same = nil
+			if pl then same = sameKnownTeam(pl) end
+			if same ~= nil then
+				enemy = not same
+			elseif hasMine then
+				enemy = not mine[teamKey(folderName)]
+			else
+				-- No matching local team folder: keep the relationship unknown.
+				-- The previous `enemy = true` fallback targeted teammates too.
+				enemy = nil
+			end
+			local e = { m = d, enemy = enemy, player = pl, folder = folderName }
+			table.insert(found, e)
+			set[d] = e
+		end)
+		if not ok then P.scanErr = tostring(err) end
+	end
+	cache, cacheSet = found, set
+end
+local function collect(includeTeam)
+	local out = {}
+	for _, e in ipairs(cache) do
+		if e.m.Parent and (e.enemy or includeTeam or P.allEnemy) then table.insert(out, e) end
+	end
+	return out
+end
+local function enemyModelOf(inst)
+	local cur = inst
+	while cur and cur ~= Workspace do
+		local e = cacheSet[cur]
+		if e then return (e.enemy or P.allEnemy) and cur or nil end
+		cur = cur.Parent
+	end
+	return nil
+end
+local rp = RaycastParams.new()
+rp.FilterType = Enum.RaycastFilterType.Exclude
+local function refreshFilter()
+	local list = { cam() }
+	local ig = Workspace:FindFirstChild("Ignore")
+	if ig then table.insert(list, ig) end
+	for _, e in ipairs(cache) do
+		if not e.enemy and e.m.Parent then table.insert(list, e.m) end
+	end
+	if LocalPlayer.Character then table.insert(list, LocalPlayer.Character) end
+	rp.FilterDescendantsInstances = list
+end
+local function visibleModel(m, part)
+	local c = cam()
+	local origin = c.CFrame.Position
+	local res = Workspace:Raycast(origin, part.Position - origin, rp)
+	if res == nil or res.Instance:IsDescendantOf(m) then return true end
+	local hit = res.Instance
+	return hit.Transparency >= 0.9 or not hit.CanCollide
+end
+local function pickPart(m, center)
+	if P.part == 1 then return headOf(m) or torsoOf(m) end
+	if P.part == 2 then return torsoOf(m) or headOf(m) end
+	local c, best, bestD = cam(), nil, math.huge
+	for _, pt in ipairs({ headOf(m), torsoOf(m) }) do
+		if pt then
+			local sp = c:WorldToViewportPoint(pt.Position)
+			local d = (Vector2.new(sp.X, sp.Y) - center).Magnitude
+			if d < bestD then best, bestD = pt, d end
+		end
+	end
+	return best
+end
+local function bestTarget(center)
+	local c = cam()
+	local best, bestPart, bestD = nil, nil, P.fov
+	for _, e in ipairs(collect(false)) do
+		local part = pickPart(e.m, center)
+		if part then
+			local sp, on = c:WorldToViewportPoint(part.Position)
+			if on then
+				local d = (Vector2.new(sp.X, sp.Y) - center).Magnitude
+				local dist = (part.Position - c.CFrame.Position).Magnitude
+				if d < bestD and dist <= P.maxDist and (not P.wall or visibleModel(e.m, part)) then best, bestPart, bestD = e.m, part, d end
+			end
+		end
+	end
+	return best, bestPart
+end
+local function aimActive()
+	if UIS:GetFocusedTextBox() then return false end
+	if P.mode == 3 then return true end
+	if P.mode == 1 then return UIS:IsMouseButtonPressed(Enum.UserInputType.MouseButton2) end
+	return P.key ~= Enum.KeyCode.Unknown and UIS:IsKeyDown(P.key)
+end
+local function press(down)
+	if down and type(env.mouse1press) == "function" then pcall(env.mouse1press) return true end
+	if not down and type(env.mouse1release) == "function" then pcall(env.mouse1release) return true end
+	return false
+end
+
+-- ---------------------------------------------------- FOV circle + aim assist
+local fovGui = new("Frame", { AnchorPoint = Vector2.new(0.5, 0.5), BackgroundTransparency = 1, BorderSizePixel = 0, Visible = false }, EspGui)
+round(fovGui, 999)
+local fovStroke = new("UIStroke", { Color = T.Accent, Thickness = 1, Transparency = 0.5 }, fovGui)
+bind(RunService.RenderStepped, function()
+	local c = cam()
+	if not c then return end
+	local vp = c.ViewportSize
+	local center = Vector2.new(vp.X / 2, vp.Y / 2)
+	fovGui.Visible = P.showFov and P.aim
+	fovGui.Size = UDim2.fromOffset(P.fov * 2, P.fov * 2)
+	fovGui.Position = UDim2.fromOffset(center.X, center.Y)
+	fovStroke.Color = P.target and T.Good or T.Accent
+	if not P.aim or not aimActive() then P.target = nil return end
+	refreshFilter()
+	local m, part
+	if P.sticky and P.target and P.target.Parent then
+		m = P.target
+		part = pickPart(m, center)
+		local keep = false
+		if part then
+			local sp, on = c:WorldToViewportPoint(part.Position)
+			keep = on and (Vector2.new(sp.X, sp.Y) - center).Magnitude <= P.fov * 1.3 and (not P.wall or visibleModel(m, part))
+		end
+		if not keep then P.target, m, part = nil, nil, nil end
+	end
+	if not m then
+		m, part = bestTarget(center)
+		if m then
+			P.target, P.targetSince = m, os.clock()
+			local j = P.jitter / 10
+			P.offset = Vector3.new((math.random() - 0.5) * 2 * j, (math.random() - 0.5) * 2 * j, (math.random() - 0.5) * 2 * j)
+		end
+	end
+	if not (m and part) then return end
+	if P.humanize and os.clock() - P.targetSince < P.delay then return end
+	local aimPos = part.Position
+	if P.humanize then aimPos = aimPos + P.offset end
+	local sp, on = c:WorldToViewportPoint(aimPos)
+	if not on then return end
+	local delta = Vector2.new(sp.X, sp.Y) - center
+	if delta.Magnitude < P.deadzone then return end
+	local step = delta * P.strength
+	if step.Magnitude > P.maxStep then step = step.Unit * P.maxStep end
+	if type(env.mousemoverel) == "function" then
+		pcall(env.mousemoverel, step.X * P.scale, step.Y * P.scale)
+	else
+		c.CFrame = c.CFrame:Lerp(CFrame.lookAt(c.CFrame.Position, aimPos), math.clamp(P.strength, 0.01, 1))
+	end
+end)
+
+-- ---------------------------------------------------- triggerbot (human-like reaction + hold time)
+task.spawn(function()
+	while Live.Running do
+		if P.trig and (not P.trigAds or UIS:IsMouseButtonPressed(Enum.UserInputType.MouseButton2)) and not UIS:GetFocusedTextBox() then
+			local c = cam()
+			if c then
+				refreshFilter()
+				local res = Workspace:Raycast(c.CFrame.Position, c.CFrame.LookVector * P.maxDist, rp)
+				if res and enemyModelOf(res.Instance) then
+					task.wait(P.trigMin + math.random() * math.max(P.trigMax - P.trigMin, 0))
+					local again = Workspace:Raycast(c.CFrame.Position, c.CFrame.LookVector * P.maxDist, rp)
+					if P.trig and again and enemyModelOf(again.Instance) then
+						if press(true) then
+							task.wait(0.03 + math.random() * 0.04)
+							press(false)
+						elseif type(env.mouse1click) == "function" then
+							pcall(env.mouse1click)
+						end
+						task.wait(0.08 + math.random() * 0.12)
+					end
+				end
+			end
+		end
+		task.wait()
+	end
+end)
+
+-- ---------------------------------------------------- ESP (all drawn locally with GUI objects)
+local objs, visCache = {}, setmetatable({}, { __mode = "k" })
+local function killObj(o)
+	for _, k in ipairs({ "box", "name", "dist", "line", "hl" }) do if o[k] then o[k]:Destroy() end end
+end
+local function makeObj(o)
+	o = o or {}
+	o.box = new("Frame", { BackgroundTransparency = 1, BorderSizePixel = 0, Visible = false }, EspGui)
+	o.stroke = new("UIStroke", { Thickness = 1.2, ApplyStrokeMode = Enum.ApplyStrokeMode.Border }, o.box)
+	o.name = new("TextLabel", { AnchorPoint = Vector2.new(0.5, 1), Size = UDim2.fromOffset(160, 14), BackgroundTransparency = 1, Font = Enum.Font.GothamBold, TextSize = 11, TextStrokeTransparency = 0.5, Visible = false }, EspGui)
+	o.dist = new("TextLabel", { AnchorPoint = Vector2.new(0.5, 0), Size = UDim2.fromOffset(120, 12), BackgroundTransparency = 1, Font = Enum.Font.Gotham, TextSize = 10, TextStrokeTransparency = 0.5, Visible = false }, EspGui)
+	o.line = new("Frame", { AnchorPoint = Vector2.new(0.5, 0.5), BorderSizePixel = 0, Visible = false }, EspGui)
+	o.hl = new("Highlight", { FillTransparency = 1, OutlineTransparency = 0.2, DepthMode = Enum.HighlightDepthMode.AlwaysOnTop, Enabled = false }, EspGui)
+	return o
+end
+local function hideObj(o)
+	o.box.Visible, o.name.Visible, o.dist.Visible, o.line.Visible, o.hl.Enabled = false, false, false, false, false
+end
+local function clearEsp()
+	for m, o in pairs(objs) do killObj(o) objs[m] = nil end
+end
+local ENEMY_VIS, ENEMY_HID = Color3.fromRGB(255, 70, 70), Color3.fromRGB(255, 190, 60)
+-- Clip bounding-box edges to the near plane before projecting. Rejecting an
+-- entire box because just one corner is behind the camera hides nearby players.
+local function projectBounds(c, cf, size)
+	local corners, points = {}, {}
+	local near = 0.05
+	for i = 0, 7 do
+		local sx = (i % 2 == 0) and -1 or 1
+		local sy = (math.floor(i / 2) % 2 == 0) and -1 or 1
+		local sz = (i < 4) and -1 or 1
+		local p = c.CFrame:PointToObjectSpace(cf:PointToWorldSpace(
+			Vector3.new(sx * size.X / 2, sy * size.Y / 2, sz * size.Z / 2)))
+		corners[i + 1] = p
+		if p.Z <= -near then table.insert(points, p) end
+	end
+	for i = 0, 7 do
+		for _, step in ipairs({1, 2, 4}) do
+			if math.floor(i / step) % 2 == 0 then
+				local a, b = corners[i + 1], corners[i + step + 1]
+				if (a.Z <= -near) ~= (b.Z <= -near) then
+					local t = (-near - a.Z) / (b.Z - a.Z)
+					table.insert(points, a + (b - a) * t)
+				end
+			end
+		end
+	end
+	local minX, minY, maxX, maxY = math.huge, math.huge, -math.huge, -math.huge
+	for _, p in ipairs(points) do
+		local sp = c:WorldToViewportPoint(c.CFrame:PointToWorldSpace(p))
+		minX, minY = math.min(minX, sp.X), math.min(minY, sp.Y)
+		maxX, maxY = math.max(maxX, sp.X), math.max(maxY, sp.Y)
+	end
+	local vp = c.ViewportSize
+	if #points == 0 or maxX <= 0 or maxY <= 0 or minX >= vp.X or minY >= vp.Y then return nil end
+	minX, minY = math.max(0, minX), math.max(0, minY)
+	maxX, maxY = math.min(vp.X, maxX), math.min(vp.Y, maxY)
+	if maxX <= minX or maxY <= minY then return nil end
+	return minX, minY, maxX, maxY
+end
+local function drawModel(c, e)
+	local m = e.m
+	local cf, size = m:GetBoundingBox()
+	local dist = (cf.Position - c.CFrame.Position).Magnitude
+	local o = objs[m]
+	if dist > P.espMax then
+		if o then hideObj(o) end
+		return false
+	end
+	local minX, minY, maxX, maxY = projectBounds(c, cf, size)
+	if not minX then
+		if o then hideObj(o) end
+		return false
+	end
+	if not o then
+		o = {} -- Register first so a partially created overlay can be cleaned up.
+		objs[m] = o
+		makeObj(o)
+	end
+	local col = e.enemy == nil and T.Sub or (e.enemy and ENEMY_HID or T.Good)
+	if e.enemy and (not P.visColor or visCache[m]) then col = ENEMY_VIS end
+	o.box.Position, o.box.Size = UDim2.fromOffset(minX, minY), UDim2.fromOffset(maxX - minX, maxY - minY)
+	o.stroke.Color, o.box.Visible = col, P.box
+	local cx = (minX + maxX) / 2
+	local pl = e.player or modelPlayer(m)
+	o.name.Position = UDim2.fromOffset(cx, math.max(14, minY - 1))
+	o.name.Text, o.name.TextColor3, o.name.Visible = pl and pl.DisplayName or m.Name, col, P.names
+	o.dist.Position = UDim2.fromOffset(cx, math.min(c.ViewportSize.Y - 12, maxY + 1))
+	o.dist.Text, o.dist.TextColor3, o.dist.Visible = math.floor(dist * 0.28) .. "m", col, P.dist
+	o.hl.Adornee, o.hl.OutlineColor, o.hl.Enabled = m, col, P.chams
+	o.line.Visible = P.tracers
+	if P.tracers then
+		local from, to = Vector2.new(c.ViewportSize.X / 2, c.ViewportSize.Y), Vector2.new(cx, maxY)
+		local d = to - from
+		o.line.Size = UDim2.fromOffset(d.Magnitude, 1)
+		o.line.Position = UDim2.fromOffset((from.X + to.X) / 2, (from.Y + to.Y) / 2)
+		o.line.Rotation, o.line.BackgroundColor3 = math.deg(math.atan2(d.Y, d.X)), col
+	end
+	return true
+end
+local function updateEsp()
+	local c = cam()
+	P.drawn, P.espErr, P.renderFailed = 0, nil, 0
+	if not c then
+		for _, o in pairs(objs) do hideObj(o) end
+		return
+	end
+	local seen = {}
+	if P.esp then
+		for _, e in ipairs(collect(P.showTeam)) do
+			seen[e.m] = true
+			local ok, drawn = pcall(drawModel, c, e)
+			if ok then
+				if drawn then P.drawn = P.drawn + 1 end
+			else
+				P.renderFailed = P.renderFailed + 1
+				P.espErr = tostring(drawn)
+				-- A stale/partially replicated model must not stop every other row.
+				local o = objs[e.m]
+				if o then killObj(o) objs[e.m] = nil end
+			end
+		end
+	end
+	for m, o in pairs(objs) do
+		if not seen[m] or not m.Parent then killObj(o) objs[m] = nil end
+	end
+end
+bind(RunService.RenderStepped, function()
+	local ok, err = pcall(updateEsp)
+	if not ok then P.espErr = tostring(err) end
+end)
+
+-- ---------------------------------------------------- radar (top-down, rotates with your view)
+local RADAR = 70
+local radar = new("Frame", { AnchorPoint = Vector2.new(0, 1), Position = UDim2.new(0, 20, 1, -20), Size = UDim2.fromOffset(RADAR * 2, RADAR * 2), BackgroundColor3 = Color3.fromRGB(10, 10, 14), BackgroundTransparency = 0.45, BorderSizePixel = 0, Visible = false }, EspGui)
+round(radar, 8)
+new("UIStroke", { Color = T.Accent, Thickness = 1, Transparency = 0.6 }, radar)
+new("Frame", { AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), Size = UDim2.fromOffset(5, 5), BackgroundColor3 = Color3.new(1, 1, 1), BorderSizePixel = 0 }, radar)
+local dots = {}
+bind(RunService.RenderStepped, function()
+	radar.Visible = P.radar
+	if not P.radar then return end
+	local c = cam()
+	if not c then return end
+	local list = collect(false)
+	for i, e in ipairs(list) do
+		local d = dots[i]
+		if not d then
+			d = new("Frame", { AnchorPoint = Vector2.new(0.5, 0.5), Size = UDim2.fromOffset(5, 5), BackgroundColor3 = ENEMY_VIS, BorderSizePixel = 0 }, radar)
+			dots[i] = d
+		end
+		local head = headOf(e.m)
+		if head then
+			local rel = c.CFrame:PointToObjectSpace(head.Position)
+			local v = Vector2.new(rel.X, rel.Z) / P.radarRange * RADAR
+			if v.Magnitude > RADAR - 4 then v = v.Unit * (RADAR - 4) end
+			d.Position = UDim2.new(0.5, v.X, 0.5, v.Y)
+			d.Visible = true
+		else
+			d.Visible = false
+		end
+	end
+	for i = #list + 1, #dots do dots[i].Visible = false end
+end)
+
+-- ---------------------------------------------------- visibility cache, enemy info + proximity alert
+local infoRow
+local lastAlert = 0
+task.spawn(function()
+	while Live.Running do
+		local c = cam()
+		if c and (P.esp or P.alert or infoRow) then
+			refreshFilter()
+			local n, nearest = 0, math.huge
+			for _, e in ipairs(collect(false)) do
+				n = n + 1
+				local head = headOf(e.m)
+				if head then
+					visCache[e.m] = visibleModel(e.m, head)
+					local d = (head.Position - c.CFrame.Position).Magnitude
+					if d < nearest then nearest = d end
+				end
+			end
+			if infoRow then
+				infoRow.Text = "Enemies: " .. n .. (n > 0 and ("   Nearest: " .. math.floor(nearest * 0.28) .. "m") or "")
+			end
+			if P.alert and nearest <= P.alertDist and os.clock() - lastAlert > 4 then
+				lastAlert = os.clock()
+				notify("Enemy nearby - " .. math.floor(nearest * 0.28) .. "m", Color3.fromRGB(255, 120, 60))
+			end
+		end
+		task.wait(0.1)
+	end
+end)
+
+task.spawn(function() -- keep the character list fresh
+	while Live.Running do
+		local ok, err = pcall(scan, false)
+		if not ok then P.err = tostring(err) end
+		if #cache == 0 then -- strict detection found nothing: accept any model inside Workspace.Players
+			local ok2, err2 = pcall(scan, true)
+			if not ok2 then P.err = tostring(err2) end
+		end
+		task.wait(playersRoot() and 0.4 or 1.5)
+	end
+end)
+local statusRow, espRow
+task.spawn(function()
+	while Live.Running do
+		if espRow then
+			local unknown = 0
+			for _, e in ipairs(cache) do if e.enemy == nil then unknown = unknown + 1 end end
+			local err = P.espErr or P.scanErr
+			espRow.Text = "pf-esp-3 | Found " .. #cache .. " models (" .. #collect(false) .. " enemy, " .. unknown .. " unknown) | drawn " .. tostring(P.drawn or 0) .. " | failed " .. tostring(P.renderFailed or 0) .. (err and (" | ERROR: " .. err) or "")
+		end
+		if statusRow then
+			local state = "idle"
+			if P.aim then state = aimActive() and (P.target and "locked on target" or "active, no target in FOV") or "waiting for ADS / key" end
+			statusRow.Text = "Detected: " .. #collect(false) .. " enemies | mouse move: " .. (type(env.mousemoverel) == "function" and "ok" or "MISSING") .. " | aim: " .. state .. (P.err and (" | ERROR: " .. P.err) or "")
+		end
+		task.wait(0.3)
+	end
+end)
+local function report()
+	local out = {}
+	local function add(s) table.insert(out, s) end
+	add("ESP revision: pf-esp-3")
+	add("scan error=" .. tostring(P.scanErr) .. " render error=" .. tostring(P.espErr))
+	add("enabled=" .. tostring(P.esp) .. " showTeam=" .. tostring(P.showTeam) .. " maxDistance=" .. tostring(P.espMax) .. " drawn=" .. tostring(P.drawn or 0))
+	add("PlaceId " .. game.PlaceId .. " | team " .. tostring(LocalPlayer.Team and LocalPlayer.Team.Name) .. " | teamcolor " .. LocalPlayer.TeamColor.Name)
+	add("mousemoverel=" .. tostring(type(env.mousemoverel)) .. " mouse1press=" .. tostring(type(env.mouse1press)) .. " mouse1click=" .. tostring(type(env.mouse1click)))
+	add("detected total=" .. #cache .. " enemies=" .. #collect(false))
+	for i, e in ipairs(cache) do
+		if i > 12 then break end
+		add("model=" .. e.m.Name .. " folder=" .. tostring(e.folder) .. " enemy=" .. tostring(e.enemy) .. " owner=" .. tostring(e.player and e.player.Name))
+	end
+	local names = {}
+	for i, ch in ipairs(Workspace:GetChildren()) do
+		if i > 60 then break end
+		table.insert(names, ch.Name .. "(" .. ch.ClassName .. ")")
+	end
+	add("Workspace children: " .. table.concat(names, ", "))
+	local root = playersRoot()
+	if root then
+		add("Workspace.Players exists, class " .. root.ClassName)
+		for i, f in ipairs(root:GetChildren()) do
+			if i > 6 then break end
+			add("  " .. f.Name .. " (" .. f.ClassName .. ") children=" .. #f:GetChildren())
+			for j, m in ipairs(f:GetChildren()) do
+				if j > 2 then break end
+				local kids = {}
+				for k, p in ipairs(m:GetChildren()) do
+					if k > 25 then break end
+					table.insert(kids, p.Name .. "(" .. p.ClassName .. ")")
+				end
+				add("    " .. m.Name .. " (" .. m.ClassName .. "): " .. table.concat(kids, ", "))
+			end
+		end
+	else
+		add("Workspace.Players does NOT exist")
+	end
+	local text = table.concat(out, "\n")
+	copyText(text)
+	notify("Diagnostic copied - paste it to me", T.Good)
+end
+local function panic()
+	P.aim, P.trig, P.esp, P.radar, P.alert, P.chams = false, false, false, false, false, false
+	for _, o in ipairs(tgs) do pcall(function() o.Set(false) end) end
+	clearEsp()
+end
+onUnload(function()
+	P.aim, P.trig, P.esp, P.radar, P.alert = false, false, false, false, false
+	clearEsp()
+	fovGui:Destroy()
+	radar:Destroy()
+	pcall(press, false)
+end)
+
+-- ====================================================== UI : Aim Assist tab
+local Aim = Section(AimTab, "Aim Assist", "Moves your mouse toward the enemy nearest your crosshair - hold right mouse (ADS) to use", "aimbot")
+tog(Aim, "Aim Assist", false, function(v) P.aim = v if not v then P.target = nil end end)
+Dropdown(Aim, "Activation", AIM_MODES, P.mode, function(i) P.mode = i end, nil, "When the aim assist pulls")
+Keybind(Aim, "Aim Key (activation: Hold Key)", P.key, function(k) P.key = k end, true)
+Dropdown(Aim, "Aim At", AIM_PARTS, P.part, function(i) P.part = i end, nil, "Which body part to aim at")
+tog(Aim, "Show FOV Circle", true, function(v) P.showFov = v end)
+local AimOpt = Collapse(Aim, "Settings")
+Slider(AimOpt, "FOV (px) - smaller = less obvious", 20, 400, 110, function(v) P.fov = v end, "pffov")
+Slider(AimOpt, "Smoothness (lower = slower / more human)", 2, 60, 16, function(v) P.strength = v / 100 end, "pfstrength")
+Slider(AimOpt, "Max Pull Per Frame (px)", 2, 60, 16, function(v) P.maxStep = v end, "pfmaxstep")
+Slider(AimOpt, "Mouse Scale % (tune if it over/undershoots)", 20, 300, 100, function(v) P.scale = v / 100 end, "pfscale")
+
+local Hum = Section(AimTab, "Humanizer", "Makes the aim look less robotic", "player")
+tog(Hum, "Humanize", true, function(v) P.humanize = v end, "Reaction delay + aim spread")
+tog(Hum, "Stick To Target Until It Leaves", true, function(v) P.sticky = v end)
+tog(Hum, "Visible Targets Only", true, function(v) P.wall = v end)
+local HumOpt = Collapse(Hum, "Settings")
+Slider(HumOpt, "Reaction Delay (ms)", 0, 400, 120, function(v) P.delay = v / 1000 end, "pfdelay")
+Slider(HumOpt, "Aim Spread (x0.1 stud)", 0, 10, 3, function(v) P.jitter = v end, "pfjitter")
+Slider(HumOpt, "Deadzone (px)", 0, 15, 2, function(v) P.deadzone = v end, "pfdeadzone")
+Slider(HumOpt, "Max Range (studs)", 50, 1500, 700, function(v) P.maxDist = v end, "pfmaxdist")
+
+local Tr = Section(AimTab, "Triggerbot", "Fires with a random reaction time and hold time when an enemy is under the crosshair", "aimbot")
+tog(Tr, "Triggerbot", false, function(v) P.trig = v end)
+tog(Tr, "Only While Aiming", true, function(v) P.trigAds = v end, "Right mouse")
+local TrOpt = Collapse(Tr, "Settings")
+Slider(TrOpt, "Min Reaction (ms)", 10, 400, 50, function(v) P.trigMin = v / 1000 end, "pftrigmin")
+Slider(TrOpt, "Max Reaction (ms)", 10, 500, 120, function(v) P.trigMax = v / 1000 end, "pftrigmax")
+
+local St = Section(AimTab, "Status", "Live check - tells you why something isn't working", "info")
+statusRow = InfoRow(St, "Detected: - | mouse move: - | aim: -")
+Button(St, "Copy Diagnostic Report", "Copy", report, nil, "Copy model and rendering diagnostics")
+local Sf = Section(AimTab, "Safety", "Read this", "warning")
+InfoRow(Sf, "No teleport, speed, fly or hitbox features on purpose - those get banned fastest.")
+InfoRow(Sf, "Anti-cheat can still ban you. Use an alt account and low settings.")
+Keybind(Sf, "Panic Key (turns everything off)", Enum.KeyCode.Unknown, function(k) P.panicKey = k end, true)
+Button(Sf, "Panic: Turn Everything Off", "Panic", panic)
+bind(UIS.InputBegan, function(i, gp)
+	if gp or Live.BindingActive or not Live.Unlocked then return end
+	if i.UserInputType == Enum.UserInputType.Keyboard and P.panicKey and P.panicKey ~= Enum.KeyCode.Unknown and i.KeyCode == P.panicKey then
+		panic()
+		notify("Phantom Forces features off", T.Warn)
+	end
+end)
+
+-- ====================================================== UI : Phantom ESP tab
+local E = Section(EspTab3, "Enemy ESP", "Drawn only on your screen", "esp")
+tog(E, "Enable ESP", false, function(v) P.esp = v if not v then clearEsp() end end)
+local EOpt = Collapse(E, "Options")
+tog(EOpt, "Boxes", true, function(v) P.box = v end)
+tog(EOpt, "Names", true, function(v) P.names = v end)
+tog(EOpt, "Distance", true, function(v) P.dist = v end)
+tog(EOpt, "Outline Chams", false, function(v) P.chams = v end)
+tog(EOpt, "Tracers", false, function(v) P.tracers = v end)
+tog(EOpt, "Color By Visibility", true, function(v) P.visColor = v end, "Red = visible, amber = behind cover")
+tog(EOpt, "Show Teammates", false, function(v) P.showTeam = v end)
+Slider(EOpt, "Max ESP Distance (studs)", 100, 3000, 1200, function(v) P.espMax = v end, "pfespmax")
+
+local R = Section(EspTab3, "Radar & Alerts", "Awareness without drawing anything on enemies", "active")
+tog(R, "Radar (bottom-left)", false, function(v) P.radar = v end)
+tog(R, "Enemy Proximity Alert", false, function(v) P.alert = v end)
+infoRow = InfoRow(R, "Enemies: -")
+local ROpt = Collapse(R, "Settings")
+Slider(ROpt, "Radar Range (studs)", 60, 600, 250, function(v) P.radarRange = v end, "pfradarrange")
+Slider(ROpt, "Alert Distance (studs)", 20, 200, 60, function(v) P.alertDist = v end, "pfalertdist")
+local Dg = Section(EspTab3, "Troubleshooting", "If nothing shows up", "help")
+espRow = InfoRow(Dg, "Found - models | drawn -")
+tog(Dg, "Treat Everyone As Enemy", false, function(v) P.allEnemy = v end, "Manual override: includes teammates and unknown models in ESP and aim assist")
+Button(Dg, "Copy Diagnostic Report", "Copy", report, nil, "Copy model and rendering diagnostics")

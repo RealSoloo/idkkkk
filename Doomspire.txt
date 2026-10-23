@@ -1,0 +1,728 @@
+-- Solos Hub game module: doomspire.lua
+-- Loaded by the main hub script (picker -> loadstring). Do not run this file on its own.
+--
+
+local Hub, S, T, C = ...
+local API = Hub.API
+local Live = API.Live -- live values: Live.Running, Live.Unlocked, Live.BindingActive
+local Dropdown, Collapse, PlayerList = API.Dropdown, API.Collapse, API.PlayerList
+
+local AddTab = API.AddTab
+local Button = API.Button
+local EspGui = API.EspGui
+local InfoRow = API.InfoRow
+local Input = API.Input
+local Keybind = API.Keybind
+local LocalPlayer = API.LocalPlayer
+local Players = API.Players
+local RunService = API.RunService
+local Section = API.Section
+local Slider = API.Slider
+local TabButtons = API.TabButtons
+local Tabs = API.Tabs
+local Toggle = API.Toggle
+local UIS = API.UIS
+local Workspace = API.Workspace
+local bind = API.bind
+local filterTabs = API.filterTabs
+local getChar = API.getChar
+local getHum = API.getHum
+local getRoot = API.getRoot
+local nearestPlayer = API.nearestPlayer
+local new = API.new
+local notify = API.notify
+local onUnload = API.onUnload
+
+if game.PlaceId ~= 79602128065352 then notify("You're not in Doomspire - this module needs that game", T.Warn) end
+local Panel = Hub.GamePanel("Doomspire", "attack", "Bombs, raids and combat.")
+local BombTab = Panel.Sub("Bombs", "attack", "Bomb patterns and drop tools.")
+local RaidTab = Panel.Sub("Raids", "aimbot", "Raid patterns.")
+local FightTab = Panel.Sub("Fighting", "godmode", "Kill and defense tools.")
+Hub.gameHeader("DOOMSPIRE")
+TabButtons["Doomspire"].Btn.LayoutOrder = -19
+-- keep only the tabs that matter for this game (flying / noclip live in Player)
+filterTabs({ "Doomspire", "Dashboard", "Player", "ESP", "Players", "Teleports", "Commands", "Hub Chat", "Theme", "Settings" })
+
+local DS = {
+	bombSlot = 4, weapSlot = 5, weapMode = 1, weapName = "sword", cps = 40, timeout = 3, dist = 3,
+	delay = 0.25, height = 0, mode = 1, equip = true, loop = false, key = Enum.KeyCode.B,
+	killKey = Enum.KeyCode.K, stopKey = Enum.KeyCode.X,
+	skipTeam = true, home = true, bombCount = 10, gap = 0.05, ringR = 25, ringN = 12, carpet = 2, spacing = 12,
+	aura = false, auraR = 20, autoClick = false, loopAll = false, loopSel = false,
+	reach = false, reachSize = 14, busy = false, token = 0, rot = 0,
+}
+local MODES = { "Mouse", "Me", "Selected Player", "Nearest Player" }
+local WEAPONS = { "Hotbar Slot", "Held Tool", "Tool Name", "All Tools" }
+
+-- ---------------------------------------------------- tools / hotbar slots
+local slots = {}
+local slotRow
+local function snapshot()
+	table.clear(slots)
+	local bp = LocalPlayer:FindFirstChildOfClass("Backpack")
+	if bp then for _, c in ipairs(bp:GetChildren()) do if c:IsA("Tool") then table.insert(slots, c.Name) end end end
+	local parts = {}
+	for i, n in ipairs(slots) do table.insert(parts, i .. ":" .. n) end
+	if slotRow then slotRow.Text = "Slots  " .. (#parts > 0 and table.concat(parts, "   ") or "(unequip your tool, then press Refresh)") end
+end
+local function toolNamed(n)
+	local ch, bp = getChar(), LocalPlayer:FindFirstChildOfClass("Backpack")
+	local t = (ch and ch:FindFirstChild(n)) or (bp and bp:FindFirstChild(n))
+	return t and t:IsA("Tool") and t or nil
+end
+local function slotTool(n) local nm = slots[n] return nm and toolNamed(nm) or nil end
+local function allTools()
+	local list, ch, bp = {}, getChar(), LocalPlayer:FindFirstChildOfClass("Backpack")
+	for _, src in ipairs({ ch, bp }) do
+		for _, c in ipairs(src and src:GetChildren() or {}) do if c:IsA("Tool") then table.insert(list, c) end end
+	end
+	return list
+end
+local function equip(tool)
+	if tool.Parent ~= getChar() then
+		local h = getHum()
+		if h then h:EquipTool(tool) else tool.Parent = getChar() end
+	end
+end
+local function getBomb() return toolNamed("Timebomb") or slotTool(DS.bombSlot) end
+local function getWeapon()
+	local m = DS.weapMode
+	if m == 1 then
+		local t = slotTool(DS.weapSlot)
+		if t then return t end
+		for _, c in ipairs(allTools()) do if c.Name:lower():find("sword", 1, true) then return c end end
+		return nil
+	elseif m == 2 then
+		local ch = getChar()
+		return ch and ch:FindFirstChildOfClass("Tool")
+	elseif m == 3 then
+		for _, c in ipairs(allTools()) do if c.Name:lower():find(DS.weapName:lower(), 1, true) then return c end end
+		return nil
+	else
+		local list = allTools()
+		if #list == 0 then return nil end
+		DS.rot = DS.rot % #list + 1
+		return list[DS.rot]
+	end
+end
+local function swing()
+	local tool = getWeapon()
+	if not tool then return false end
+	equip(tool)
+	pcall(function() tool:Activate() end)
+	return true
+end
+
+-- ---------------------------------------------------- helpers
+local lastWarn = 0
+local function warn2(text)
+	if os.clock() - lastWarn > 2 then lastWarn = os.clock() notify(text, T.Warn) end
+end
+local function alive(p)
+	local h = p and p.Character and p.Character:FindFirstChildOfClass("Humanoid")
+	return h ~= nil and h.Health > 0
+end
+local function rootOf(p) return p and p.Character and p.Character:FindFirstChild("HumanoidRootPart") end
+local function hpOf(p)
+	local h = p and p.Character and p.Character:FindFirstChildOfClass("Humanoid")
+	return h and h.Health or 0
+end
+local function stopAll() DS.token = DS.token + 1 DS.busy = false end
+local function runSeq(fn)
+	if DS.busy then notify("Already running - press Stop first", T.Warn) return end
+	DS.token = DS.token + 1
+	local my = DS.token
+	DS.busy = true
+	task.spawn(function()
+		local ok = function() return Live.Running and DS.token == my end
+		local good, err = pcall(fn, ok)
+		if not good then warn2("Error: " .. tostring(err):sub(1, 60)) end
+		if DS.token == my then DS.busy = false end
+	end)
+end
+local function enemies()
+	local list = {}
+	for _, p in ipairs(Players:GetPlayers()) do
+		if p ~= LocalPlayer and alive(p) and rootOf(p) and not (DS.skipTeam and S.SameTeam(p)) then table.insert(list, p) end
+	end
+	local r = getRoot()
+	if DS.prio == 2 then
+		table.sort(list, function(a, b) return hpOf(a) < hpOf(b) end)
+	elseif DS.prio == 3 then
+		table.sort(list, function(a, b) return hpOf(a) > hpOf(b) end)
+	elseif r then
+		table.sort(list, function(a, b) return (rootOf(a).Position - r.Position).Magnitude < (rootOf(b).Position - r.Position).Magnitude end)
+	end
+	return list
+end
+local function goHome(home)
+	local r = getRoot()
+	if r and DS.home and home then r.CFrame = home r.AssemblyLinearVelocity = Vector3.zero end
+end
+
+-- ---------------------------------------------------- bombs
+local function prepBomb()
+	local tool = getBomb()
+	local ev = tool and tool:FindFirstChild("Fire")
+	if not ev then warn2("Timebomb not found (check the slot numbers)") return nil end
+	if DS.equip then equip(tool) end
+	return ev
+end
+local function fireAt(ev, pos)
+	pcall(function() ev:FireServer(CFrame.new(pos + Vector3.new(0, DS.height, 0))) end)
+end
+local function bombSpam(ev, pos, count, ok)
+	for _ = 1, count do
+		if not ok() then return end
+		fireAt(ev, pos)
+		task.wait(math.max(DS.gap, 0.01))
+	end
+end
+local function targetPos(mode)
+	if mode == 1 then
+		local hit = LocalPlayer:GetMouse().Hit
+		return hit and hit.Position
+	elseif mode == 2 then
+		local r = getRoot()
+		return r and r.Position
+	elseif mode == 3 then
+		local tr = rootOf(S.Target)
+		if not tr then return nil end
+		if DS.lead then return tr.Position + tr.AssemblyLinearVelocity * DS.leadT end
+		return tr.Position
+	else
+		local p = nearestPlayer()
+		local tr = rootOf(p)
+		if not tr then return nil end
+		if DS.lead then return tr.Position + tr.AssemblyLinearVelocity * DS.leadT end
+		return tr.Position
+	end
+end
+local function drop(mode)
+	local pos = targetPos(mode or DS.mode)
+	if not pos then warn2("No drop position (" .. MODES[mode or DS.mode] .. ")") return end
+	local ev = prepBomb()
+	if ev then fireAt(ev, pos) end
+end
+S.DoomDrop = drop
+
+-- enemy team spawns
+local function enemySpawns()
+	local out, anyTeam = {}, false
+	local color = LocalPlayer.TeamColor
+	local hasTeam = LocalPlayer.Team ~= nil
+	for _, d in ipairs(Workspace:GetDescendants()) do
+		if d:IsA("SpawnLocation") and not d.Neutral then
+			anyTeam = true
+			if not hasTeam or d.TeamColor ~= color then table.insert(out, d) end
+		end
+	end
+	if not anyTeam then
+		-- fallback: parts called "...spawn..." that aren't the colour of your team
+		for _, d in ipairs(Workspace:GetDescendants()) do
+			if d:IsA("BasePart") and d.Name:lower():find("spawn", 1, true) and not d:IsDescendantOf(getChar() or Workspace) and d.BrickColor ~= color then
+				table.insert(out, d)
+			end
+		end
+	end
+	return out
+end
+
+-- ---------------------------------------------------- weapon attack
+local function attack(p, ok, maxTime)
+	local t0, gap = os.clock(), 1 / math.max(DS.cps, 1)
+	while ok() and alive(p) and os.clock() - t0 < (maxTime or DS.timeout) do
+		local r, tr = getRoot(), rootOf(p)
+		if not r or not tr then break end
+		local back = tr.CFrame * CFrame.new(0, 0, DS.dist)
+		r.CFrame = CFrame.lookAt(back.Position, tr.Position)
+		r.AssemblyLinearVelocity = Vector3.zero
+		if not swing() then warn2("No weapon found (check weapon slot / mode)") return false end
+		task.wait(gap)
+	end
+	return not alive(p)
+end
+local function killList(list)
+	runSeq(function(ok)
+		local r = getRoot()
+		if not r then return end
+		local home, n = r.CFrame, 0
+		for _, p in ipairs(list) do
+			if not ok() then break end
+			if alive(p) and attack(p, ok) then n = n + 1 end
+		end
+		goHome(home)
+		notify(("Done - %d of %d eliminated"):format(n, #list), n > 0 and T.Good or T.Warn)
+	end)
+end
+local function killAll() killList(enemies()) end
+local function killSelected()
+	if S.Target and S.Target.Parent then killList({ S.Target }) else notify("Select a player in the Players tab first", T.Warn) end
+end
+local function killNearest()
+	local p = enemies()[1]
+	if p then killList({ p }) else notify("No enemies found", T.Warn) end
+end
+
+-- ---------------------------------------------------- loops
+task.spawn(function() -- auto bomb loop
+	while Live.Running do
+		if DS.loop then drop() task.wait(math.max(DS.delay, 0.03)) else task.wait(0.1) end
+	end
+end)
+task.spawn(function() -- kill aura / auto click / loop kills
+	while Live.Running do
+		local gap = 1 / math.max(DS.cps, 1)
+		if DS.aura and not DS.busy then
+			local r = getRoot()
+			if r then
+				for _, p in ipairs(enemies()) do
+					if (rootOf(p).Position - r.Position).Magnitude <= DS.auraR then swing() break end
+				end
+			end
+		end
+		if DS.autoClick and not DS.busy then
+			local ch = getChar()
+			local t = ch and ch:FindFirstChildOfClass("Tool")
+			if t then pcall(function() t:Activate() end) end
+		end
+		if DS.loopAll and not DS.busy then killAll() end
+		if DS.loopSel and not DS.busy and S.Target and alive(S.Target) then killList({ S.Target }) end
+		task.wait(math.max(gap, 0.03))
+	end
+end)
+-- sword reach (client side: bigger handle = bigger hit area)
+local reachOrig = setmetatable({}, { __mode = "k" })
+local function restoreReach()
+	for h, o in pairs(reachOrig) do if h.Parent then h.Size, h.Massless = o.size, o.massless end end
+	table.clear(reachOrig)
+end
+bind(RunService.Heartbeat, function()
+	if not DS.reach then return end
+	local ch = getChar()
+	local tool = ch and ch:FindFirstChildOfClass("Tool")
+	local h = tool and tool:FindFirstChild("Handle")
+	if h and h:IsA("BasePart") then
+		if not reachOrig[h] then reachOrig[h] = { size = h.Size, massless = h.Massless } end
+		h.Size = Vector3.new(DS.reachSize, DS.reachSize, DS.reachSize)
+		h.Massless = true
+	end
+end)
+bind(UIS.InputBegan, function(i, gp)
+	if gp or Live.BindingActive or not Live.Unlocked or i.UserInputType ~= Enum.UserInputType.Keyboard or UIS:GetFocusedTextBox() then return end
+	if DS.key ~= Enum.KeyCode.Unknown and i.KeyCode == DS.key then drop(1)
+	elseif DS.killKey ~= Enum.KeyCode.Unknown and i.KeyCode == DS.killKey then killAll()
+	elseif DS.stopKey ~= Enum.KeyCode.Unknown and i.KeyCode == DS.stopKey then stopAll() notify("Stopped", T.Sub) end
+end)
+bind(LocalPlayer.CharacterAdded, function() task.wait(1.5) if Live.Running then snapshot() end end)
+onUnload(function() stopAll() DS.loop, DS.aura, DS.autoClick, DS.loopAll, DS.loopSel, DS.reach = false, false, false, false, false, false restoreReach() end)
+
+-- ====================================================== UI
+local Slot = Section(BombTab, "Tools & Hotbar", "Which tool is which slot (set these once)", "loot")
+slotRow = InfoRow(Slot, "Slots  ...")
+Button(Slot, "Refresh Slots (unequips your tool)", "Refresh", function()
+	local h = getHum()
+	if h then h:UnequipTools() end
+	task.wait(0.25)
+	snapshot()
+end)
+local SlotOpt = Collapse(Slot, "Settings")
+Slider(SlotOpt, "Bomb Slot", 1, 9, 4, function(v) DS.bombSlot = v end, "dsbombslot")
+Slider(SlotOpt, "Weapon Slot", 1, 9, 5, function(v) DS.weapSlot = v end, "dsweapslot")
+snapshot()
+
+local TgB = Section(BombTab, "Target", "Used by Drop / Bomb on Selected Player - no need to open the Players tab", "players")
+PlayerList(TgB, 130)
+
+local Bomb = Section(BombTab, "Timebomb", "Drop the bomb anywhere with no cooldown", "attack")
+Button(Bomb, "Equip Timebomb", "Equip", function() local t = getBomb() if t then equip(t) else notify("Timebomb not found", T.Warn) end end)
+local dropDd = Dropdown(Bomb, "Drop Where", { "At Mouse", "At Me", "On Selected Player", "On Nearest Player" }, 1, nil, nil, "Pick a spot, then press Drop")
+Button(Bomb, "Drop Bomb", "Drop", function() drop(dropDd.Get()) end)
+Keybind(Bomb, "Drop At Mouse Key  (Backspace = none)", DS.key, function(k) DS.key = k end, true)
+Toggle(Bomb, "Auto Equip Before Dropping", true, function(v) DS.equip = v end, nil, "dsequip")
+Slider(Bomb, "Height Offset", 0, 150, 0, function(v) DS.height = v end, "dsheight")
+
+local Auto = Section(BombTab, "Auto Bomb", "Keeps dropping bombs on a loop", "attack")
+Toggle(Auto, "Auto Bomb Loop", false, function(v) DS.loop = v end, nil, "dsloop")
+Dropdown(Auto, "Drop Target", MODES, DS.mode, function(i) DS.mode = i end)
+Slider(Auto, "Delay (x0.01s)", 3, 200, 25, function(v) DS.delay = v / 100 end, "dsdelay")
+
+local Raid = Section(RaidTab, "Bomb Raids", "Mass bombing sequences (press Stop to cancel)", "attack")
+Toggle(Raid, "Return To Start Afterwards", true, function(v) DS.home = v end, nil, "dshome")
+Button(Raid, "Raid Every Enemy Spawn", "Start", function()
+	runSeq(function(ok)
+		local r = getRoot()
+		if not r then return end
+		local spawns = enemySpawns()
+		if #spawns == 0 then notify("No enemy spawns found", T.Warn) return end
+		local ev = prepBomb()
+		if not ev then return end
+		local home = r.CFrame
+		for i, sp in ipairs(spawns) do
+			if not ok() then break end
+			local root = getRoot()
+			if not root then break end
+			root.CFrame = sp.CFrame + Vector3.new(0, 6, 0)
+			root.AssemblyLinearVelocity = Vector3.zero
+			task.wait(0.15)
+			bombSpam(ev, sp.Position, DS.bombCount, ok)
+		end
+		goHome(home)
+		notify("Spawn raid finished (" .. #spawns .. " spawns)", T.Good)
+	end)
+end)
+Button(Raid, "Bomb Every Enemy Player", "Start", function()
+	runSeq(function(ok)
+		local ev = prepBomb()
+		if not ev then return end
+		local list = enemies()
+		for _, p in ipairs(list) do
+			if not ok() then break end
+			local tr = rootOf(p)
+			if tr then bombSpam(ev, tr.Position, DS.bombCount, ok) end
+		end
+		notify("Bombed " .. #list .. " players", T.Good)
+	end)
+end)
+Button(Raid, "Bomb Selected Player", "Start", function()
+	runSeq(function(ok)
+		local tr = rootOf(S.Target)
+		if not tr then notify("Select a player first", T.Warn) return end
+		local ev = prepBomb()
+		if ev then bombSpam(ev, tr.Position, DS.bombCount, ok) end
+	end)
+end)
+Button(Raid, "Bomb Ring Around Me", "Start", function()
+	runSeq(function(ok)
+		local r = getRoot()
+		if not r then return end
+		local ev = prepBomb()
+		if not ev then return end
+		for i = 1, DS.ringN do
+			if not ok() then break end
+			local a = (i / DS.ringN) * math.pi * 2
+			fireAt(ev, r.Position + Vector3.new(math.cos(a) * DS.ringR, 0, math.sin(a) * DS.ringR))
+			task.wait(math.max(DS.gap, 0.01))
+		end
+	end)
+end)
+Button(Raid, "Carpet Bomb At Mouse", "Start", function()
+	runSeq(function(ok)
+		local hit = LocalPlayer:GetMouse().Hit
+		if not hit then return end
+		local ev = prepBomb()
+		if not ev then return end
+		for x = -DS.carpet, DS.carpet do
+			for z = -DS.carpet, DS.carpet do
+				if not ok() then return end
+				fireAt(ev, hit.Position + Vector3.new(x * DS.spacing, 0, z * DS.spacing))
+				task.wait(math.max(DS.gap, 0.01))
+			end
+		end
+	end)
+end)
+Button(Raid, "Stop Everything", "Stop", function() stopAll() notify("Stopped", T.Sub) end)
+local RaidOpt = Collapse(Raid, "Settings")
+Slider(RaidOpt, "Bombs Per Target", 1, 100, 10, function(v) DS.bombCount = v end, "dsbombcount")
+Slider(RaidOpt, "Gap Between Bombs (x0.01s)", 1, 50, 5, function(v) DS.gap = v / 100 end, "dsgap")
+Slider(RaidOpt, "Ring Radius", 5, 120, 25, function(v) DS.ringR = v end, "dsringr")
+Slider(RaidOpt, "Ring Bombs", 4, 60, 12, function(v) DS.ringN = v end, "dsringn")
+Slider(RaidOpt, "Carpet Size (grid radius)", 1, 6, 2, function(v) DS.carpet = v end, "dscarpet")
+Slider(RaidOpt, "Carpet Spacing", 4, 40, 12, function(v) DS.spacing = v end, "dsspacing")
+
+local TgK = Section(FightTab, "Target", "Used by Kill Selected Player and Loop Kill Selected", "players")
+PlayerList(TgK, 130)
+
+local Kill = Section(FightTab, "Weapon Kill", "Teleports onto each player and spams your weapon until they're dead", "attack")
+Dropdown(Kill, "Weapon To Use", WEAPONS, DS.weapMode, function(i) DS.weapMode = i end)
+Input(Kill, "Tool Name (mode: Tool Name)", "part of the name", "Set", function(text) if text ~= "" then DS.weapName = text notify("Weapon name: " .. text, T.Good) end end)
+Toggle(Kill, "Skip Teammates", true, function(v) DS.skipTeam = v end, nil, "dsskipteam")
+local killDd = Dropdown(Kill, "Kill Who", { "Everyone", "Selected Player", "Nearest Player" }, 1)
+Button(Kill, "Kill", "Kill", function()
+	local i = killDd.Get()
+	if i == 1 then killAll() elseif i == 2 then killSelected() else killNearest() end
+end)
+Button(Kill, "Stop", "Stop", function() stopAll() notify("Stopped", T.Sub) end)
+Toggle(Kill, "Loop Kill Everyone", false, function(v) DS.loopAll = v if not v then stopAll() end end, nil, "dsloopall")
+Toggle(Kill, "Loop Kill Selected Player", false, function(v) DS.loopSel = v if not v then stopAll() end end, nil, "dsloopsel")
+Keybind(Kill, "Kill Everyone Key  (Backspace = none)", DS.killKey, function(k) DS.killKey = k end, true)
+Keybind(Kill, "Stop Key  (Backspace = none)", DS.stopKey, function(k) DS.stopKey = k end, true)
+local KillOpt = Collapse(Kill, "Settings")
+Slider(KillOpt, "Clicks Per Second", 5, 60, 40, function(v) DS.cps = v end, "dscps")
+Slider(KillOpt, "Max Seconds Per Player", 1, 15, 3, function(v) DS.timeout = v end, "dstimeout")
+Slider(KillOpt, "Stand Distance Behind", 1, 10, 3, function(v) DS.dist = v end, "dsdist")
+
+local Assist = Section(FightTab, "Combat Assist", "Hands-free helpers", "aimbot")
+Toggle(Assist, "Kill Aura", false, function(v) DS.aura = v end, nil, "dsaura", "Swing at enemies in range")
+Toggle(Assist, "Auto Click Held Tool", false, function(v) DS.autoClick = v end, nil, "dsautoclick")
+Toggle(Assist, "Weapon Reach", false, function(v) DS.reach = v if not v then restoreReach() end end, nil, "dsreach", "Bigger hit area")
+local AssistOpt = Collapse(Assist, "Settings")
+Slider(AssistOpt, "Aura Range", 5, 60, 20, function(v) DS.auraR = v end, "dsaurar")
+Slider(AssistOpt, "Reach Size", 4, 40, 14, function(v) DS.reachSize = v end, "dsreachsize")
+
+local Sp = Section(RaidTab, "Spawns", "Jump between team spawns", "teleports")
+local spInfo = InfoRow(Sp, "Enemy spawns: press Scan")
+local cache, idx = {}, 0
+Button(Sp, "Scan Enemy Spawns", "Scan", function()
+	cache = enemySpawns()
+	spInfo.Text = "Enemy spawns found: " .. #cache
+end)
+Button(Sp, "Teleport To Next Enemy Spawn", "Go", function()
+	if #cache == 0 then cache = enemySpawns() spInfo.Text = "Enemy spawns found: " .. #cache end
+	if #cache == 0 then notify("No enemy spawns found", T.Warn) return end
+	idx = idx % #cache + 1
+	local r = getRoot()
+	if r then r.CFrame = cache[idx].CFrame + Vector3.new(0, 6, 0) notify("Spawn " .. idx .. " of " .. #cache) end
+end)
+Button(Sp, "Teleport To My Spawn", "Go", function()
+	local r = getRoot()
+	local rl = LocalPlayer.RespawnLocation
+	if not rl then
+		for _, d in ipairs(Workspace:GetDescendants()) do
+			if d:IsA("SpawnLocation") and not d.Neutral and d.TeamColor == LocalPlayer.TeamColor then rl = d break end
+		end
+	end
+	if r and rl then r.CFrame = rl.CFrame + Vector3.new(0, 6, 0) else notify("Couldn't find your spawn", T.Warn) end
+end)
+
+-- ====================================================== extra features (v3.17)
+DS.rainR, DS.orbit, DS.orbitA, DS.loopBombAll, DS.spawnCamp, DS.noTp = 25, false, 0, false, false, false
+DS.stick, DS.dodge, DS.dodgeR, DS.bombEsp, DS.lead, DS.leadT, DS.lineStep = false, false, 20, false, false, 0.25, 8
+local liveBombs, bombHl, lastDodge = {}, {}, 0
+local function isLiveBomb(d)
+	if not (d:IsA("BasePart") or d:IsA("Model")) then return false end
+	if not d.Name:lower():find("bomb", 1, true) then return false end
+	local me, bp = getChar(), LocalPlayer:FindFirstChildOfClass("Backpack")
+	if (me and d:IsDescendantOf(me)) or (bp and d:IsDescendantOf(bp)) then return false end
+	return d:IsDescendantOf(Workspace)
+end
+for _, d in ipairs(Workspace:GetDescendants()) do if isLiveBomb(d) then liveBombs[d] = true end end
+bind(Workspace.DescendantAdded, function(d)
+	if d.Name:lower():find("bomb", 1, true) then
+		task.defer(function() if isLiveBomb(d) then liveBombs[d] = true end end)
+	end
+end)
+local function bombPos(b)
+	if b:IsA("BasePart") then return b.Position end
+	local ok, pv = pcall(function() return b:GetPivot().Position end)
+	return ok and pv or nil
+end
+task.spawn(function() -- bomb ESP + auto dodge
+	while Live.Running do
+		for b in pairs(liveBombs) do
+			if not b.Parent then
+				liveBombs[b] = nil
+				if bombHl[b] then bombHl[b]:Destroy() bombHl[b] = nil end
+			elseif DS.bombEsp and not bombHl[b] then
+				bombHl[b] = new("Highlight", { Adornee = b, FillColor = Color3.fromRGB(255, 70, 70), OutlineColor = Color3.fromRGB(255, 255, 255), FillTransparency = 0.3, DepthMode = Enum.HighlightDepthMode.AlwaysOnTop }, EspGui)
+			end
+		end
+		if not DS.bombEsp then
+			for b, h in pairs(bombHl) do h:Destroy() bombHl[b] = nil end
+		end
+		local r = getRoot()
+		if DS.dodge and r and os.clock() - lastDodge > 0.6 then
+			for b in pairs(liveBombs) do
+				local bp = bombPos(b)
+				if bp and (bp - r.Position).Magnitude <= DS.dodgeR then
+					local away = r.Position - bp
+					away = Vector3.new(away.X, 0, away.Z)
+					away = away.Magnitude > 0.5 and away.Unit or Vector3.new(1, 0, 0)
+					r.CFrame = r.CFrame + away * (DS.dodgeR + 8)
+					r.AssemblyLinearVelocity = Vector3.zero
+					lastDodge = os.clock()
+					break
+				end
+			end
+		end
+		task.wait(0.1)
+	end
+end)
+
+-- bomb patterns
+local function randomIn(radius)
+	local a, d = math.random() * math.pi * 2, math.sqrt(math.random()) * radius
+	return Vector3.new(math.cos(a) * d, 0, math.sin(a) * d)
+end
+local function bombEveryone()
+	runSeq(function(ok)
+		local ev = prepBomb()
+		if not ev then return end
+		for _, p in ipairs(enemies()) do
+			if not ok() then break end
+			local tr = rootOf(p)
+			if tr then bombSpam(ev, tr.Position + tr.AssemblyLinearVelocity * (DS.lead and DS.leadT or 0), DS.bombCount, ok) end
+		end
+	end)
+end
+local function raidSpawns()
+	runSeq(function(ok)
+		local r = getRoot()
+		if not r then return end
+		local spawns = enemySpawns()
+		if #spawns == 0 then notify("No enemy spawns found", T.Warn) return end
+		local ev = prepBomb()
+		if not ev then return end
+		local home = r.CFrame
+		for _, sp in ipairs(spawns) do
+			if not ok() then break end
+			if not DS.noTp then
+				local root = getRoot()
+				if not root then break end
+				root.CFrame = sp.CFrame + Vector3.new(0, 6, 0)
+				root.AssemblyLinearVelocity = Vector3.zero
+				task.wait(0.15)
+			end
+			bombSpam(ev, sp.Position, DS.bombCount, ok)
+		end
+		if not DS.noTp then goHome(home) end
+	end)
+end
+task.spawn(function()
+	while Live.Running do
+		if DS.orbit and not DS.busy then
+			local r, ev = getRoot(), getBomb() and getBomb():FindFirstChild("Fire")
+			if r and ev then
+				DS.orbitA = DS.orbitA + 0.7
+				if DS.equip then equip(getBomb()) end
+				fireAt(ev, r.Position + Vector3.new(math.cos(DS.orbitA) * DS.ringR, 0, math.sin(DS.orbitA) * DS.ringR))
+			end
+		end
+		if DS.loopBombAll and not DS.busy then bombEveryone() end
+		if DS.spawnCamp and not DS.busy then raidSpawns() end
+		if DS.stick and not DS.busy and S.Target and alive(S.Target) then
+			local r, tr = getRoot(), rootOf(S.Target)
+			if r and tr then
+				local back = tr.CFrame * CFrame.new(0, 0, DS.dist)
+				r.CFrame = CFrame.lookAt(back.Position, tr.Position)
+				r.AssemblyLinearVelocity = Vector3.zero
+				swing()
+			end
+		end
+		local w = 0.1
+		if DS.orbit then w = DS.delay end
+		task.wait(math.max(w, 0.05))
+	end
+end)
+onUnload(function()
+	DS.orbit, DS.loopBombAll, DS.spawnCamp, DS.stick, DS.dodge, DS.bombEsp = false, false, false, false, false, false
+	for b, h in pairs(bombHl) do h:Destroy() end
+	table.clear(bombHl)
+end)
+
+-- ---- Bombs tab
+local Pat = Section(BombTab, "Bomb Patterns", "Fancier ways to drop bombs (press Stop in Raids to cancel)", "attack")
+Button(Pat, "Bomb Rain At Mouse", "Start", function()
+	runSeq(function(ok)
+		local hit = LocalPlayer:GetMouse().Hit
+		local ev = hit and prepBomb()
+		if not ev then return end
+		for _ = 1, DS.bombCount do
+			if not ok() then return end
+			fireAt(ev, hit.Position + randomIn(DS.rainR))
+			task.wait(math.max(DS.gap, 0.01))
+		end
+	end)
+end)
+Button(Pat, "Bomb Rain On Selected Player", "Start", function()
+	runSeq(function(ok)
+		local tr = rootOf(S.Target)
+		if not tr then notify("Select a player first", T.Warn) return end
+		local ev = prepBomb()
+		if not ev then return end
+		for _ = 1, DS.bombCount do
+			if not ok() then return end
+			local cur = rootOf(S.Target)
+			if not cur then return end
+			fireAt(ev, cur.Position + randomIn(DS.rainR))
+			task.wait(math.max(DS.gap, 0.01))
+		end
+	end)
+end)
+Button(Pat, "Bomb Line From Me To Mouse", "Start", function()
+	runSeq(function(ok)
+		local r, hit = getRoot(), LocalPlayer:GetMouse().Hit
+		local ev = (r and hit) and prepBomb()
+		if not ev then return end
+		local a, b = r.Position, hit.Position
+		local n = math.max(math.floor((b - a).Magnitude / DS.lineStep), 1)
+		for i = 1, n do
+			if not ok() then return end
+			fireAt(ev, a:Lerp(b, i / n))
+			task.wait(math.max(DS.gap, 0.01))
+		end
+	end)
+end)
+Toggle(Pat, "Bomb Orbit", false, function(v) DS.orbit = v end, nil, "dsorbit", "Bombs circle around me")
+Toggle(Pat, "Loop Bomb Every Enemy", false, function(v) DS.loopBombAll = v if not v then stopAll() end end, nil, "dsloopbombs")
+Toggle(Pat, "Lead Moving Targets", false, function(v) DS.lead = v end, nil, "dslead")
+local PatOpt = Collapse(Pat, "Settings")
+Slider(PatOpt, "Rain Radius", 5, 80, 25, function(v) DS.rainR = v end, "dsrainr")
+Slider(PatOpt, "Line Spacing", 3, 30, 8, function(v) DS.lineStep = v end, "dslinestep")
+Slider(PatOpt, "Lead Time (x0.01s)", 5, 80, 25, function(v) DS.leadT = v / 100 end, "dsleadt")
+
+-- ---- Raids tab
+local Rx = Section(RaidTab, "Spawn Raids+", "More ways to hit the enemy spawns", "teleports")
+Toggle(Rx, "Raid Without Teleporting", false, function(v) DS.noTp = v end, nil, "dsnotp", "Fire from where you stand")
+Toggle(Rx, "Spawn Camp", false, function(v) DS.spawnCamp = v if not v then stopAll() end end, nil, "dsspawncamp", "Repeat spawn raids")
+Button(Rx, "Raid Random Enemy Spawn", "Start", function()
+	runSeq(function(ok)
+		local spawns = enemySpawns()
+		if #spawns == 0 then notify("No enemy spawns found", T.Warn) return end
+		local sp, r = spawns[math.random(#spawns)], getRoot()
+		local ev = r and prepBomb()
+		if not ev then return end
+		local home = r.CFrame
+		if not DS.noTp then r.CFrame = sp.CFrame + Vector3.new(0, 6, 0) task.wait(0.15) end
+		bombSpam(ev, sp.Position, DS.bombCount, ok)
+		if not DS.noTp then goHome(home) end
+	end)
+end)
+Button(Rx, "Bomb Ring Around Selected Player", "Start", function()
+	runSeq(function(ok)
+		local tr = rootOf(S.Target)
+		if not tr then notify("Select a player first", T.Warn) return end
+		local ev = prepBomb()
+		if not ev then return end
+		for i = 1, DS.ringN do
+			if not ok() then break end
+			local a = (i / DS.ringN) * math.pi * 2
+			fireAt(ev, tr.Position + Vector3.new(math.cos(a) * DS.ringR, 0, math.sin(a) * DS.ringR))
+			task.wait(math.max(DS.gap, 0.01))
+		end
+	end)
+end)
+
+-- ---- Fighting tab
+local PRIOS = { "Nearest", "Lowest Health", "Highest Health" }
+local Tg = Section(FightTab, "Targeting", "Who Kill Everyone goes after first", "players")
+Dropdown(Tg, "Kill Order", PRIOS, DS.prio or 1, function(i) DS.prio = i end)
+Button(Tg, "Kill Lowest Health Enemy", "Kill", function()
+	local list = enemies()
+	table.sort(list, function(a, b) return hpOf(a) < hpOf(b) end)
+	if list[1] then killList({ list[1] }) else notify("No enemies found", T.Warn) end
+end)
+Toggle(Tg, "Stick To Selected Player", false, function(v) DS.stick = v end, nil, "dsstick", "Follow + swing")
+
+local Df = Section(FightTab, "Defense", "Stay alive and see the bombs coming (bomb detection is a name-based guess)", "godmode")
+Toggle(Df, "Bomb ESP", false, function(v) DS.bombEsp = v end, nil, "dsbombesp")
+Toggle(Df, "Auto Dodge Bombs", false, function(v) DS.dodge = v end, nil, "dsdodge")
+Slider(Df, "Dodge Trigger Distance", 8, 50, 20, function(v) DS.dodgeR = v end, "dsdodger")
+
+-- ---- Teleports tab
+local Tpd = Section(Tabs["Teleports"], "Doomspire Teleports", "Jump to enemies", "teleports")
+local tpDd = Dropdown(Tpd, "Destination", { "Nearest Enemy", "Above Selected Player", "Random Enemy Spawn" }, 1)
+Button(Tpd, "Teleport", "Go", function()
+	local i, r = tpDd.Get(), getRoot()
+	if i == 1 then
+		local tr = rootOf(enemies()[1])
+		if tr and r then r.CFrame = tr.CFrame * CFrame.new(0, 0, 4) else notify("No enemies found", T.Warn) end
+	elseif i == 2 then
+		local tr = rootOf(S.Target)
+		if tr and r then r.CFrame = tr.CFrame + Vector3.new(0, 15, 0) else notify("Pick a player in the Target list first", T.Warn) end
+	else
+		local spawns = enemySpawns()
+		if #spawns == 0 or not r then notify("No enemy spawns found", T.Warn) return end
+		r.CFrame = spawns[math.random(#spawns)].CFrame + Vector3.new(0, 6, 0)
+	end
+end)

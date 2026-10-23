@@ -1,0 +1,1543 @@
+-- Solos Hub game module: bab.lua  (Build A Boat For Treasure)  -- v2
+-- Loaded by the main hub script (picker -> loadstring). Do not run this file on its own.
+--
+-- Written from memory of how the game is laid out, UNTESTED in game:
+--   stages:  Workspace.BoatStages.NormalStages.CaveStage1 .. CaveStage10   (each has a DarknessPart checkpoint trigger)
+--   finish:  Workspace.BoatStages.NormalStages.TheEnd.GoldenChest.Trigger   (touching it pays out gold, then you respawn)
+-- Gold farm = move your own character through each stage trigger, then the chest, then repeat. The game trusts the client
+-- for where your character is, which is why this style of farm works at all. Every name above is looked up defensively;
+-- if the game changed, the Status row tells you which part it could not find instead of erroring.
+--
+-- v2: farm movement types (Teleport / Tween / Step Hop), speed + easing, presets, noclip, wiggle + touch assist,
+--     stage range, chest-only mode, lap timeout, run/time limits, lap stats, float platform, safe spot, anti-AFK.
+
+local Hub, S, T, C = ...
+local API = Hub.API
+local Live = API.Live -- live values: Live.Running, Live.Unlocked, Live.BindingActive
+local Dropdown, Collapse = API.Dropdown, API.Collapse
+
+local Button = API.Button
+local EspGui = API.EspGui
+local Input = API.Input
+local InfoRow = API.InfoRow
+local copyText = API.copyText
+local LocalPlayer = API.LocalPlayer
+local RunService = API.RunService
+local Section = API.Section
+local Slider = API.Slider
+local TabButtons = API.TabButtons
+local Tabs = API.Tabs
+local Toggle = API.Toggle
+local Workspace = API.Workspace
+local bind = API.bind
+local filterTabs = API.filterTabs
+local getChar = API.getChar
+local getHum = API.getHum
+local getRoot = API.getRoot
+local new = API.new
+local notify = API.notify
+local onUnload = API.onUnload
+
+if game.PlaceId ~= 537413528 then notify("You're not in Build A Boat - this module needs that game", T.Warn) end
+local Panel = Hub.GamePanel("Build A Boat", "autofarm", "Gold farm, movement options and tools.")
+local FarmTab = Panel.Sub("Gold Farm", "autofarm", "Start the farm, pick a preset, watch the numbers.")
+local SetTab = Panel.Sub("Settings", "settings", "Movement type, speed, timing and limits.")
+local ShopTab = Panel.Sub("Shop", "loot", "Buy and open chests, find the game remotes.")
+local ToolsTab = Panel.Sub("Tools", "magnet", "Markers, platforms and quick actions.")
+local HwTab = Panel.Sub("Halloween", "night", "Trick or treat houses - candy with danger escape.")
+Hub.gameHeader("BUILD A BOAT")
+TabButtons["Build A Boat"].Btn.LayoutOrder = -19
+filterTabs({ "Build A Boat", "Dashboard", "Player", "ESP", "Players", "Teleports", "Commands", "Hub Chat", "Theme", "Settings" })
+
+local METHODS = { "Teleport (instant)", "Tween (smooth)", "Step Hop (jumps)" }
+local EASE_NAMES = { "Linear", "Smooth", "Ease Out" }
+local EASE = {
+	function(a) return a end,
+	function(a) return 0.5 - math.cos(a * math.pi) / 2 end,
+	function(a) return 1 - (1 - a) * (1 - a) end,
+}
+
+local B = {
+	token = 0, farming = false,
+	method = 1, speed = 400, ease = 2, lift = 0,
+	stageWait = 2.3, jitter = 0.3, chestWait = 20, settle = 1.5, lapTimeout = 120,
+	startStage = 1, endStage = 10, chestOnly = false,
+	maxRuns = 0, maxMinutes = 0,
+	hold = true, wiggle = false, touchAssist = false, resetIfStuck = true,
+	noclip = true, noclipAlways = false, antiAfk = true,
+	runs = 0, active = 0, mark = nil, startGold = nil,
+	lastLap = nil, bestLap = nil, lapTotal = 0,
+}
+local statusRow, runsRow, lastRow, bestRow, avgRow, goldRow, gainRow, rateRow, perHrRow, timeRow
+local farmToggle
+local methodDd, speedSl, waitSl, jitterSl
+
+-- ---------------------------------------------------- finding things in the map
+local function stageFolder()
+	local bs = Workspace:FindFirstChild("BoatStages")
+	return bs and bs:FindFirstChild("NormalStages")
+end
+local function partOf(inst)
+	if not inst then return nil end
+	if inst:IsA("BasePart") then return inst end
+	return inst:FindFirstChild("DarknessPart") or inst:FindFirstChildWhichIsA("BasePart", true)
+end
+local function stagePart(i)
+	local f = stageFolder()
+	return f and partOf(f:FindFirstChild("CaveStage" .. i))
+end
+local function chestPart()
+	local f = stageFolder()
+	local e = f and f:FindFirstChild("TheEnd")
+	local chest = e and e:FindFirstChild("GoldenChest")
+	if not chest then return nil end
+	return chest:FindFirstChild("Trigger") or chest:FindFirstChildWhichIsA("BasePart", true)
+end
+local function teamZone()
+	local team = LocalPlayer.Team
+	if not team then return nil end
+	local want = team.Name:lower()
+	for _, ch in ipairs(Workspace:GetChildren()) do
+		local n = ch.Name:lower()
+		if n == want .. "zone" or n == want .. "base" then return partOf(ch) end
+	end
+	for _, ch in ipairs(Workspace:GetChildren()) do
+		local n = ch.Name:lower()
+		if n:find(want, 1, true) and n:find("zone", 1, true) then return partOf(ch) end
+	end
+	return nil
+end
+
+-- gold is read from a value object named "Gold" somewhere under the player (leaderstats / Data). Only used for the stats.
+local goldVal
+local function findGold()
+	if goldVal and goldVal.Parent then return goldVal end
+	local ok, v = pcall(function() return LocalPlayer:FindFirstChild("Gold", true) end)
+	if ok and v and v:IsA("ValueBase") then goldVal = v return v end
+	return nil
+end
+local function commas(n)
+	local s = tostring(math.floor(n))
+	local out = s:reverse():gsub("(%d%d%d)", "%1,"):reverse()
+	return (out:gsub("^,", ""))
+end
+local function clock(sec)
+	sec = math.floor(sec)
+	return string.format("%02d:%02d:%02d", math.floor(sec / 3600), math.floor(sec / 60) % 60, sec % 60)
+end
+local function setStatus(text, color)
+	if statusRow then statusRow.Set(text, color) end
+end
+
+-- ---------------------------------------------------- character + movement
+local function alive()
+	local h = getHum()
+	return h ~= nil and h.Health > 0 and getRoot() ~= nil
+end
+local function killChar()
+	local h = getHum()
+	if h then h.Health = 0 end
+end
+
+-- plain teleport used by the Teleports tab (keeps the part's orientation like before)
+local function tpTo(part, lift)
+	local r = getRoot()
+	if not (r and part) then return false end
+	r.CFrame = part.CFrame + Vector3.new(0, lift or 0, 0)
+	r.AssemblyLinearVelocity = Vector3.zero
+	return true
+end
+
+-- keep your own rotation, only change position (so tweening does not tilt the character)
+local function pin(part, up)
+	local r = getRoot()
+	if not (r and part) then return false end
+	r.CFrame = CFrame.new(part.Position + Vector3.new(0, B.lift + (up or 0), 0)) * (r.CFrame - r.CFrame.Position)
+	r.AssemblyLinearVelocity = Vector3.zero
+	return true
+end
+
+-- optional extra: also ask the executor to fire the touch event (does nothing if the executor has no firetouchinterest)
+local function touch(part)
+	local f = API.env.firetouchinterest
+	local r = getRoot()
+	if type(f) == "function" and r and part then
+		pcall(f, r, part, 0)
+		pcall(f, r, part, 1)
+	end
+end
+
+local function mine(my) return Live.Running and B.token == my end
+
+local function waitAlive(my)
+	while mine(my) do
+		if alive() then return true end
+		setStatus("Waiting to respawn", T.Sub)
+		task.wait(0.3)
+	end
+	return false
+end
+
+-- move to a part using the chosen method. how = 1 teleport, 2 tween, 3 step hop. Returns false if interrupted / died.
+local function moveTo(part, my, how)
+	how = how or B.method
+	local r = getRoot()
+	if not (r and part) then return false end
+	local target = part.Position + Vector3.new(0, B.lift, 0)
+	local startPos = r.Position
+	local rot = r.CFrame - r.CFrame.Position
+	local dist = (target - startPos).Magnitude
+	if how == 1 or dist < 1 then
+		r.CFrame = CFrame.new(target) * rot
+		r.AssemblyLinearVelocity = Vector3.zero
+		return true
+	end
+	local speed = math.max(B.speed, 1)
+	if how == 3 then
+		local steps = math.max(1, math.ceil(dist / 40))
+		for i = 1, steps do
+			r = getRoot()
+			if not (mine(my) and r and alive()) then return false end
+			r.CFrame = CFrame.new(startPos:Lerp(target, i / steps)) * rot
+			r.AssemblyLinearVelocity = Vector3.zero
+			task.wait(math.max(40 / speed, 0.03))
+		end
+		return true
+	end
+	local dur = math.max(dist / speed, 0.03)
+	local ease = EASE[B.ease] or EASE[1]
+	local t0 = os.clock()
+	while mine(my) do
+		r = getRoot()
+		if not (r and alive()) then return false end
+		local a = math.min((os.clock() - t0) / dur, 1)
+		r.CFrame = CFrame.new(startPos:Lerp(target, ease(a))) * rot
+		r.AssemblyLinearVelocity = Vector3.zero
+		r.AssemblyAngularVelocity = Vector3.zero
+		if a >= 1 then return true end
+		RunService.Heartbeat:Wait()
+	end
+	return false
+end
+
+-- stay on the part for `seconds` (re-pinning each step so physics can't slide you off the trigger)
+local function stay(part, seconds, my)
+	local untilT = os.clock() + seconds
+	local flip = false
+	while mine(my) and os.clock() < untilT do
+		if not alive() then return false end
+		if B.hold then
+			flip = not flip
+			pin(part, (B.wiggle and flip) and 3 or 0)
+		end
+		if B.touchAssist then touch(part) end
+		task.wait(B.wiggle and 0.25 or 0.1)
+	end
+	return mine(my) and alive()
+end
+
+-- ---------------------------------------------------- the farm
+-- one lap: every stage, then the chest, then wait for the respawn. Returns true when the lap finished.
+local function oneRun(my)
+	if not waitAlive(my) then return false end
+	local f = stageFolder()
+	if not f then setStatus("Stages not found (BoatStages)", T.Bad) return false end
+	local lapStart = os.clock()
+	local function late()
+		if os.clock() - lapStart > B.lapTimeout then
+			setStatus("Lap timed out - resetting", T.Warn)
+			killChar()
+			return true
+		end
+		return false
+	end
+	if not B.chestOnly then
+		local first, last = math.min(B.startStage, B.endStage), math.max(B.startStage, B.endStage)
+		local found = 0
+		for i = first, last do
+			if not mine(my) or late() then return false end
+			local part = stagePart(i)
+			if part then
+				found = found + 1
+				setStatus("Stage " .. i .. " / " .. last, T.Good)
+				if not moveTo(part, my) then return false end
+				if not stay(part, B.stageWait + math.random() * B.jitter, my) then return false end
+			end
+		end
+		if found == 0 then setStatus("No stage triggers found", T.Bad) return false end
+	end
+	local chest = chestPart()
+	if not chest then setStatus("Golden chest not found", T.Bad) return false end
+	setStatus("Opening the chest", T.Warn)
+	local startChar = getChar()
+	if not moveTo(chest, my) then return false end
+	local deadline = os.clock() + B.chestWait
+	local flip = false
+	while mine(my) and os.clock() < deadline and getChar() == startChar do
+		flip = not flip
+		pin(chest, (B.wiggle and flip) and 3 or 0)
+		if B.touchAssist then touch(chest) end
+		task.wait(B.wiggle and 0.25 or 0.2)
+	end
+	if mine(my) and getChar() == startChar and B.resetIfStuck then
+		setStatus("Chest did not respawn you - resetting", T.Warn)
+		killChar()
+	end
+	local tries = 0
+	while mine(my) and tries < 60 and not (getChar() ~= startChar and getRoot() and getHum()) do
+		task.wait(0.3)
+		tries = tries + 1
+	end
+	task.wait(B.settle) -- let the new character settle at spawn
+	return mine(my)
+end
+
+local function elapsedTime()
+	return B.active + (B.mark and (os.clock() - B.mark) or 0)
+end
+
+local function refreshInfo()
+	if not runsRow then return end
+	runsRow.Set(tostring(B.runs))
+	lastRow.Set(B.lastLap and string.format("%.1fs", B.lastLap) or "-")
+	bestRow.Set(B.bestLap and string.format("%.1fs", B.bestLap) or "-")
+	avgRow.Set(B.runs > 0 and string.format("%.1fs", B.lapTotal / B.runs) or "-")
+	local g = findGold()
+	goldRow.Set(g and commas(g.Value) or "not found", g and T.Text or T.Sub)
+	local elapsed = elapsedTime()
+	timeRow.Set(clock(elapsed))
+	perHrRow.Set(elapsed > 60 and string.format("%.1f / hr", B.runs / (elapsed / 3600)) or "measuring...")
+	if g and B.startGold then
+		local gained = g.Value - B.startGold
+		gainRow.Set((gained >= 0 and "+" or "") .. commas(gained), gained > 0 and T.Good or T.Sub)
+		rateRow.Set(elapsed > 60 and (commas(gained / (elapsed / 3600)) .. " / hr") or "measuring...", T.Text)
+	else
+		gainRow.Set("-", T.Sub)
+		rateRow.Set("-", T.Sub)
+	end
+end
+
+local function markStop()
+	if B.mark then
+		B.active = B.active + (os.clock() - B.mark)
+		B.mark = nil
+	end
+end
+
+local function stopFarm()
+	B.token = B.token + 1
+	B.farming = false
+	markStop()
+	setStatus("Idle", T.Sub)
+	if farmToggle then farmToggle.Set(false) end
+end
+
+local function startFarm(limit)
+	B.token = B.token + 1
+	local my = B.token
+	B.farming = true
+	if not B.mark then B.mark = os.clock() end
+	local g = findGold()
+	if g and not B.startGold then B.startGold = g.Value end
+	local cap = limit or B.maxRuns
+	local began = os.clock()
+	local done = 0
+	task.spawn(function()
+		local why = nil
+		while mine(my) do
+			if B.maxMinutes > 0 and os.clock() - began >= B.maxMinutes * 60 then
+				why = "time limit reached"
+				break
+			end
+			local t0 = os.clock()
+			local ok, res = pcall(oneRun, my)
+			if not ok then
+				warn("[SolosHub] Build A Boat farm error: " .. tostring(res))
+				setStatus("Error - retrying", T.Bad)
+				task.wait(2)
+			elseif res then
+				local lap = os.clock() - t0
+				B.runs = B.runs + 1
+				B.lapTotal = B.lapTotal + lap
+				B.lastLap = lap
+				if not B.bestLap or lap < B.bestLap then B.bestLap = lap end
+				done = done + 1
+				refreshInfo()
+				if cap and cap > 0 and done >= cap then
+					if not limit then why = "run limit reached" end
+					break
+				end
+			else
+				task.wait(2) -- missing parts / died: pause before trying again
+			end
+		end
+		if B.token == my then
+			B.farming = false
+			markStop()
+			setStatus(done > 0 and ("Finished " .. done .. " run(s)") or "Idle", T.Sub)
+			if farmToggle then farmToggle.Set(false) end
+			if why then notify("Build A Boat farm stopped: " .. why, T.Warn) end
+		end
+	end)
+end
+
+-- ---------------------------------------------------- presets (they just set the controls below)
+local PRESETS = {
+	{ method = 1, speed = 400, wait = 25, jitter = 3 }, -- Safe
+	{ method = 2, speed = 400, wait = 20, jitter = 3 }, -- Balanced
+	{ method = 2, speed = 900, wait = 13, jitter = 2 }, -- Fast
+}
+local function applyPreset(i)
+	local p = PRESETS[i]
+	if not p then return end
+	methodDd.Set(p.method)
+	speedSl.Set(p.speed)
+	waitSl.Set(p.wait)
+	jitterSl.Set(p.jitter)
+	notify("Preset applied", T.Good)
+end
+
+-- ---------------------------------------------------- UI: Gold Farm
+local Farm = Section(FarmTab, "Gold Farm", "Runs the stages, opens the golden chest, respawns and repeats", "autofarm")
+farmToggle = Toggle(Farm, "Gold Farm", false, function(v)
+	if v then startFarm() else stopFarm() end
+end, nil, "babfarm", "Goes through every stage and the chest on repeat")
+Button(Farm, "Run Once", "Run", function() startFarm(1) if farmToggle then farmToggle.Set(true) end end, nil, "Do a single lap, then stop")
+Button(Farm, "Stop", "Stop", stopFarm)
+Dropdown(Farm, "Preset", { "Safe (teleport, slow)", "Balanced (tween)", "Fast (tween, short waits)" }, 1, function(i) applyPreset(i) end, nil, "Sets movement type, speed and waits in one go")
+
+local Stats = Section(FarmTab, "Session", "Live numbers for this farm session", "info")
+statusRow = Hub.Stat(Stats, "Status", "Idle", T.Sub)
+runsRow = Hub.Stat(Stats, "Runs completed", "0")
+lastRow = Hub.Stat(Stats, "Last lap", "-")
+bestRow = Hub.Stat(Stats, "Best lap", "-")
+avgRow = Hub.Stat(Stats, "Average lap", "-")
+perHrRow = Hub.Stat(Stats, "Runs per hour", "-")
+goldRow = Hub.Stat(Stats, "Gold", "-")
+gainRow = Hub.Stat(Stats, "Gold this session", "-")
+rateRow = Hub.Stat(Stats, "Estimated rate", "-")
+timeRow = Hub.Stat(Stats, "Farm time", "00:00:00")
+Button(Stats, "Reset Session", "Reset", function()
+	B.runs, B.active, B.startGold = 0, 0, nil
+	B.mark = B.farming and os.clock() or nil
+	B.lastLap, B.bestLap, B.lapTotal = nil, nil, 0
+	local g = findGold()
+	if g then B.startGold = g.Value end
+	refreshInfo()
+end, nil, "Zero the runs, laps, time and gold counters")
+
+task.spawn(function()
+	while Live.Running do
+		pcall(refreshInfo)
+		task.wait(1)
+	end
+end)
+
+-- ---------------------------------------------------- UI: Settings
+local Mv = Section(SetTab, "Movement", "How you travel between the stages and the chest", "speed")
+methodDd = Dropdown(Mv, "Farm Type", METHODS, 1, function(i) B.method = i end, nil, "Teleport = instant, Tween = glide at a set speed, Step Hop = short jumps")
+speedSl = Slider(Mv, "Tween / Hop Speed (studs/s)", 50, 1500, 400, function(v) B.speed = v end, "babspeed")
+Dropdown(Mv, "Tween Easing", EASE_NAMES, 2, function(i) B.ease = i end, nil, "Linear is constant speed, Smooth slows at both ends")
+Slider(Mv, "Height Offset (studs)", -10, 20, 0, function(v) B.lift = v end, "babheight")
+Toggle(Mv, "Noclip While Farming", true, function(v) B.noclip = v end, nil, "babnoclip", "Walk through walls and parts so tweening never gets stuck")
+Toggle(Mv, "Hold Position On Triggers", true, function(v) B.hold = v end, nil, "babhold", "Keeps you pinned on the trigger while it registers")
+Toggle(Mv, "Wiggle On Triggers", false, function(v) B.wiggle = v end, nil, "babwiggle", "Bounces in and out of the trigger to re-fire its touch")
+Toggle(Mv, "Executor Touch Assist", false, function(v) B.touchAssist = v end, nil, "babtouch", "Also calls firetouchinterest if your executor has it")
+
+local Tm = Section(SetTab, "Timing", "Waits and safety timeouts", "time")
+waitSl = Slider(Tm, "Wait On Each Stage (x0.1s)", 3, 60, 23, function(v) B.stageWait = v / 10 end, "babstagewait")
+jitterSl = Slider(Tm, "Random Extra Wait (x0.1s)", 0, 30, 3, function(v) B.jitter = v / 10 end, "babjitter")
+Slider(Tm, "Chest Wait (s)", 5, 40, 20, function(v) B.chestWait = v end, "babchestwait")
+Slider(Tm, "Respawn Settle (x0.1s)", 5, 50, 15, function(v) B.settle = v / 10 end, "babsettle")
+Slider(Tm, "Lap Timeout (s)", 30, 300, 120, function(v) B.lapTimeout = v end, "bablaptimeout")
+Toggle(Tm, "Reset If Stuck At Chest", true, function(v) B.resetIfStuck = v end, nil, "babresetstuck", "Resets your character if the chest does not respawn you")
+
+local Rg = Section(SetTab, "Route And Limits", "Which stages to run and when to stop on its own", "lock")
+Slider(Rg, "Start At Stage", 1, 10, 1, function(v) B.startStage = v end, "babstartstage")
+Slider(Rg, "End At Stage", 1, 10, 10, function(v) B.endStage = v end, "babendstage")
+Toggle(Rg, "Chest Only (skip stages)", false, function(v) B.chestOnly = v end, nil, "babchestonly", "Goes straight to the chest - may not pay out if the game checks stages")
+Slider(Rg, "Stop After Runs (0 = never)", 0, 200, 0, function(v) B.maxRuns = v end, "babmaxruns")
+Slider(Rg, "Stop After Minutes (0 = never)", 0, 240, 0, function(v) B.maxMinutes = v end, "babmaxminutes")
+
+-- ---------------------------------------------------- UI: Tools
+local markers = {}
+local function clearMarkers()
+	for _, g in ipairs(markers) do g:Destroy() end
+	table.clear(markers)
+end
+local function addMarker(part, text)
+	local gui = new("BillboardGui", { Adornee = part, AlwaysOnTop = true, Size = UDim2.fromOffset(120, 26), StudsOffset = Vector3.new(0, 8, 0), ResetOnSpawn = false }, EspGui)
+	new("TextLabel", { Size = UDim2.fromScale(1, 1), BackgroundColor3 = Color3.fromRGB(20, 20, 36), BackgroundTransparency = 0.25, Text = text, TextColor3 = Color3.new(1, 1, 1), Font = Enum.Font.GothamBold, TextSize = 13 }, gui)
+	table.insert(markers, gui)
+end
+local Mk = Section(ToolsTab, "Markers", "Labels on the stages, the chest and the team zones", "esp")
+Toggle(Mk, "Stage Markers", false, function(v)
+	clearMarkers()
+	if not v then return end
+	local n = 0
+	for i = 1, 10 do
+		local p = stagePart(i)
+		if p then addMarker(p, "Stage " .. i) n = n + 1 end
+	end
+	local c = chestPart()
+	if c then addMarker(c, "Golden Chest") n = n + 1 end
+	if n == 0 then notify("No stages found - are you in the right game?", T.Warn) end
+end, nil, nil, "Shows where each stage trigger and the chest are")
+local zoneMarkers = {}
+Toggle(Mk, "Team Zone Markers", false, function(v)
+	for _, g in ipairs(zoneMarkers) do g:Destroy() end
+	table.clear(zoneMarkers)
+	if not v then return end
+	for _, ch in ipairs(Workspace:GetChildren()) do
+		if ch.Name:match("Zone$") then
+			local p = partOf(ch)
+			if p then
+				local gui = new("BillboardGui", { Adornee = p, AlwaysOnTop = true, Size = UDim2.fromOffset(120, 26), StudsOffset = Vector3.new(0, 10, 0), ResetOnSpawn = false }, EspGui)
+				new("TextLabel", { Size = UDim2.fromScale(1, 1), BackgroundColor3 = Color3.fromRGB(20, 20, 36), BackgroundTransparency = 0.25, Text = ch.Name, TextColor3 = Color3.new(1, 1, 1), Font = Enum.Font.GothamBold, TextSize = 13 }, gui)
+				table.insert(zoneMarkers, gui)
+			end
+		end
+	end
+	if #zoneMarkers == 0 then notify("No team zones found", T.Warn) end
+end, nil, nil, "Labels every part in Workspace whose name ends in Zone")
+
+-- float platform: an invisible-ish floor that follows you at the height you turned it on (stand on water)
+local floatPart, floatY
+local Mvt = Section(ToolsTab, "Movement Tools", "Platforms and anti-AFK", "player")
+Toggle(Mvt, "Float Platform", false, function(v)
+	if floatPart then floatPart:Destroy() floatPart = nil end
+	if not v then return end
+	local r = getRoot()
+	if not r then notify("No character to float", T.Warn) return end
+	floatY = r.Position.Y - 3.5
+	floatPart = new("Part", { Anchored = true, Size = Vector3.new(14, 1, 14), Transparency = 0.7, Color = T.Accent, Material = Enum.Material.SmoothPlastic, CastShadow = false, CFrame = CFrame.new(r.Position.X, floatY, r.Position.Z) }, Workspace)
+end, nil, nil, "Stand on water or in the air at the height you enabled it")
+bind(RunService.Heartbeat, function()
+	if floatPart and floatPart.Parent then
+		local r = getRoot()
+		if r then floatPart.CFrame = CFrame.new(r.Position.X, floatY, r.Position.Z) end
+	end
+end)
+
+Toggle(Mvt, "Noclip (always)", false, function(v) B.noclipAlways = v end, nil, nil, "Noclip even when the farm is off")
+bind(RunService.Stepped, function()
+	if not (B.noclipAlways or (B.noclip and B.farming)) then return end
+	local c = getChar()
+	if not c then return end
+	for _, p in ipairs(c:GetDescendants()) do
+		if p:IsA("BasePart") then p.CanCollide = false end
+	end
+end)
+
+local VU
+pcall(function() VU = game:GetService("VirtualUser") end)
+Toggle(Mvt, "Anti AFK", true, function(v) B.antiAfk = v end, nil, "babafk", "Stops the idle kick while you farm")
+bind(LocalPlayer.Idled, function()
+	if not (B.antiAfk and VU) then return end
+	pcall(function()
+		VU:CaptureController()
+		VU:ClickButton2(Vector2.new())
+	end)
+end)
+
+local safePart
+local Quick = Section(ToolsTab, "Quick Actions", "One-click helpers", "active")
+Button(Quick, "Safe Spot", "Go", function()
+	stopFarm()
+	local r = getRoot()
+	if not r then notify("No character", T.Warn) return end
+	if not (safePart and safePart.Parent) then
+		safePart = new("Part", { Anchored = true, Size = Vector3.new(30, 2, 30), Position = Vector3.new(r.Position.X, 2500, r.Position.Z), Transparency = 0.5, Color = T.Accent, Material = Enum.Material.SmoothPlastic }, Workspace)
+	end
+	r.CFrame = safePart.CFrame + Vector3.new(0, 4, 0)
+	r.AssemblyLinearVelocity = Vector3.zero
+end, nil, "Stops the farm and parks you on a platform far above the map")
+Button(Quick, "Reset Character", "Reset", killChar, nil, "Respawn at your team base")
+Button(Quick, "Stop Everything", "Stop", function()
+	stopFarm()
+	clearMarkers()
+end, nil, "Stops the farm and removes the stage markers")
+
+-- ---------------------------------------------------- UI: Shop
+-- The shop / chest features call the game's own remotes. The names below are from memory and UNVERIFIED: if a call says
+-- "remote not found", press "Scan Remotes", look at the copied list, and type the real name into the box.
+local RS = game:GetService("ReplicatedStorage")
+local SH = { buyTok = 0, openTok = 0, amount = 1, interval = 1.0, keep = 0 }
+local CHESTS = { "Common Chest", "Uncommon Chest", "Rare Chest", "Epic Chest", "Legendary Chest" }
+local KEYS = { "shop", "buy", "bought", "chest", "open", "claim", "item", "gold", "purchase", "crate", "reward" }
+local itemDd, itemBox, buyBox, openBox
+local shopStatus, remotesRow, shopGoldRow
+
+local function findRemote(name)
+	if not name or name == "" then return nil end
+	for _, root in ipairs({ Workspace, RS }) do
+		local ok, r = pcall(function() return root:FindFirstChild(name, true) end)
+		if ok and r and (r:IsA("RemoteEvent") or r:IsA("RemoteFunction")) then return r end
+	end
+	return nil
+end
+local function callRemote(r, ...)
+	if r:IsA("RemoteFunction") then return pcall(r.InvokeServer, r, ...) end
+	return pcall(r.FireServer, r, ...)
+end
+local function boxText(box, default)
+	if box and box.Text ~= "" then return box.Text end
+	return default
+end
+local function chosenItem()
+	return boxText(itemBox, CHESTS[itemDd.Get()])
+end
+
+local function doBuy()
+	local name = boxText(buyBox, "ItemBoughtFromShop")
+	local r = findRemote(name)
+	if not r then shopStatus.Set("Buy remote not found: " .. name, T.Bad) return false end
+	local g = findGold()
+	if g and g.Value < SH.keep * 100 then shopStatus.Set("Below the gold reserve", T.Warn) return false end
+	local item = chosenItem()
+	local ok = callRemote(r, item, SH.amount)
+	shopStatus.Set(ok and ("Sent buy: " .. item .. " x" .. SH.amount) or "Buy call errored", ok and T.Good or T.Bad)
+	return ok
+end
+local function doOpen()
+	local name = boxText(openBox, "OpenItemRemote")
+	local r = findRemote(name)
+	if not r then shopStatus.Set("Open remote not found: " .. name, T.Bad) return false end
+	local item = chosenItem()
+	local ok = callRemote(r, item, SH.amount)
+	shopStatus.Set(ok and ("Sent open: " .. item .. " x" .. SH.amount) or "Open call errored", ok and T.Good or T.Bad)
+	return ok
+end
+local function runLoop(key, fn)
+	SH[key] = SH[key] + 1
+	local my = SH[key]
+	task.spawn(function()
+		while Live.Running and SH[key] == my do
+			pcall(fn)
+			task.wait(SH.interval)
+		end
+	end)
+end
+
+local Sp = Section(ShopTab, "Chests", "Buy chests with gold and open them", "loot")
+itemDd = Dropdown(Sp, "Chest Type", CHESTS, 1, nil, nil, "Pick one, or type an exact item name below")
+itemBox = Input(Sp, "Custom Item Name", "(optional) exact name", "Set", function() end)
+Slider(Sp, "Amount Per Call", 1, 50, 1, function(v) SH.amount = v end, "babshopamount")
+Button(Sp, "Buy Once", "Buy", doBuy, nil, "Sends one buy request for the chosen item")
+Button(Sp, "Open Once", "Open", doOpen, nil, "Sends one open request for the chosen item")
+Toggle(Sp, "Auto Buy", false, function(v)
+	if v then runLoop("buyTok", doBuy) else SH.buyTok = SH.buyTok + 1 end
+end, nil, nil, "Keeps buying on the interval below (spends your gold)")
+Toggle(Sp, "Auto Open", false, function(v)
+	if v then runLoop("openTok", doOpen) else SH.openTok = SH.openTok + 1 end
+end, nil, nil, "Keeps opening on the interval below")
+Slider(Sp, "Loop Interval (x0.1s)", 2, 100, 10, function(v) SH.interval = v / 10 end, "babshopinterval")
+Slider(Sp, "Keep Gold Reserve (x100)", 0, 1000, 0, function(v) SH.keep = v end, "babshopkeep")
+shopStatus = Hub.Stat(Sp, "Shop status", "Idle", T.Sub)
+shopGoldRow = Hub.Stat(Sp, "Gold", "-")
+
+local Rm = Section(ShopTab, "Remotes", "If a call says remote not found, set the real names here", "info")
+buyBox = Input(Rm, "Buy Remote Name", "ItemBoughtFromShop", "Set", function() end)
+openBox = Input(Rm, "Open Remote Name", "OpenItemRemote", "Set", function() end)
+remotesRow = Hub.Stat(Rm, "Remotes found", "-")
+Button(Rm, "Scan Remotes", "Scan", function()
+	local out = {}
+	for _, root in ipairs({ Workspace, RS }) do
+		for _, d in ipairs(root:GetDescendants()) do
+			if d:IsA("RemoteEvent") or d:IsA("RemoteFunction") then
+				local low = d.Name:lower()
+				for _, k in ipairs(KEYS) do
+					if low:find(k, 1, true) then
+						table.insert(out, d.ClassName .. ": " .. d:GetFullName())
+						break
+					end
+				end
+			end
+		end
+	end
+	remotesRow.Set(tostring(#out))
+	if #out == 0 then notify("No matching remotes found", T.Warn) return end
+	copyText(table.concat(out, "\n"))
+	notify(#out .. " remotes copied to clipboard", T.Good)
+end, nil, "Copies every shop / chest / claim style remote name to your clipboard")
+
+task.spawn(function()
+	while Live.Running do
+		local g = findGold()
+		if shopGoldRow then shopGoldRow.Set(g and commas(g.Value) or "not found", g and T.Text or T.Sub) end
+		task.wait(1)
+	end
+end)
+
+-- ---------------------------------------------------- HALLOWEEN: Trick Or Treat houses (UNTESTED - structure guessed)
+-- Looks for models / parts named like "TrickOrTreatHouse", finds the door (a part named *door*, or wherever a
+-- ProximityPrompt / ClickDetector lives), stands in front of it on a small platform (so you can't fall through the map),
+-- knocks, and leaves. If your health drops while you stand there (a "trick" house) it instantly teleports you to the next
+-- house, or out of the way if there is none. Visited houses are revisited after a wait (default 10s).
+local HWclean
+do
+	local HW = {
+		houses = {}, last = {}, danger = {}, my = nil, onceSet = {},
+		doorWait = 1.0, settle = 0.3, knock = 0.6, stand = 3, hurtPct = 1, escapeOnHurt = true, skipDanger = true,
+		revisit = 10, dangerWait = 60, order = 1, endAt = 1, guard = false, once = false, finished = false,
+		houses_done = 0, hurts = 0, deaths = 0, rounds = 0, markers = {},
+	}
+	local hwStatus, hwDone, hwHurt, hwDeaths, hwRounds, hwCandy, hwFound, hwDanger
+	local houseDd, autoToggle
+
+	local function nameHas(inst, s) return inst.Name:lower():find(s, 1, true) ~= nil end
+	local function running() return HW.my ~= nil and HW.my == B.token and Live.Running end
+
+	-- ---- finding houses
+	local function houseInfo(h)
+		local prompts, clicks, door = {}, {}, nil
+		for _, d in ipairs(h:GetDescendants()) do
+			if d:IsA("ProximityPrompt") then table.insert(prompts, d)
+			elseif d:IsA("ClickDetector") then table.insert(clicks, d) end
+			if not door and nameHas(d, "door") then
+				if d:IsA("BasePart") then door = d
+				elseif d:IsA("Model") then door = d:FindFirstChildWhichIsA("BasePart", true) end
+			end
+		end
+		local function partFor(inst)
+			if not inst then return nil end
+			local p = inst.Parent
+			if p and p:IsA("Attachment") then p = p.Parent end
+			if p and p:IsA("BasePart") then return p end
+			return nil
+		end
+		local target = partFor(prompts[1]) or partFor(clicks[1]) or door
+		if not target then
+			target = h:IsA("BasePart") and h or h.PrimaryPart or h:FindFirstChildWhichIsA("BasePart", true)
+		end
+		return { model = h, target = target, prompts = prompts, clicks = clicks, hasDoor = (door ~= nil) }
+	end
+	local function scanHouses(deep)
+		local found, set = {}, {}
+		local function consider(inst)
+			if (inst:IsA("Model") or inst:IsA("BasePart")) and nameHas(inst, "trickortreathouse") then
+				local p = inst.Parent
+				while p and p ~= Workspace do
+					if set[p] then return end
+					p = p.Parent
+				end
+				set[inst] = true
+				table.insert(found, inst)
+			end
+		end
+		for _, a in ipairs(Workspace:GetChildren()) do
+			consider(a)
+			for _, b in ipairs(a:GetChildren()) do consider(b) end
+		end
+		if #found == 0 and deep then
+			local n = 0
+			for _, d in ipairs(Workspace:GetDescendants()) do
+				n = n + 1
+				if n % 3000 == 0 then task.wait() end
+				consider(d)
+			end
+		end
+		HW.houses = {}
+		for _, h in ipairs(found) do
+			local info = houseInfo(h)
+			if info.target then table.insert(HW.houses, info) end
+		end
+		return #HW.houses
+	end
+
+	local function centerOf(info)
+		if info.model:IsA("Model") then
+			local ok, p = pcall(function() return info.model:GetPivot().Position end)
+			if ok then return p end
+		end
+		return info.target.Position
+	end
+	local function touchBased(info) return #info.prompts == 0 and #info.clicks == 0 end
+	local function standPos(info)
+		local tp = info.target.Position
+		local c = centerOf(info)
+		local dir = Vector3.new(tp.X - c.X, 0, tp.Z - c.Z)
+		if dir.Magnitude < 1 then dir = info.target.CFrame.LookVector * Vector3.new(1, 0, 1) end
+		if dir.Magnitude < 0.1 then dir = Vector3.new(0, 0, -1) end
+		return tp + dir.Unit * (touchBased(info) and 1 or HW.stand)
+	end
+	-- put the position on the real ground so you never spawn inside / under the floor
+	local function landing(info)
+		local p = standPos(info)
+		local rp = RaycastParams.new()
+		rp.FilterType = Enum.RaycastFilterType.Exclude
+		rp.IgnoreWater = true
+		rp.FilterDescendantsInstances = { getChar() }
+		local res = Workspace:Raycast(p + Vector3.new(0, 3, 0), Vector3.new(0, -60, 0), rp)
+		if res then return Vector3.new(p.X, res.Position.Y + 3.2, p.Z) end
+		return p
+	end
+	local function interact(info)
+		local env = API.env
+		local r = getRoot()
+		for _, p in ipairs(info.prompts) do
+			if p.Parent then
+				pcall(function()
+					p.HoldDuration = 0
+					p.RequiresLineOfSight = false
+					p.MaxActivationDistance = math.max(p.MaxActivationDistance, 25)
+				end)
+				if type(env.fireproximityprompt) == "function" then
+					pcall(env.fireproximityprompt, p)
+				else
+					pcall(function() p:InputHoldBegin() task.wait(0.05) p:InputHoldEnd() end)
+				end
+			end
+		end
+		for _, c in ipairs(info.clicks) do
+			if c.Parent and type(env.fireclickdetector) == "function" then pcall(env.fireclickdetector, c) end
+		end
+		if r and info.target and type(env.firetouchinterest) == "function" then
+			pcall(env.firetouchinterest, r, info.target, 0)
+			pcall(env.firetouchinterest, r, info.target, 1)
+		end
+	end
+
+	local function goSafe()
+		local r = getRoot()
+		if not r then return end
+		if not (safePart and safePart.Parent) then
+			safePart = new("Part", { Anchored = true, Size = Vector3.new(30, 2, 30), Position = Vector3.new(r.Position.X, 2500, r.Position.Z), Transparency = 0.5, Color = T.Accent, Material = Enum.Material.SmoothPlastic }, Workspace)
+		end
+		r.CFrame = safePart.CFrame + Vector3.new(0, 4, 0)
+		r.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+	end
+	local function goEnd()
+		if HW.endAt == 1 then
+			goSafe()
+		elseif HW.endAt == 2 then
+			local z = teamZone()
+			if z then pin({ Position = z.Position + Vector3.new(0, 10, 0) }) else goSafe() end
+		end
+	end
+
+	local function candyValue()
+		for _, n in ipairs({ "Candy", "Candies", "Candys", "Treats" }) do
+			local ok, v = pcall(function() return LocalPlayer:FindFirstChild(n, true) end)
+			if ok and v and v:IsA("ValueBase") then return v end
+		end
+		return nil
+	end
+	local function refreshStats()
+		if not hwStatus then return end
+		hwDone.Set(tostring(HW.houses_done))
+		hwHurt.Set(tostring(HW.hurts))
+		hwDeaths.Set(tostring(HW.deaths))
+		hwRounds.Set(tostring(HW.rounds))
+		local c = candyValue()
+		hwCandy.Set(c and tostring(c.Value) or "not found", c and T.Text or T.Sub)
+		local n = 0
+		for _ in pairs(HW.danger) do n = n + 1 end
+		hwDanger.Set(tostring(n), n > 0 and T.Warn or T.Text)
+	end
+
+	-- ---- picking the next house: new houses first, then old ones whose wait is over
+	local function waitFor(info)
+		if HW.danger[info.model] and HW.skipDanger then return HW.dangerWait end
+		return HW.revisit
+	end
+	local function remaining(info)
+		local last = HW.last[info.model]
+		if not last then return 0 end
+		return waitFor(info) - (os.clock() - last)
+	end
+	local function nextHouses(exclude)
+		local list = {}
+		for _, info in ipairs(HW.houses) do
+			if info.model.Parent and info.target.Parent and not (exclude and info.model == exclude.model)
+				and not (HW.once and HW.onceSet[info.model]) and remaining(info) <= 0 then
+				table.insert(list, info)
+			end
+		end
+		local r = getRoot()
+		local here = r and r.Position or Vector3.new(0, 0, 0)
+		table.sort(list, function(a, b)
+			local av, bv = HW.last[a.model] ~= nil, HW.last[b.model] ~= nil
+			if av ~= bv then return not av end -- never-visited houses first
+			if HW.order == 1 then return (a.target.Position - here).Magnitude < (b.target.Position - here).Magnitude end
+			if HW.order == 2 then return a.target.Position.X < b.target.Position.X end
+			return a.target.Position.Z < b.target.Position.Z
+		end)
+		return list
+	end
+	local function soonest()
+		local best
+		for _, info in ipairs(HW.houses) do
+			if info.model.Parent and not (HW.once and HW.onceSet[info.model]) then
+				local rem = remaining(info)
+				if not best or rem < best then best = rem end
+			end
+		end
+		return best
+	end
+
+	-- stand at the door on a platform, knock, watch your health. Returns "ok", "hurt", "died" or "stopped"
+	local function visit(info, my)
+		local fresh = houseInfo(info.model) -- prompts can appear later, so look again right before knocking
+		if fresh.target then info = fresh end
+		local pos = landing(info)
+		local plat = new("Part", { Anchored = true, Size = Vector3.new(8, 1, 8), Transparency = 1, CanCollide = true, CFrame = CFrame.new(pos.X, pos.Y - 3.6, pos.Z) }, Workspace)
+		local function finish(res) plat:Destroy() return res end
+		if not moveTo({ Position = pos }, my) then
+			if not mine(my) then return finish("stopped") end
+			return finish("died")
+		end
+		local hum = getHum()
+		local hp0 = hum and hum.Health or 100
+		local t0 = os.clock()
+		local knockAt = t0 + HW.settle -- let the teleport settle / replicate before knocking (more on laggy servers)
+		local last = nil
+		local untilT = t0 + HW.settle + HW.doorWait
+		while mine(my) and os.clock() < untilT do
+			hum = getHum()
+			local r = getRoot()
+			if not (hum and hum.Health > 0 and r) then return finish("died") end
+			local lost = hp0 - hum.Health
+			if HW.escapeOnHurt and lost >= math.max(hum.MaxHealth, 1) * HW.hurtPct / 100 then return finish("hurt") end
+			if r.Position.Y < pos.Y - 8 or (r.Position - pos).Magnitude > 12 then pin({ Position = pos }) end -- fell / got pushed away
+			pin({ Position = pos })
+			if os.clock() >= knockAt and (not last or os.clock() - last >= HW.knock) then
+				interact(info)
+				last = os.clock()
+			end
+			RunService.Heartbeat:Wait()
+		end
+		if not mine(my) then return finish("stopped") end
+		return finish("ok")
+	end
+
+	-- hurt / trick house: jump (instantly) to the next house, or out of the way if there is none
+	local function escape(my, from)
+		local nxt = nextHouses(from)[1]
+		if nxt then
+			moveTo({ Position = landing(nxt) }, my, 1)
+		else
+			goSafe()
+		end
+	end
+
+	local function handleResult(res, info, my)
+		HW.last[info.model] = os.clock()
+		HW.onceSet[info.model] = true
+		if res == "ok" then
+			HW.houses_done = HW.houses_done + 1
+		elseif res == "hurt" then
+			HW.hurts = HW.hurts + 1
+			HW.danger[info.model] = true
+			setStatus("Trick house - escaping", T.Warn)
+			escape(my, info)
+		elseif res == "died" then
+			HW.deaths = HW.deaths + 1
+			HW.danger[info.model] = true
+			setStatus("Died - respawning", T.Bad)
+			waitAlive(my)
+		end
+		refreshStats()
+	end
+
+	-- keeps running until YOU turn it off. Every spawned house gets visited; when none is ready it parks you out of the way,
+	-- keeps scanning, and goes back to a house once its wait is over (default 10s) or as soon as a brand new one appears.
+	-- ("Run One Round" is the only mode that finishes on its own.)
+	local function runRounds(my)
+		local parked, lastDeep = false, 0
+		HW.onceSet = {}
+		while mine(my) do
+			local ok, err = pcall(function()
+				local deep = os.clock() - lastDeep > 10
+				if deep then lastDeep = os.clock() end
+				local n = scanHouses(deep)
+				hwFound.Set(tostring(n))
+				local info = nextHouses()[1]
+				if info then
+					parked = false
+					setStatus("Knocking (" .. #nextHouses() .. " ready)", T.Good)
+					local res = visit(info, my)
+					if res == "stopped" then return end
+					handleResult(res, info, my)
+					return
+				end
+				if HW.once then
+					HW.finished = true
+					return
+				end
+				if not parked then
+					parked = true
+					HW.rounds = HW.rounds + 1
+					setStatus("No house ready - moving out of the way", T.Sub)
+					goEnd()
+					refreshStats()
+				end
+				local s = soonest()
+				if n == 0 then
+					setStatus("Waiting for a house to appear", T.Sub)
+				elseif s then
+					setStatus("Next house in " .. math.max(math.ceil(s), 0) .. "s", T.Sub)
+				else
+					setStatus("Waiting for the next house", T.Sub)
+				end
+				task.wait(0.5)
+			end)
+			if not ok then
+				warn("[SolosHub] Halloween step error: " .. tostring(err))
+				task.wait(1)
+			end
+			if HW.finished then
+				HW.finished = false
+				goEnd()
+				HW.rounds = HW.rounds + 1
+				refreshStats()
+				setStatus("Round done", T.Sub)
+				return
+			end
+		end
+	end
+
+	local function startJob(fn)
+		stopFarm()
+		B.token = B.token + 1
+		local my = B.token
+		HW.my = my
+		task.spawn(function()
+			local ok, err = pcall(fn, my)
+			if not ok then
+				warn("[SolosHub] Halloween error: " .. tostring(err))
+				setStatus("Error", T.Bad)
+			end
+			if B.token == my then
+				HW.my = nil
+				setStatus("Idle", T.Sub)
+				if autoToggle then autoToggle.Set(false) end
+			end
+		end)
+	end
+
+	-- ---- UI
+	local Hw = Section(HwTab, "Trick Or Treat", "Knocks on every house for candy and leaves if a house hurts you", "night")
+	autoToggle = Toggle(Hw, "Auto Trick Or Treat", false, function(v)
+		if v then
+			HW.once = false
+			startJob(function(my) runRounds(my) end)
+		else
+			stopFarm()
+		end
+	end, nil, nil, "Runs until you turn it off: visits every house, waits out of the way, returns when one is ready")
+	Button(Hw, "Run One Round", "Run", function()
+		HW.once = true
+		startJob(function(my) runRounds(my) end)
+		autoToggle.Set(true)
+	end, nil, "Visit every house once, then leave (the only mode that stops by itself)")
+	Button(Hw, "Stop", "Stop", function() stopFarm() autoToggle.Set(false) end)
+	Button(Hw, "Escape Now (out of the way)", "Go", function() stopFarm() autoToggle.Set(false) goSafe() end, nil, "Instantly teleports you to the safe spot platform")
+
+	local Hs = Section(HwTab, "Session", "Numbers for this event run", "info")
+	hwStatus = statusRow
+	hwFound = Hub.Stat(Hs, "Houses found", "-")
+	hwDone = Hub.Stat(Hs, "Houses visited", "0")
+	hwHurt = Hub.Stat(Hs, "Times hurt (escaped)", "0")
+	hwDeaths = Hub.Stat(Hs, "Deaths", "0")
+	hwDanger = Hub.Stat(Hs, "Dangerous houses remembered", "0")
+	hwRounds = Hub.Stat(Hs, "Times parked (no house ready)", "0")
+	hwCandy = Hub.Stat(Hs, "Candy", "-")
+	Button(Hs, "Clear Danger List", "Clear", function() HW.danger = {} refreshStats() end, nil, "Forget which houses hurt you")
+	Button(Hs, "Reset Counters", "Reset", function()
+		HW.houses_done, HW.hurts, HW.deaths, HW.rounds = 0, 0, 0, 0
+		refreshStats()
+	end)
+
+	local Hh = Section(HwTab, "Houses", "Find the houses and try one by hand", "teleports")
+	houseDd = Dropdown(Hh, "House", { "Press Scan Houses" }, 1)
+	local function rebuildList()
+		local names = {}
+		local r = getRoot()
+		for i, info in ipairs(HW.houses) do
+			local d = r and math.floor((info.target.Position - r.Position).Magnitude) or 0
+			local flags = (#info.prompts > 0 and "prompt") or (#info.clicks > 0 and "click") or (info.hasDoor and "door only" or "no door")
+			names[i] = "House " .. i .. "  -  " .. d .. "m  (" .. flags .. ")" .. (HW.danger[info.model] and "  [hurts]" or "")
+		end
+		if #names == 0 then names = { "No houses found" } end
+		houseDd.SetOptions(names)
+	end
+	Button(Hh, "Scan Houses", "Scan", function()
+		local n = scanHouses(true)
+		hwFound.Set(tostring(n))
+		rebuildList()
+		notify(n > 0 and (n .. " house(s) found") or "No TrickOrTreatHouse found", n > 0 and T.Good or T.Warn)
+	end, nil, "Looks for anything named TrickOrTreatHouse")
+	Button(Hh, "Teleport To Selected House", "Go", function()
+		local info = HW.houses[houseDd.Get()]
+		if not info then notify("Scan houses first", T.Warn) return end
+		pin({ Position = landing(info) })
+	end)
+	Button(Hh, "Knock Selected (with escape)", "Knock", function()
+		local info = HW.houses[houseDd.Get()]
+		if not info then notify("Scan houses first", T.Warn) return end
+		startJob(function(my)
+			setStatus("Knocking", T.Good)
+			handleResult(visit(info, my), info, my)
+		end)
+	end, nil, "Goes to the door, knocks once, escapes if it hurts")
+	Toggle(Hh, "House Markers", false, function(v)
+		for _, g in ipairs(HW.markers) do g:Destroy() end
+		table.clear(HW.markers)
+		if not v then return end
+		if #HW.houses == 0 then scanHouses(true) end
+		for i, info in ipairs(HW.houses) do
+			local gui = new("BillboardGui", { Adornee = info.target, AlwaysOnTop = true, Size = UDim2.fromOffset(110, 24), StudsOffset = Vector3.new(0, 6, 0), ResetOnSpawn = false }, EspGui)
+			new("TextLabel", { Size = UDim2.fromScale(1, 1), BackgroundColor3 = Color3.fromRGB(20, 20, 36), BackgroundTransparency = 0.25, Text = "House " .. i, TextColor3 = Color3.new(1, 1, 1), Font = Enum.Font.GothamBold, TextSize = 13 }, gui)
+			table.insert(HW.markers, gui)
+		end
+	end, nil, nil, "Labels every door")
+
+	-- ---- guard for knocking by hand: if you get hurt next to a house, jump to the next one / out of the way
+	local Hg = Section(HwTab, "Danger Guard", "Protects you even when you knock by hand", "godmode")
+	local lastHp
+	Toggle(Hg, "Danger Guard (manual knocking)", false, function(v) HW.guard = v lastHp = nil end, nil, nil, "Teleports you away the moment a house hurts you")
+	bind(RunService.Heartbeat, function()
+		if not HW.guard or running() then return end
+		local hum, r = getHum(), getRoot()
+		if not (hum and r and hum.Health > 0) then lastHp = nil return end
+		local lost = lastHp and (lastHp - hum.Health) or 0
+		lastHp = hum.Health
+		if lost >= math.max(hum.MaxHealth, 1) * HW.hurtPct / 100 then
+			local near, nd
+			for _, info in ipairs(HW.houses) do
+				if info.target.Parent then
+					local d = (info.target.Position - r.Position).Magnitude
+					if d < 60 and (not nd or d < nd) then near, nd = info, d end
+				end
+			end
+			if near then
+				HW.danger[near.model] = true
+				HW.last[near.model] = os.clock()
+				HW.hurts = HW.hurts + 1
+				local nxt = nextHouses(near)[1]
+				if nxt then pin({ Position = landing(nxt) }) else goSafe() end
+				notify("A house hurt you - moved away", T.Warn)
+				refreshStats()
+			end
+		end
+	end)
+
+	-- ---- settings
+	local Ho = Section(HwTab, "Settings", "How the event farm behaves", "settings")
+	local doorSl, settleSl, knockSl, revisitSl
+	local PRESETS = {
+		{ 8, 1, 4, 8 },    -- fast server
+		{ 10, 3, 6, 10 },  -- normal
+		{ 20, 8, 10, 15 }, -- laggy
+		{ 30, 15, 12, 20 }, -- very laggy
+	}
+	Dropdown(Ho, "Lag Preset", { "Fast server", "Normal", "Laggy server", "Very laggy server" }, 2, function(i)
+		local p = PRESETS[i]
+		if not p then return end
+		doorSl.Set(p[1])
+		settleSl.Set(p[2])
+		knockSl.Set(p[3])
+		revisitSl.Set(p[4])
+		notify("Timing preset applied - fine tune with the sliders below", T.Good)
+	end, nil, "Sets the four waits below in one go")
+	doorSl = Slider(Ho, "Time At Each Door (x0.1s)", 2, 100, 10, function(v) HW.doorWait = v / 10 end, "bhwdoorwait")
+	settleSl = Slider(Ho, "Settle Time Before Knocking (x0.1s)", 0, 50, 3, function(v) HW.settle = v / 10 end, "bhwsettle")
+	knockSl = Slider(Ho, "Time Between Knocks (x0.1s)", 2, 50, 6, function(v) HW.knock = v / 10 end, "bhwknock")
+	revisitSl = Slider(Ho, "Wait Before Returning To A House (s)", 1, 300, 10, function(v) HW.revisit = v end, "bhwrevisit")
+	Input(Ho, "Exact Return Wait (seconds)", "e.g. 7.5", "Set", function(text)
+		local n = tonumber(text)
+		if not n or n < 0 then notify("Type a number of seconds", T.Warn) return end
+		HW.revisit = n
+		revisitSl.SetSilent(math.clamp(math.floor(n + 0.5), 1, 300))
+		notify("Return wait set to " .. n .. "s", T.Good)
+	end)
+	Slider(Ho, "Stand Distance From Door (studs)", 0, 10, 3, function(v) HW.stand = v end, "bhwstand")
+	Slider(Ho, "Escape When Health Drops By (% of max)", 1, 50, 1, function(v) HW.hurtPct = v end, "bhwhurt")
+	Toggle(Ho, "Escape When Hurt", true, function(v) HW.escapeOnHurt = v end, nil, "bhwescape", "Off = stay at the door no matter what (not recommended)")
+	Toggle(Ho, "Wait Longer On Houses That Hurt Me", true, function(v) HW.skipDanger = v end, nil, "bhwskip", "Houses that hurt or killed you are retried after the longer wait below")
+	Slider(Ho, "Wait After A House Hurt Me (s)", 5, 900, 60, function(v) HW.dangerWait = v end, "bhwdangerwait")
+	Dropdown(Ho, "House Order", { "Nearest first", "West to east (X)", "North to south (Z)" }, 1, function(i) HW.order = i end)
+	Dropdown(Ho, "When No House Is Ready", { "Safe spot (high platform)", "My team zone", "Stay where I am" }, 1, function(i) HW.endAt = i end)
+
+	task.spawn(function()
+		while Live.Running do
+			pcall(refreshStats)
+			task.wait(2)
+		end
+	end)
+	HWclean = function()
+		for _, g in ipairs(HW.markers) do g:Destroy() end
+		HW.my = nil
+	end
+end
+
+-- ---------------------------------------------------- LEVERS / BUTTONS / SWITCHES: all on / all off + ESP (UNTESTED - guessed)
+-- Finds anything named like "lever", "button" or "switch" in the Workspace, reads its on/off state from a BoolValue /
+-- attribute (names like On, State, Active, Toggled ...), and only clicks the ones that are NOT already in the state you want.
+-- Ones whose state can't be read are counted as "unknown" and skipped unless you allow clicking them.
+local LVclean
+do
+	local LV = {
+		scope = 1, radius = 150, levers = true, buttons = true, switches = true,
+		clickUnknown = false, walk = false, delay = 0.2,
+		espOn = false, espRange = 300, espDist = true, espItems = {}, cands = {}, scanned = 0,
+	}
+	local KINDS = { { "lever", "Lever" }, { "button", "Button" }, { "switch", "Switch" } }
+	local STATE_NAMES = { on = true, state = true, active = true, activated = true, toggled = true, enabled = true, ison = true, powered = true, pressed = true, status = true }
+	local lvRow
+
+	local function posOf(inst)
+		if inst:IsA("Model") then
+			local ok, p = pcall(function() return inst:GetPivot().Position end)
+			if ok then return p end
+		end
+		return inst.Position
+	end
+	local function partOfInst(inst)
+		if inst:IsA("BasePart") then return inst end
+		return inst.PrimaryPart or inst:FindFirstChildWhichIsA("BasePart", true)
+	end
+	local function kindOf(inst)
+		local n = inst.Name:lower()
+		for _, k in ipairs(KINDS) do
+			if n:find(k[1], 1, true) then return k[1], k[2] end
+		end
+		return nil
+	end
+	local function kindEnabled(k)
+		return (k == "lever" and LV.levers) or (k == "button" and LV.buttons) or (k == "switch" and LV.switches)
+	end
+
+	-- every lever-like thing in the map (yields now and then so big boats don't freeze you)
+	local function scan()
+		local out, set, n = {}, {}, 0
+		local ch = getChar()
+		for _, d in ipairs(Workspace:GetDescendants()) do
+			n = n + 1
+			if n % 3000 == 0 then task.wait() end
+			if (d:IsA("Model") or d:IsA("BasePart")) and not (ch and d:IsDescendantOf(ch)) then
+				local k, label = kindOf(d)
+				if k then
+					local p, inside = d.Parent, false
+					while p and p ~= Workspace do
+						if set[p] then inside = true break end
+						p = p.Parent
+					end
+					if not inside then
+						set[d] = true
+						table.insert(out, { inst = d, kind = k, label = label })
+					end
+				end
+			end
+		end
+		LV.cands = out
+		LV.scanned = os.clock()
+		return out
+	end
+
+	local function readState(inst)
+		for _, d in ipairs(inst:GetDescendants()) do
+			if d:IsA("BoolValue") and STATE_NAMES[d.Name:lower()] then return d.Value end
+		end
+		if inst:IsA("BoolValue") and STATE_NAMES[inst.Name:lower()] then return inst.Value end
+		for k, v in pairs(inst:GetAttributes()) do
+			if type(v) == "boolean" and STATE_NAMES[k:lower()] then return v end
+		end
+		return nil
+	end
+
+	local function inScope(c)
+		if not c.inst.Parent then return false end
+		if LV.scope == 3 then return true end
+		if LV.scope == 2 then
+			local team = LocalPlayer.Team
+			if not team then return true end
+			local tn = team.Name:lower()
+			local p = c.inst.Parent
+			while p and p ~= Workspace do
+				if p.Name:lower():find(tn, 1, true) then return true end
+				p = p.Parent
+			end
+			return false
+		end
+		local r = getRoot()
+		return r ~= nil and (posOf(c.inst) - r.Position).Magnitude <= LV.radius
+	end
+
+	-- press / click / touch it using whatever the block offers
+	local function activate(inst)
+		local env = API.env
+		local did = false
+		for _, d in ipairs(inst:GetDescendants()) do
+			if d:IsA("ClickDetector") and type(env.fireclickdetector) == "function" then
+				pcall(function() d.MaxActivationDistance = 100000 end)
+				pcall(env.fireclickdetector, d)
+				did = true
+			elseif d:IsA("ProximityPrompt") then
+				pcall(function() d.HoldDuration = 0 d.RequiresLineOfSight = false d.MaxActivationDistance = 100000 end)
+				if type(env.fireproximityprompt) == "function" then
+					pcall(env.fireproximityprompt, d)
+				else
+					pcall(function() d:InputHoldBegin() task.wait(0.05) d:InputHoldEnd() end)
+				end
+				did = true
+			end
+		end
+		if not did then
+			for _, d in ipairs(inst:GetDescendants()) do
+				if d:IsA("RemoteEvent") or d:IsA("RemoteFunction") then
+					local n = d.Name:lower()
+					if n:find("click") or n:find("toggle") or n:find("press") or n:find("use") or n:find("activ") or n:find("interact") then
+						if d:IsA("RemoteEvent") then pcall(d.FireServer, d) else task.spawn(function() pcall(d.InvokeServer, d) end) end
+						did = true
+					end
+				end
+			end
+		end
+		if not did then
+			local part, r = partOfInst(inst), getRoot()
+			if part and r and type(env.firetouchinterest) == "function" then
+				pcall(env.firetouchinterest, r, part, 0)
+				pcall(env.firetouchinterest, r, part, 1)
+				did = true
+			end
+		end
+		return did
+	end
+
+	local function startApply(want)
+		stopFarm()
+		B.token = B.token + 1
+		local my = B.token
+		task.spawn(function()
+			local ok, err = pcall(function()
+				if lvRow then lvRow.Text = "Scanning..." end
+				scan()
+				local list = {}
+				for _, c in ipairs(LV.cands) do
+					if kindEnabled(c.kind) and inScope(c) then table.insert(list, c) end
+				end
+				local r0 = getRoot()
+				local here = r0 and r0.Position or Vector3.new(0, 0, 0)
+				table.sort(list, function(a, b) return (posOf(a.inst) - here).Magnitude < (posOf(b.inst) - here).Magnitude end)
+				if #list == 0 then
+					if lvRow then lvRow.Text = "Nothing found in range - raise the radius or change the scope" end
+					return
+				end
+				local home = r0 and r0.CFrame
+				local changed, skipped, unknown, failed = 0, 0, 0, 0
+				for i, c in ipairs(list) do
+					if not mine(my) then break end
+					if c.inst.Parent then
+						local st = readState(c.inst)
+						local act = false
+						if st == nil then
+							unknown = unknown + 1
+							act = LV.clickUnknown
+						elseif st == want then
+							skipped = skipped + 1 -- already how it needs to be
+						else
+							act = true
+						end
+						if act then
+							if LV.walk then moveTo({ Position = posOf(c.inst) + Vector3.new(0, 3, 0) }, my, 1) task.wait(0.15) end
+							local did = activate(c.inst)
+							if not did then
+								failed = failed + 1
+							elseif st ~= nil then
+								local t = os.clock()
+								local now = st
+								while os.clock() - t < 0.5 do
+									now = readState(c.inst)
+									if now == want then break end
+									task.wait(0.05)
+								end
+								if now == want then changed = changed + 1 else failed = failed + 1 end
+							else
+								changed = changed + 1
+							end
+							task.wait(LV.delay)
+						end
+						if lvRow then lvRow.Text = (want and "Turning ON" or "Turning OFF") .. "  " .. i .. " / " .. #list end
+					end
+				end
+				if LV.walk and home then
+					local rr = getRoot()
+					if rr then rr.CFrame = home end
+				end
+				if lvRow then
+					lvRow.Text = string.format("Done: %d changed, %d already right (skipped), %d unknown%s, %d failed", changed, skipped, unknown, LV.clickUnknown and " (clicked)" or " (skipped)", failed)
+				end
+			end)
+			if not ok then
+				warn("[SolosHub] lever error: " .. tostring(err))
+				if lvRow then lvRow.Text = "Error: " .. tostring(err):sub(1, 60) end
+			end
+		end)
+	end
+
+	-- ---- UI
+	local Lv = Section(ToolsTab, "Levers, Buttons And Switches", "Flip everything on or off in one click - ones already how you want are skipped", "active")
+	local scopeDd = Dropdown(Lv, "Which Ones", { "Near me (radius)", "My team's blocks (guess)", "Everything in the map" }, 1, function(i) LV.scope = i end)
+	Slider(Lv, "Radius (studs)", 10, 1000, 150, function(v) LV.radius = v end, "blvradius")
+	Toggle(Lv, "Levers", true, function(v) LV.levers = v end, nil, "blvlevers")
+	Toggle(Lv, "Buttons", true, function(v) LV.buttons = v end, nil, "blvbuttons")
+	Toggle(Lv, "Switches", true, function(v) LV.switches = v end, nil, "blvswitches")
+	Button(Lv, "Turn Everything ON", "ON", function() startApply(true) end, nil, "Only clicks the ones that are currently off")
+	Button(Lv, "Turn Everything OFF", "OFF", function() startApply(false) end, nil, "Only clicks the ones that are currently on")
+	Button(Lv, "Stop", "Stop", function() stopFarm() if lvRow then lvRow.Text = "Stopped" end end)
+	lvRow = InfoRow(Lv, "Ready")
+	local LvOpt = Collapse(Lv, "Options")
+	Toggle(LvOpt, "Click Ones With Unknown State", false, function(v) LV.clickUnknown = v end, nil, "blvunknown", "If a block's on/off state can't be read it is normally skipped. On = click it anyway (may flip it the wrong way)")
+	Toggle(LvOpt, "Walk To Each One", false, function(v) LV.walk = v end, nil, "blvwalk", "Teleports next to each one first, then back to where you were")
+	Slider(LvOpt, "Delay Between Clicks (x0.1s)", 0, 30, 2, function(v) LV.delay = v / 10 end, "blvdelay")
+	Button(Lv, "Scan And Count", "Scan", function()
+		task.spawn(function()
+			lvRow.Text = "Scanning..."
+			scan()
+			local counts, inRange = { lever = 0, button = 0, switch = 0 }, 0
+			local on, off, unk = 0, 0, 0
+			for _, c in ipairs(LV.cands) do
+				counts[c.kind] = counts[c.kind] + 1
+				if inScope(c) and kindEnabled(c.kind) then
+					inRange = inRange + 1
+					local s = readState(c.inst)
+					if s == nil then unk = unk + 1 elseif s then on = on + 1 else off = off + 1 end
+				end
+			end
+			lvRow.Text = string.format("Map: %d levers, %d buttons, %d switches. In range: %d (%d on, %d off, %d unknown)", counts.lever, counts.button, counts.switch, inRange, on, off, unk)
+		end)
+	end, nil, "Counts them and reads their state without clicking anything")
+	Button(Lv, "Copy Nearest One's Structure", "Copy", function()
+		task.spawn(function()
+			scan()
+			local r = getRoot()
+			if not r then return end
+			local best, bd
+			for _, c in ipairs(LV.cands) do
+				local d = (posOf(c.inst) - r.Position).Magnitude
+				if not bd or d < bd then best, bd = c, d end
+			end
+			if not best then notify("No lever / button / switch found", T.Warn) return end
+			local out = { best.inst:GetFullName() .. "   (" .. math.floor(bd) .. " studs away)" }
+			local function dump(inst, depth)
+				if #out > 120 then return end
+				local line = string.rep("  ", depth) .. inst.ClassName .. " " .. inst.Name
+				if inst:IsA("ValueBase") then line = line .. " = " .. tostring(inst.Value) end
+				for k, v in pairs(inst:GetAttributes()) do line = line .. "  [" .. k .. "=" .. tostring(v) .. "]" end
+				table.insert(out, line)
+				for _, c in ipairs(inst:GetChildren()) do dump(c, depth + 1) end
+			end
+			dump(best.inst, 0)
+			copyText(table.concat(out, "\n"))
+			notify("Copied the nearest one's structure - paste it to me so I can fix the detection", T.Good)
+		end)
+	end, nil, "Stand next to a lever and press this, then send me what it copied")
+
+	-- ---- ESP
+	local Le = Section(ToolsTab, "Lever ESP", "Labels every lever, button and switch - green = on, red = off, yellow = unknown", "esp")
+	local function clearEsp()
+		for inst, e in pairs(LV.espItems) do
+			if e.hl then e.hl:Destroy() end
+			if e.gui then e.gui:Destroy() end
+			LV.espItems[inst] = nil
+		end
+	end
+	Toggle(Le, "Lever / Button / Switch ESP", false, function(v)
+		LV.espOn = v
+		if not v then clearEsp() end
+	end, nil, nil, "Outline + label on every one of them")
+	Slider(Le, "ESP Range (studs, 0 = unlimited)", 0, 2000, 300, function(v) LV.espRange = v end, "blvesprange")
+	Toggle(Le, "Show Distance", true, function(v) LV.espDist = v end, nil, "blvespdist")
+	task.spawn(function()
+		while Live.Running do
+			if LV.espOn then
+				pcall(function()
+					if os.clock() - LV.scanned > 5 then scan() end
+					local r = getRoot()
+					local keep, shown = {}, 0
+					local sorted = {}
+					for _, c in ipairs(LV.cands) do
+						if c.inst.Parent and kindEnabled(c.kind) then
+							local d = r and (posOf(c.inst) - r.Position).Magnitude or 0
+							if LV.espRange == 0 or d <= LV.espRange then table.insert(sorted, { c = c, d = d }) end
+						end
+					end
+					table.sort(sorted, function(a, b) return a.d < b.d end)
+					for _, e in ipairs(sorted) do
+						if shown >= 120 then break end
+						shown = shown + 1
+						local c = e.c
+						keep[c.inst] = true
+						local st = readState(c.inst)
+						local col = (st == nil and T.Warn) or (st and T.Good or T.Bad)
+						local item = LV.espItems[c.inst]
+						if not item then
+							local part = partOfInst(c.inst)
+							if part then
+								item = {}
+								item.hl = new("Highlight", { Adornee = c.inst, FillTransparency = 0.6, OutlineColor = Color3.new(1, 1, 1) }, EspGui)
+								item.gui = new("BillboardGui", { Adornee = part, AlwaysOnTop = true, Size = UDim2.fromOffset(150, 22), StudsOffset = Vector3.new(0, 3, 0), ResetOnSpawn = false }, EspGui)
+								item.lbl = new("TextLabel", { Size = UDim2.fromScale(1, 1), BackgroundColor3 = Color3.fromRGB(20, 20, 36), BackgroundTransparency = 0.25, TextColor3 = Color3.new(1, 1, 1), Font = Enum.Font.GothamBold, TextSize = 12 }, item.gui)
+								LV.espItems[c.inst] = item
+							end
+						end
+						if item then
+							item.hl.FillColor = col
+							item.lbl.TextColor3 = col
+							item.lbl.Text = c.label .. (st == nil and "" or (st and "  [ON]" or "  [OFF]")) .. (LV.espDist and ("  " .. math.floor(e.d) .. "m") or "")
+						end
+					end
+					for inst, item in pairs(LV.espItems) do
+						if not keep[inst] then
+							if item.hl then item.hl:Destroy() end
+							if item.gui then item.gui:Destroy() end
+							LV.espItems[inst] = nil
+						end
+					end
+				end)
+			end
+			task.wait(0.5)
+		end
+	end)
+	LVclean = function() clearEsp() end
+end
+
+-- ---------------------------------------------------- Teleports (shared Universal tab)
+local dest = { "Golden Chest", "My Team Zone" }
+for i = 10, 1, -1 do table.insert(dest, 1, "Stage " .. i) end
+local function destPart(i)
+	if i <= 10 then return stagePart(i) end
+	if i == 11 then return chestPart() end
+	return teamZone()
+end
+local Tp = Section(Tabs["Teleports"], "Build A Boat Teleports", "Jump to any stage or the chest", "teleports")
+local tpDd = Dropdown(Tp, "Destination", dest, 1)
+Button(Tp, "Teleport", "Go", function()
+	local i = tpDd.Get()
+	local ok
+	if i <= 10 or i == 11 then
+		ok = tpTo(destPart(i))
+	else
+		ok = tpTo(teamZone(), 10)
+	end
+	if not ok then notify("Couldn't find " .. tpDd.Name() .. " (or you have no character)", T.Warn) end
+end)
+Button(Tp, "Tween There", "Tween", function()
+	local p = destPart(tpDd.Get())
+	if not p then notify("Couldn't find " .. tpDd.Name(), T.Warn) return end
+	task.spawn(function() moveTo(p, B.token, 2) end)
+end, nil, "Glides there at the Tween speed from the Settings tab")
+
+onUnload(function()
+	B.token = B.token + 1
+	SH.buyTok = SH.buyTok + 1
+	SH.openTok = SH.openTok + 1
+	clearMarkers()
+	for _, g in ipairs(zoneMarkers) do g:Destroy() end
+	if floatPart then floatPart:Destroy() end
+	if safePart then safePart:Destroy() end
+	if HWclean then HWclean() end
+	if LVclean then LVclean() end
+end)

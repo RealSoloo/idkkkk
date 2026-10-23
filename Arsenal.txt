@@ -1,0 +1,495 @@
+-- Solos Hub game module: arsenal.lua
+-- Loaded by the main hub script (picker -> loadstring). Do not run this file on its own.
+--
+-- Aimbot / triggerbot / hitbox, ESP (chams, boxes, tracers) and weapon tweaks.
+-- Weapon + ammo tweaks read Arsenal's own value objects (names are best guesses) and are wrapped in pcall.
+
+local Hub, S, T, C = ...
+local API = Hub.API
+local Live = API.Live -- live values: Live.Running, Live.Unlocked, Live.BindingActive
+local Dropdown, Collapse, PlayerList = API.Dropdown, API.Collapse, API.PlayerList
+
+local AddTab = API.AddTab
+local Button = API.Button
+local EspGui = API.EspGui
+local Keybind = API.Keybind
+local LocalPlayer = API.LocalPlayer
+local Players = API.Players
+local RunService = API.RunService
+local Section = API.Section
+local Slider = API.Slider
+local TabButtons = API.TabButtons
+local Tabs = API.Tabs
+local Toggle = API.Toggle
+local UIS = API.UIS
+local Workspace = API.Workspace
+local bind = API.bind
+local cam = API.cam
+local env = API.env
+local filterTabs = API.filterTabs
+local getChar = API.getChar
+local getHum = API.getHum
+local getRoot = API.getRoot
+local new = API.new
+local notify = API.notify
+local onUnload = API.onUnload
+local round = API.round
+local spectate = API.spectate
+local stopSpectate = API.stopSpectate
+
+if game.PlaceId ~= 286090429 then notify("You're not in Arsenal - this module needs that game", T.Warn) end
+local Panel = Hub.GamePanel("Arsenal", "aimbot", "Aimbot, ESP and weapon tweaks.")
+local AimTab = Panel.Sub("Aimbot", "aimbot", "Aim assist, triggerbot and rage options.")
+local EspTab2 = Panel.Sub("ESP", "esp", "See enemies through walls.")
+local WepTab = Panel.Sub("Weapons", "attack", "Weapon mods and movement.")
+Hub.gameHeader("ARSENAL")
+TabButtons["Arsenal"].Btn.LayoutOrder = -19
+filterTabs({ "Arsenal", "Dashboard", "Player", "Visuals", "Players", "Teleports", "Commands", "Hub Chat", "Theme", "Settings" })
+
+local A = {
+	aim = false, mode = 1, key = Enum.KeyCode.E, part = 1, fov = 150, showFov = true, smooth = 0.3, teamCheck = true,
+	wall = true, maxDist = 1500, sticky = false, predict = false, predAmt = 0.1, noFF = true, target = nil,
+	trig = false, trigDelay = 0.05, hit = false, hitPart = 1, hitSize = 8, hitTrans = 0.7,
+	rage = false, rageDist = 4,
+	esp = false, box = true, names = true, health = true, dist = true, held = false, chams = true, tracers = false,
+	showTeam = false, teamColors = false, espMax = 2000, fillT = 0.6, tracerFrom = 1,
+	ammo = false, ammoVal = 999, noRecoil = false, rapid = false, fastReload = false, autoFire = false,
+	customFov = false, fovVal = 90, bhop = false,
+}
+local AIM_PARTS = { "Head", "UpperTorso", "HumanoidRootPart", "Closest" }
+local AIM_MODES = { "Hold Right Mouse", "Hold Key", "Always On" }
+local HB_PARTS = { "Head", "HumanoidRootPart" }
+local mouse = LocalPlayer:GetMouse()
+
+-- ---------------------------------------------------- helpers
+local function rootOf(p) return p and p.Character and p.Character:FindFirstChild("HumanoidRootPart") end
+local function hpOf(p)
+	local h = p and p.Character and p.Character:FindFirstChildOfClass("Humanoid")
+	return h and h.Health or 0, h and h.MaxHealth or 100
+end
+local function alive(p)
+	local h = p and p.Character and p.Character:FindFirstChildOfClass("Humanoid")
+	return h ~= nil and h.Health > 0
+end
+local function isEnemy(p)
+	if p == LocalPlayer then return false end
+	if A.teamCheck and S.SameTeam(p) then return false end
+	return true
+end
+local function shielded(p) return A.noFF and p.Character and p.Character:FindFirstChildOfClass("ForceField") ~= nil end
+local function enemyList()
+	local out = {}
+	for _, p in ipairs(Players:GetPlayers()) do
+		if isEnemy(p) and alive(p) and rootOf(p) and not shielded(p) then table.insert(out, p) end
+	end
+	return out
+end
+local function click()
+	if type(env.mouse1click) == "function" then pcall(env.mouse1click) return end
+	local ch = getChar()
+	local tool = ch and ch:FindFirstChildOfClass("Tool")
+	if tool then pcall(function() tool:Activate() end) end
+end
+
+local rp = RaycastParams.new()
+rp.FilterType = Enum.RaycastFilterType.Exclude
+local function visible(part, ch)
+	local c = cam()
+	rp.FilterDescendantsInstances = { getChar() or c, c }
+	local origin = c.CFrame.Position
+	local res = Workspace:Raycast(origin, part.Position - origin, rp)
+	return res == nil or res.Instance:IsDescendantOf(ch)
+end
+local function aimPartOf(ch, mousePos)
+	local m = A.part
+	if m ~= 4 then
+		return ch:FindFirstChild(AIM_PARTS[m]) or ch:FindFirstChild("Torso") or ch:FindFirstChild("HumanoidRootPart")
+	end
+	local c, best, bestD = cam(), nil, math.huge
+	for _, n in ipairs({ "Head", "UpperTorso", "HumanoidRootPart" }) do
+		local pt = ch:FindFirstChild(n)
+		if pt then
+			local sp = c:WorldToViewportPoint(pt.Position)
+			local d = (Vector2.new(sp.X, sp.Y) - mousePos).Magnitude
+			if d < bestD then best, bestD = pt, d end
+		end
+	end
+	return best
+end
+local function bestTarget()
+	local c, mp, myr = cam(), UIS:GetMouseLocation(), getRoot()
+	local best, bestPart, bestD = nil, nil, A.fov
+	for _, p in ipairs(enemyList()) do
+		local part = aimPartOf(p.Character, mp)
+		if part then
+			local sp, on = c:WorldToViewportPoint(part.Position)
+			if on then
+				local d = (Vector2.new(sp.X, sp.Y) - mp).Magnitude
+				local far = myr and (part.Position - myr.Position).Magnitude > A.maxDist
+				if d < bestD and not far and (not A.wall or visible(part, p.Character)) then best, bestPart, bestD = p, part, d end
+			end
+		end
+	end
+	return best, bestPart
+end
+
+-- ---------------------------------------------------- FOV circle + aim loop
+local fovGui = new("Frame", { AnchorPoint = Vector2.new(0.5, 0.5), BackgroundTransparency = 1, BorderSizePixel = 0, Visible = false }, EspGui)
+round(fovGui, 999)
+local fovStroke = new("UIStroke", { Color = T.Accent, Thickness = 1.5, Transparency = 0.2 }, fovGui)
+local function aimActive()
+	if UIS:GetFocusedTextBox() then return false end
+	if A.mode == 3 then return true end
+	if A.mode == 1 then return UIS:IsMouseButtonPressed(Enum.UserInputType.MouseButton2) end
+	return A.key ~= Enum.KeyCode.Unknown and UIS:IsKeyDown(A.key)
+end
+bind(RunService.RenderStepped, function()
+	local mp = UIS:GetMouseLocation()
+	fovGui.Visible = A.showFov and A.aim
+	fovGui.Size = UDim2.fromOffset(A.fov * 2, A.fov * 2)
+	fovGui.Position = UDim2.fromOffset(mp.X, mp.Y)
+	fovStroke.Color = A.target and T.Good or T.Accent
+	if not A.aim or not aimActive() then A.target = nil return end
+	local c = cam()
+	if not c then return end
+	local part
+	if A.sticky and A.target and alive(A.target) and A.target.Character then
+		part = aimPartOf(A.target.Character, mp)
+		if not part then A.target = nil end
+	end
+	if not part then A.target, part = bestTarget() end
+	if not (A.target and part) then return end
+	local pos = part.Position
+	if A.predict then pos = pos + part.AssemblyLinearVelocity * A.predAmt end
+	c.CFrame = c.CFrame:Lerp(CFrame.lookAt(c.CFrame.Position, pos), math.clamp(A.smooth, 0.01, 1))
+end)
+
+-- ---------------------------------------------------- triggerbot + rage
+task.spawn(function()
+	while Live.Running do
+		if A.trig and not UIS:GetFocusedTextBox() then
+			local t = mouse.Target
+			local m = t and t:FindFirstAncestorOfClass("Model")
+			local p = m and Players:GetPlayerFromCharacter(m)
+			if p and isEnemy(p) and alive(p) and not shielded(p) then
+				click()
+				task.wait(math.max(A.trigDelay, 0.01))
+			end
+		end
+		task.wait()
+	end
+end)
+task.spawn(function() -- rage: teleport behind the nearest enemy, face them and shoot
+	while Live.Running do
+		if A.rage and alive(LocalPlayer) then
+			local r = getRoot()
+			local best, bestD
+			for _, p in ipairs(enemyList()) do
+				local d = r and (rootOf(p).Position - r.Position).Magnitude or math.huge
+				if not bestD or d < bestD then best, bestD = p, d end
+			end
+			local tr = rootOf(best)
+			if r and tr then
+				local back = tr.CFrame * CFrame.new(0, 0, A.rageDist)
+				r.CFrame = CFrame.lookAt(back.Position, tr.Position)
+				r.AssemblyLinearVelocity = Vector3.zero
+				local c = cam()
+				local head = best.Character:FindFirstChild("Head") or tr
+				if c then c.CFrame = CFrame.lookAt(c.CFrame.Position, head.Position) end
+				click()
+			end
+		end
+		task.wait(0.05)
+	end
+end)
+
+-- ---------------------------------------------------- hitbox expander (client side)
+local hbOrig = setmetatable({}, { __mode = "k" })
+local function hbRestore()
+	for part, o in pairs(hbOrig) do
+		if part.Parent then part.Size, part.Transparency, part.CanCollide, part.Massless = o[1], o[2], o[3], o[4] end
+	end
+	table.clear(hbOrig)
+end
+task.spawn(function()
+	while Live.Running do
+		if A.hit then
+			for _, p in ipairs(enemyList()) do
+				local part = p.Character:FindFirstChild(HB_PARTS[A.hitPart])
+				if part and part:IsA("BasePart") then
+					if not hbOrig[part] then hbOrig[part] = { part.Size, part.Transparency, part.CanCollide, part.Massless } end
+					part.Size = Vector3.new(A.hitSize, A.hitSize, A.hitSize)
+					part.Transparency, part.CanCollide, part.Massless = A.hitTrans, false, true
+				end
+			end
+		elseif next(hbOrig) then
+			hbRestore()
+		end
+		task.wait(0.25)
+	end
+end)
+
+-- ---------------------------------------------------- ESP (chams, box, name/health/distance, tracers)
+local objs = {}
+local function killObj(o)
+	for _, k in ipairs({ "hl", "boxGui", "tagGui", "line" }) do if o[k] then o[k]:Destroy() end end
+end
+local function makeObj()
+	local o = {}
+	o.hl = new("Highlight", { DepthMode = Enum.HighlightDepthMode.AlwaysOnTop, Enabled = false }, EspGui)
+	o.boxGui = new("BillboardGui", { Size = UDim2.fromScale(4, 5.6), AlwaysOnTop = true, LightInfluence = 0, Enabled = false }, EspGui)
+	o.boxFrame = new("Frame", { Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, BorderSizePixel = 0 }, o.boxGui)
+	o.stroke = new("UIStroke", { Thickness = 1.5, ApplyStrokeMode = Enum.ApplyStrokeMode.Border }, o.boxFrame)
+	o.hpBack = new("Frame", { Size = UDim2.new(0, 3, 1, 0), Position = UDim2.new(0, -6, 0, 0), BackgroundColor3 = Color3.fromRGB(20, 20, 20), BorderSizePixel = 0 }, o.boxFrame)
+	o.hpFill = new("Frame", { AnchorPoint = Vector2.new(0, 1), Size = UDim2.fromScale(1, 1), Position = UDim2.fromScale(0, 1), BackgroundColor3 = T.Good, BorderSizePixel = 0 }, o.hpBack)
+	o.tagGui = new("BillboardGui", { Size = UDim2.fromOffset(200, 36), StudsOffset = Vector3.new(0, 3.9, 0), AlwaysOnTop = true, LightInfluence = 0, Enabled = false }, EspGui)
+	o.tag = new("TextLabel", { Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, Font = Enum.Font.GothamBold, TextSize = 12, TextStrokeTransparency = 0.4 }, o.tagGui)
+	o.line = new("Frame", { AnchorPoint = Vector2.new(0.5, 0.5), BorderSizePixel = 0, Visible = false }, EspGui)
+	return o
+end
+local function hideObj(o)
+	o.hl.Enabled, o.boxGui.Enabled, o.tagGui.Enabled, o.line.Visible = false, false, false, false
+end
+local function espColor(p)
+	if A.teamColors then
+		local tc = S.TeamColorOf(p)
+		if tc then return tc end
+	end
+	if S.SameTeam(p) then return T.Good end
+	return Color3.fromRGB(255, 70, 70)
+end
+local function updateEsp()
+	local c, myr = cam(), getRoot()
+	local vp = c and c.ViewportSize or Vector2.new(0, 0)
+	for _, p in ipairs(Players:GetPlayers()) do
+		if p ~= LocalPlayer then
+			local o = objs[p]
+			local ch = p.Character
+			local root = ch and ch:FindFirstChild("HumanoidRootPart")
+			local show = A.esp and root and alive(p) and (A.showTeam or not S.SameTeam(p))
+			local dist = (show and myr) and (root.Position - myr.Position).Magnitude or 0
+			if show and dist > A.espMax then show = false end
+			if not show then
+				if o then hideObj(o) end
+			else
+				if not o then o = makeObj() objs[p] = o end
+				local col = espColor(p)
+				o.hl.Adornee, o.hl.FillColor, o.hl.OutlineColor, o.hl.FillTransparency = ch, col, col, A.fillT
+				o.hl.Enabled = A.chams
+				o.boxGui.Adornee, o.stroke.Color = root, col
+				o.boxGui.Enabled = A.box
+				o.hpBack.Visible = A.health
+				local hp, mhp = hpOf(p)
+				local frac = math.clamp(hp / math.max(mhp, 1), 0, 1)
+				o.hpFill.Size = UDim2.fromScale(1, frac)
+				o.hpFill.BackgroundColor3 = Color3.fromRGB(255 * (1 - frac), 255 * frac, 60)
+				o.tagGui.Adornee = root
+				local lines = {}
+				if A.names then table.insert(lines, p.DisplayName) end
+				local info = {}
+				if A.health then table.insert(info, math.floor(hp) .. "hp") end
+				if A.dist then table.insert(info, math.floor(dist) .. "m") end
+				if #info > 0 then table.insert(lines, table.concat(info, "  ")) end
+				if A.held then
+					local tool = ch:FindFirstChildOfClass("Tool")
+					if tool then table.insert(lines, tool.Name) end
+				end
+				o.tag.Text, o.tag.TextColor3 = table.concat(lines, "\n"), col
+				o.tagGui.Enabled = #lines > 0
+				if A.tracers and c then
+					local sp, on = c:WorldToViewportPoint(root.Position)
+					if on then
+						local from = A.tracerFrom == 1 and Vector2.new(vp.X / 2, vp.Y) or Vector2.new(vp.X / 2, vp.Y / 2)
+						local to = Vector2.new(sp.X, sp.Y)
+						local d = to - from
+						o.line.Size = UDim2.fromOffset(d.Magnitude, 1.5)
+						o.line.Position = UDim2.fromOffset((from.X + to.X) / 2, (from.Y + to.Y) / 2)
+						o.line.Rotation = math.deg(math.atan2(d.Y, d.X))
+						o.line.BackgroundColor3 = col
+						o.line.Visible = true
+					else
+						o.line.Visible = false
+					end
+				else
+					o.line.Visible = false
+				end
+			end
+		end
+	end
+	for p, o in pairs(objs) do
+		if not p.Parent then killObj(o) objs[p] = nil end
+	end
+end
+bind(RunService.RenderStepped, function() pcall(updateEsp) end)
+local function clearEsp()
+	for p, o in pairs(objs) do killObj(o) objs[p] = nil end
+end
+
+-- ---------------------------------------------------- weapon tweaks (guessed value names, restored afterwards)
+local wOrig = {}
+local function weaponFolder()
+	local rs = game:GetService("ReplicatedStorage")
+	return rs:FindFirstChild("Weapons")
+end
+local function setWeaponValue(name, value)
+	local f = weaponFolder()
+	if not f then return end
+	for _, w in ipairs(f:GetChildren()) do
+		local v = w:FindFirstChild(name)
+		if v and v:IsA("ValueBase") then
+			if wOrig[v] == nil then wOrig[v] = v.Value end
+			v.Value = value
+		end
+	end
+end
+local function restoreWeaponValue(name)
+	for v, o in pairs(wOrig) do
+		if v.Parent and v.Name == name then v.Value = o wOrig[v] = nil end
+	end
+end
+local function restoreAllWeapons()
+	for v, o in pairs(wOrig) do if v.Parent then v.Value = o end end
+	table.clear(wOrig)
+end
+task.spawn(function()
+	while Live.Running do
+		pcall(function()
+			if A.noRecoil then setWeaponValue("RecoilControl", 0) setWeaponValue("Spread", 0) end
+			if A.rapid then setWeaponValue("FireRate", 0.02) end
+			if A.fastReload then setWeaponValue("ReloadTime", 0.01) setWeaponValue("EquipTime", 0.01) end
+			if A.autoFire then setWeaponValue("Auto", true) end
+			if A.ammo then
+				local gui = LocalPlayer.PlayerGui:FindFirstChild("GUI")
+				local vars = gui and gui:FindFirstChild("Client") and gui.Client:FindFirstChild("Variables")
+				if vars then
+					for _, n in ipairs({ "ammocount", "ammocount2" }) do
+						local v = vars:FindFirstChild(n)
+						if v and v:IsA("ValueBase") then v.Value = A.ammoVal end
+					end
+				end
+			end
+		end)
+		task.wait(0.5)
+	end
+end)
+
+-- ---------------------------------------------------- field of view + bunny hop
+bind(RunService.RenderStepped, function()
+	if A.customFov then local c = cam() if c then c.FieldOfView = A.fovVal end end
+end)
+bind(RunService.Heartbeat, function()
+	if not A.bhop or UIS:GetFocusedTextBox() or not UIS:IsKeyDown(Enum.KeyCode.Space) then return end
+	local h = getHum()
+	if h and h.FloorMaterial ~= Enum.Material.Air then h:ChangeState(Enum.HumanoidStateType.Jumping) end
+end)
+bind(UIS.InputBegan, function(i, gp)
+	if gp or Live.BindingActive or not Live.Unlocked or UIS:GetFocusedTextBox() then return end
+	if i.UserInputType == Enum.UserInputType.Keyboard and A.toggleKey and A.toggleKey ~= Enum.KeyCode.Unknown and i.KeyCode == A.toggleKey then
+		A.aim = not A.aim
+		if A.aimToggle then A.aimToggle.Set(A.aim) end
+		notify("Aimbot " .. (A.aim and "on" or "off"), A.aim and T.Good or T.Sub)
+	end
+end)
+onUnload(function()
+	A.aim, A.trig, A.hit, A.rage, A.esp, A.ammo, A.noRecoil, A.rapid, A.fastReload, A.autoFire, A.customFov, A.bhop = false, false, false, false, false, false, false, false, false, false, false, false
+	hbRestore() restoreAllWeapons() clearEsp()
+	if fovGui then fovGui:Destroy() end
+end)
+
+-- ====================================================== UI : Aimbot tab
+local Aim = Section(AimTab, "Aimbot", "Pulls your camera onto the enemy closest to your crosshair", "aimbot")
+A.aimToggle = Toggle(Aim, "Aimbot", false, function(v) A.aim = v if not v then A.target = nil end end, nil, "arsaim")
+Dropdown(Aim, "Aim Mode", AIM_MODES, A.mode, function(i) A.mode = i end, nil, "How the aimbot is activated")
+Keybind(Aim, "Aim Key (mode: Hold Key)", A.key, function(k) A.key = k end, true)
+Keybind(Aim, "Toggle Aimbot Key  (Backspace = none)", Enum.KeyCode.Unknown, function(k) A.toggleKey = k end, true)
+Dropdown(Aim, "Aim At", AIM_PARTS, A.part, function(i) A.part = i end, nil, "Which body part to lock onto")
+Toggle(Aim, "Sticky Target", false, function(v) A.sticky = v end, nil, "arssticky", "Keep the same enemy")
+Toggle(Aim, "Predict Movement", false, function(v) A.predict = v end, nil, "arspredict")
+local AimOpt = Collapse(Aim, "Settings")
+Slider(AimOpt, "Aim Strength % (100 = snap)", 1, 100, 30, function(v) A.smooth = v / 100 end, "arssmooth")
+Slider(AimOpt, "Prediction Amount (x0.01s)", 1, 40, 10, function(v) A.predAmt = v / 100 end, "arspredamt")
+
+local Fil = Section(AimTab, "Target Filters", "Who the aimbot and triggerbot are allowed to pick", "players")
+Toggle(Fil, "Team Check", true, function(v) A.teamCheck = v end, nil, "arsteam", "Skip teammates")
+Toggle(Fil, "Wall Check", true, function(v) A.wall = v end, nil, "arswall", "Visible only")
+local FilOpt = Collapse(Fil, "Options")
+Toggle(FilOpt, "Ignore Spawn Protection (ForceField)", true, function(v) A.noFF = v end, nil, "arsff")
+Slider(FilOpt, "Max Distance", 50, 3000, 1500, function(v) A.maxDist = v end, "arsmaxdist")
+Toggle(FilOpt, "Show FOV Circle", true, function(v) A.showFov = v end, nil, "arsshowfov")
+Slider(FilOpt, "FOV Circle Size", 20, 500, 150, function(v) A.fov = v end, "arsfov")
+
+local Trig = Section(AimTab, "Triggerbot & Hitbox", "Shoots when an enemy is under the crosshair; bigger enemy hitboxes on your client", "aimbot")
+Toggle(Trig, "Triggerbot", false, function(v) A.trig = v end, nil, "arstrig")
+Toggle(Trig, "Hitbox Expander", false, function(v) A.hit = v if not v then hbRestore() end end, nil, "arshit")
+Dropdown(Trig, "Hitbox Part", HB_PARTS, A.hitPart, function(i) hbRestore() A.hitPart = i end)
+local TrigOpt = Collapse(Trig, "Settings")
+Slider(TrigOpt, "Trigger Delay (x0.01s)", 1, 50, 5, function(v) A.trigDelay = v / 100 end, "arstrigdelay")
+Slider(TrigOpt, "Hitbox Size", 2, 30, 8, function(v) A.hitSize = v end, "arshitsize")
+Slider(TrigOpt, "Hitbox Transparency %", 0, 100, 70, function(v) A.hitTrans = v / 100 end, "arshittrans")
+
+local Rg = Section(AimTab, "Rage", "Teleports behind the nearest enemy and shoots - very obvious, use at your own risk", "godmode")
+Toggle(Rg, "Rage Mode", false, function(v) A.rage = v end, nil, "arsrage", "Tp behind nearest + shoot")
+Slider(Rg, "Distance Behind Enemy", 1, 15, 4, function(v) A.rageDist = v end, "arsragedist")
+
+-- ====================================================== UI : Arsenal ESP tab
+local E = Section(EspTab2, "Player ESP", "See enemies through walls", "esp")
+Toggle(E, "Enable ESP", false, function(v) A.esp = v if not v then clearEsp() end end, nil, "arsesp")
+Dropdown(E, "Tracer Start", { "Bottom", "Center" }, A.tracerFrom, function(i) A.tracerFrom = i end)
+local EOpt = Collapse(E, "Options")
+Toggle(EOpt, "Chams (glow)", true, function(v) A.chams = v end, nil, "arschams")
+Toggle(EOpt, "Boxes", true, function(v) A.box = v end, nil, "arsbox")
+Toggle(EOpt, "Name Tags", true, function(v) A.names = v end, nil, "arsnames")
+Toggle(EOpt, "Health Bar + HP", true, function(v) A.health = v end, nil, "arshealth")
+Toggle(EOpt, "Distance", true, function(v) A.dist = v end, nil, "arsdist")
+Toggle(EOpt, "Held Weapon Name", false, function(v) A.held = v end, nil, "arsheld")
+Toggle(EOpt, "Tracers", false, function(v) A.tracers = v end, nil, "arstracers")
+local Ec = Section(EspTab2, "ESP Options", "Colors and range", "esp")
+Toggle(Ec, "Show Teammates", false, function(v) A.showTeam = v end, nil, "arsshowteam")
+Toggle(Ec, "Use Team Colors", false, function(v) A.teamColors = v end, nil, "arsteamcol")
+local EcOpt = Collapse(Ec, "Settings")
+Slider(EcOpt, "Max ESP Distance", 100, 5000, 2000, function(v) A.espMax = v end, "arsespmax")
+Slider(EcOpt, "Chams Fill Transparency %", 0, 100, 60, function(v) A.fillT = v / 100 end, "arsfillt")
+local Vw = Section(EspTab2, "View", "Camera tweaks", "show")
+Toggle(Vw, "Custom Field Of View", false, function(v) A.customFov = v if not v then local c = cam() if c then c.FieldOfView = 70 end end end, nil, "arscustfov")
+Slider(Vw, "Field Of View", 40, 120, 90, function(v) A.fovVal = v end, "arsfovval")
+
+-- ====================================================== UI : Weapons tab
+local W = Section(WepTab, "Weapon Tweaks", "Edits the game's weapon values on your client - re-equip a weapon after switching a toggle on", "attack")
+Toggle(W, "No Recoil / No Spread", false, function(v) A.noRecoil = v if not v then restoreWeaponValue("RecoilControl") restoreWeaponValue("Spread") end end, nil, "arsnorecoil")
+Toggle(W, "Rapid Fire", false, function(v) A.rapid = v if not v then restoreWeaponValue("FireRate") end end, nil, "arsrapid")
+Button(W, "Restore All Weapon Values", "Restore", function() restoreAllWeapons() notify("Weapon values restored", T.Good) end)
+local WOpt = Collapse(W, "Options")
+Toggle(WOpt, "Fast Reload + Equip", false, function(v) A.fastReload = v if not v then restoreWeaponValue("ReloadTime") restoreWeaponValue("EquipTime") end end, nil, "arsfastreload")
+Toggle(WOpt, "Force Automatic Fire", false, function(v) A.autoFire = v if not v then restoreWeaponValue("Auto") end end, nil, "arsautofire")
+Toggle(WOpt, "Infinite Ammo", false, function(v) A.ammo = v end, nil, "arsammo", "Client counter")
+Slider(WOpt, "Ammo Value", 30, 9999, 999, function(v) A.ammoVal = v end, "arsammoval")
+
+-- ====================================================== extra sections in shared tabs
+local Mv = Section(Tabs["Player"], "Arsenal Movement", "Arsenal only", "player")
+Toggle(Mv, "Bunny Hop", false, function(v) A.bhop = v end, nil, "arsbhop", "Hold Space")
+local Tp = Section(Tabs["Teleports"], "Arsenal Teleports", "Jump to enemies", "teleports")
+local function nearestEnemy()
+	local r, best, bestD = getRoot(), nil, nil
+	for _, p in ipairs(enemyList()) do
+		local d = r and (rootOf(p).Position - r.Position).Magnitude or math.huge
+		if not bestD or d < bestD then best, bestD = p, d end
+	end
+	return best
+end
+local tpDd = Dropdown(Tp, "Action", { "Teleport Behind Nearest Enemy", "Teleport To Random Enemy", "Spectate Nearest Enemy" }, 1)
+Button(Tp, "Run", "Go", function()
+	local i, r = tpDd.Get(), getRoot()
+	if i == 1 then
+		local best = nearestEnemy()
+		local tr = rootOf(best)
+		if r and tr then r.CFrame = CFrame.lookAt((tr.CFrame * CFrame.new(0, 0, 5)).Position, tr.Position) else notify("No enemy found", T.Warn) end
+	elseif i == 2 then
+		local list = enemyList()
+		if #list == 0 or not r then notify("No enemy found", T.Warn) return end
+		r.CFrame = rootOf(list[math.random(#list)]).CFrame * CFrame.new(0, 0, 5)
+	else
+		local best = nearestEnemy()
+		if best then spectate(best) else notify("No enemy found", T.Warn) end
+	end
+end)
+Button(Tp, "Stop Spectating", "Stop", function() stopSpectate() end)
