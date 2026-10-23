@@ -86,10 +86,11 @@ class GuiTests(unittest.TestCase):
         import customtkinter as ctk
         self.root = ctk.CTk()
         self.root.geometry("1440x900")
-        self.workspace = CodeWorkspace(self.root)
+        self.directory = tempfile.TemporaryDirectory()
+        self.workspace = CodeWorkspace(self.root, session_path=Path(self.directory.name) / "workspace.json")
+        self.workspace.new()
         self.workspace.pack(fill="both", expand=True)
         self.root.update()
-        self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
         self.addCleanup(self.close_root)
         self.path = Path(self.directory.name) / "script.lua"
@@ -107,7 +108,8 @@ class GuiTests(unittest.TestCase):
         self.workspace.pack_forget()
         with patch.object(appmod, "CONFIG_PATH", str(self.path.parent / "config.json")):
             app = appmod.App(self.root)
-        app.show_page("Code Workspace")
+        with patch("code_workspace.SESSION_PATH", self.path.parent / "app-workspace.json"):
+            app.show_page("Code Workspace")
         self.root.update()
         tab = app.editor.open_path(self.path)
         self.root.update()
@@ -124,7 +126,7 @@ class GuiTests(unittest.TestCase):
         self.assertTrue(app.conn_strip.winfo_ismapped())
         app.show_page("Code Workspace")
         tab.text.insert("end", "unsaved")
-        with patch("code_workspace.messagebox.askyesnocancel", return_value=None):
+        with patch.object(app.editor, "can_close", return_value=False):
             app.close()
         self.assertTrue(self.root.winfo_exists())
         self.assertTrue(tab.has_changes())
@@ -148,7 +150,7 @@ class GuiTests(unittest.TestCase):
         with patch("code_workspace.messagebox.askyesnocancel", return_value=None):
             ws.close_tab()
             self.assertIn(str(tab.frame), ws.tabs)
-            self.assertFalse(ws.can_close())
+            self.assertTrue(ws.can_close())
         with patch("code_workspace.messagebox.askyesnocancel", return_value=False):
             ws.close_tab()
             self.assertNotIn(str(tab.frame), ws.tabs)
@@ -220,7 +222,7 @@ class GuiTests(unittest.TestCase):
         self.assertTrue(tab.text.tag_ranges("keyword"))
         with patch("code_workspace.messagebox.showinfo"):
             report = self.workspace.check_setup()
-        self.assertIn("editor-3", report)
+        self.assertIn("editor-4", report)
         self.assertIn("Luau color test: PASS", report)
         self.assertIn("Luau error test: PASS", report)
         self.assertNotIn("local x = )", report)
@@ -237,6 +239,101 @@ class GuiTests(unittest.TestCase):
         ws.poll_analysis()
         self.assertTrue(tab.problems)
         self.assertNotIn("unavailable", tab.notice)
+
+    def test_workspace_restart_restores_drafts_and_external_conflicts(self):
+        ws = self.workspace
+        tab = ws.open_path(self.path)
+        tab.text.insert("end", "-- draft")
+        tab.language = "Plain text"
+        tab.text.mark_set("insert", "2.3")
+        draft = ws.new()
+        draft.text.insert("end", "unsaved new script")
+        ws.font_size = 18
+        self.assertTrue(ws.can_close())
+        session_path = ws.session_path
+        self.path.write_text("external change")
+        ws.destroy()
+        restored = CodeWorkspace(self.root, session_path=session_path)
+        restored.pack(fill="both", expand=True)
+        self.workspace = restored
+        tabs = list(restored.tabs.values())
+        file_tab = next(t for t in tabs if t.document.path == self.path)
+        self.assertTrue(file_tab.content().endswith("-- draft"))
+        self.assertEqual(file_tab.language, "Plain text")
+        self.assertEqual(file_tab.text.index("insert"), "2.3")
+        self.assertEqual(restored.active().content(), "unsaved new script")
+        self.assertEqual(restored.font_size, 18)
+        self.assertIn(str(self.path), restored.library_paths)
+        with patch("code_workspace.messagebox.askyesno", return_value=False):
+            self.assertFalse(restored.save(file_tab))
+        self.assertEqual(self.path.read_text(), "external change")
+
+    def test_workspace_switch_keeps_separate_files_and_drafts(self):
+        ws = self.workspace
+        first_name = ws.workspace_name
+        tab = ws.open_path(self.path)
+        tab.text.insert("end", "-- first workspace")
+        ws.session["workspaces"]["LT2"] = {"tabs": [], "files": []}
+        ws.switch_workspace("LT2")
+        self.assertFalse(ws.tabs)
+        self.assertFalse(ws.library_paths)
+        ws.new().text.insert("end", "-- LT2 draft")
+        ws.switch_workspace(first_name)
+        self.assertTrue(any(t.content().endswith("-- first workspace") for t in ws.tabs.values()))
+        self.assertIn(str(self.path), ws.library_paths)
+        ws.switch_workspace("LT2")
+        self.assertEqual(ws.active().content(), "-- LT2 draft")
+        self.assertTrue(ws.can_close())
+
+    def test_closed_tab_stays_in_library_and_discarded_draft_is_removed(self):
+        ws = self.workspace
+        tab = ws.open_path(self.path)
+        tab.text.insert("end", "discard me")
+        with patch("code_workspace.messagebox.askyesnocancel", return_value=False):
+            ws.close_tab()
+        self.assertIn(str(self.path), ws.library_paths)
+        contents = ws.session_path.read_text()
+        self.assertNotIn("discard me", contents)
+        reopened = ws.open_path(self.path)
+        self.assertNotIn("discard me", reopened.content())
+
+    def test_session_write_failure_blocks_exit(self):
+        ws = self.workspace
+        ws.active().text.insert("end", "keep this draft")
+        with patch("code_workspace.os.replace", side_effect=OSError("disk full")), \
+             patch("code_workspace.messagebox.showerror"):
+            self.assertFalse(ws.can_close())
+        self.assertEqual(ws.active().content(), "keep this draft")
+        self.assertIn("could not be saved", ws.session_label.cget("text"))
+
+    def test_corrupt_session_is_preserved(self):
+        path = self.path.parent / "broken.json"
+        path.write_text("not valid json")
+        ws = CodeWorkspace(self.root, session_path=path)
+        ws.new().text.insert("end", "recovered")
+        self.assertTrue(ws.persist_session())
+        backups = list(path.parent.glob("broken.json.unreadable-*"))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(backups[0].read_text(), "not valid json")
+        ws.destroy()
+
+    def test_icon_picker_copies_and_applies_png(self):
+        import run
+        import tkinter as tk
+        run.load("api", "Api")
+        module = run.load("solos_app", "App")
+        icon_path = self.path.parent / "logo.png"
+        image = tk.PhotoImage(master=self.root, width=32, height=32)
+        image.put("#9B87F5", to=(0, 0, 32, 32))
+        image.write(str(icon_path), format="png")
+        with patch.object(module, "CONFIG_PATH", str(self.path.parent / "app-config.json")):
+            app = module.App(self.root)
+            with patch.object(module.filedialog, "askopenfilename", return_value=str(icon_path)):
+                app.choose_app_icon()
+            saved_icon = Path(app.cfg["icon_path"])
+            self.assertEqual(saved_icon.read_bytes(), icon_path.read_bytes())
+            self.assertTrue(hasattr(app, "_icon_image"))
+            self.assertEqual(app.load_config()["icon_path"], str(saved_icon))
 
     def test_large_script(self):
         text = "local example = 'a line of Lua'\n" * 17000

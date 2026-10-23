@@ -1,6 +1,8 @@
 """Local text editing. Documents never use the key API or execute their contents."""
 from bisect import bisect_right
 import ast
+import base64
+import time
 import sys
 import importlib.metadata
 import json
@@ -23,7 +25,8 @@ MUTED = "#9AA3BA"
 PURPLE = "#9B87F5"
 
 
-EDITOR_REVISION = "editor-3"
+EDITOR_REVISION = "editor-4"
+SESSION_PATH = Path.home() / ".solos_code_workspace.json"
 
 LANGUAGES = ["Luau", "Python", "JSON", "JavaScript", "Plain text"]
 COLORS = {
@@ -182,8 +185,8 @@ class EditorTab:
         self.gutter = tk.Canvas(self.frame, width=58, bg=BG, highlightthickness=0)
         self.gutter.grid(row=0, column=0, sticky="ns")
         self.text = tk.Text(self.frame, bg=BG, fg=FG, insertbackground=FG,
-                            selectbackground="#483B73", font=("Consolas", 12),
-                            wrap="none", undo=True, maxundo=200, borderwidth=0,
+                            selectbackground="#483B73", font=("Consolas", workspace.font_size),
+                            wrap="none", height=1, width=1, undo=True, maxundo=200, borderwidth=0,
                             highlightthickness=0, padx=8, pady=10, tabs=(32,))
         self.text.grid(row=0, column=1, sticky="nsew")
         # Handle editor shortcuts before Tk Text's built-in class bindings.
@@ -226,6 +229,7 @@ class EditorTab:
             self.workspace.notebook.tab(self.frame, text=self.title + " *")
             self.draw_lines()
             self.schedule_analysis()
+            self.workspace.schedule_session()
             self.workspace.update_status()
 
     def indent_return(self, event=None):
@@ -298,7 +302,7 @@ class EditorTab:
             if info is None:
                 break
             self.gutter.create_text(48, info[1], anchor="ne", text=index.split(".")[0],
-                                    fill="#FB7185" if any(p[0] == int(index.split(".")[0]) for p in self.problems) else MUTED, font=("Consolas", 11))
+                                    fill="#FB7185" if any(p[0] == int(index.split(".")[0]) for p in self.problems) else MUTED, font=("Consolas", self.workspace.font_size - 1))
             index = self.text.index(index + "+1line")
 
     def has_changes(self):
@@ -306,7 +310,7 @@ class EditorTab:
 
 
 class CodeWorkspace(ctk.CTkFrame):
-    def __init__(self, parent):
+    def __init__(self, parent, session_path=None):
         super().__init__(parent, fg_color="#0B0D14", corner_radius=0)
         self.tabs = {}
         self.counter = 0
@@ -314,53 +318,67 @@ class CodeWorkspace(ctk.CTkFrame):
         self.entries = []
         self.analysis_results = queue.Queue()
         self.closing = False
+        self.restoring = True
+        self.session_job = None
+        self.session_load_error = None
+        self.unrestored_tabs = []
+        self.session_path = Path(session_path) if session_path is not None else SESSION_PATH
+        self.session = self.load_session()
+        self.workspace_name = self.session.get("active", "")
+        if self.workspace_name not in self.session["workspaces"]:
+            self.workspace_name = next(iter(self.session["workspaces"]))
+        self.font_size = self.session.get("font_size", 14)
+        if self.font_size not in (12, 14, 16, 18, 20):
+            self.font_size = 14
         heading = ctk.CTkFrame(self, fg_color="transparent")
         heading.pack(fill="x", padx=24, pady=(16, 8))
-        ctk.CTkLabel(heading, text="Code workspace", font=("Segoe UI", 24, "bold"),
-                     text_color=FG).pack(side="left")
-        ctk.CTkLabel(heading, text="LOCAL WORKSPACE  /  Saved on your computer", text_color=MUTED).pack(side="right")
-        toolbar = ctk.CTkFrame(self, fg_color="transparent")
-        toolbar.pack(fill="x", padx=24, pady=8)
-        for label, command in (("New", self.new), ("Open files", self.open_files),
-                               ("Open folder", self.open_folder), ("Save", self.save),
-                               ("Save as", lambda: self.save(save_as=True)),
-                               ("Save all", self.save_all), ("Close tab", self.close_tab)):
-            ctk.CTkButton(toolbar, text=label, command=command, width=100, height=32,
-                          fg_color=PURPLE if label == "Save" else "#171B28", text_color=BG if label == "Save" else FG,
-                          border_width=1, border_color="#2B3247", hover_color="#483B73").pack(side="left", padx=(0, 8))
-        search = ctk.CTkFrame(self, fg_color="transparent")
-        search.pack(fill="x", padx=24, pady=(0, 8))
-        self.query = ctk.CTkEntry(search, placeholder_text="Find in file  ·  Ctrl+F", width=280,
-                                  fg_color=BG, border_color="#2B3247", text_color=FG)
-        self.query.pack(side="left")
-        self.query.bind("<Return>", lambda e: self.find_next())
-        ctk.CTkButton(search, text="Find next", command=self.find_next, width=100,
-                      fg_color="#241B45").pack(side="left", padx=8)
-        self.find_result = ctk.CTkLabel(search, text="", text_color=MUTED)
-        self.find_result.pack(side="left")
-        self.language_menu = ctk.CTkOptionMenu(search, values=LANGUAGES, command=self.change_language,
-                                              fg_color="#171B28", button_color="#2B3247",
-                                              button_hover_color="#483B73", width=130)
-        self.language_menu.pack(side="right")
-        ctk.CTkLabel(search, text="Language", text_color=MUTED).pack(side="right", padx=12)
-        body = tk.PanedWindow(self, orient="horizontal", bg="#0B0D14", sashwidth=8, bd=0)
-        body.pack(fill="both", expand=True, padx=24)
-        sidebar = ctk.CTkFrame(body, fg_color=BG, corner_radius=12, border_width=1, border_color="#2B3247")
-        ctk.CTkLabel(sidebar, text="EXPLORER", text_color=PURPLE, anchor="w", font=("Segoe UI", 11, "bold")).pack(fill="x", padx=14, pady=(12, 0))
-        self.folder_label = tk.Label(sidebar, text="Open a folder to browse files", bg=BG, fg=MUTED,
-                                     anchor="w", wraplength=210, padx=8, pady=8)
-        self.folder_label.pack(fill="x")
-        actions = tk.Frame(sidebar, bg=BG)
-        actions.pack(fill="x")
-        for label, command in (("↑ Parent", self.parent_folder), ("Refresh", self.refresh_folder)):
-            ctk.CTkButton(actions, text=label, command=command, fg_color="#171B28", hover_color="#483B73", width=90, height=28).pack(side="left", padx=5, pady=5)
-        self.files = tk.Listbox(sidebar, bg=BG, fg=FG, selectbackground="#483B73",
-                               font=("Segoe UI", 12), activestyle="none", selectborderwidth=0,
-                               borderwidth=0, highlightthickness=0, exportselection=False)
-        scrollbar = ctk.CTkScrollbar(sidebar, command=self.files.yview, fg_color=BG, button_color="#333A50")
-        scrollbar.pack(side="right", fill="y")
-        self.files.configure(yscrollcommand=scrollbar.set)
-        self.files.pack(fill="both", expand=True)
+        title_block = ctk.CTkFrame(heading, fg_color="transparent")
+        title_block.pack(side="left")
+        ctk.CTkLabel(title_block, text="YOUR CODE, ORGANIZED", font=("Segoe UI", 11, "bold"),
+                     text_color=PURPLE, anchor="w").pack(anchor="w")
+        self.workspace_title = ctk.CTkLabel(title_block, text=self.workspace_name, font=("Segoe UI", 28, "bold"), text_color=FG)
+        self.workspace_title.pack(anchor="w")
+        self.session_label = ctk.CTkLabel(heading, text="●  Local workspace", text_color="#43D9AC", font=("Segoe UI", 13))
+        self.session_label.pack(side="right", padx=8)
+        body = tk.PanedWindow(self, orient="horizontal", bg="#0B0D14", sashwidth=12, bd=0)
+        body.pack(fill="both", expand=True, padx=24, pady=(12, 0))
+        sidebar = ctk.CTkFrame(body, fg_color="#131722", corner_radius=14, border_width=1, border_color="#2B3247")
+        ctk.CTkLabel(sidebar, text="WORKSPACES", text_color=MUTED, anchor="w", font=("Segoe UI", 11, "bold")).pack(fill="x", padx=18, pady=(16, 8))
+        workspace_holder = ctk.CTkFrame(sidebar, fg_color="transparent", height=150)
+        workspace_holder.pack(fill="x", padx=10)
+        workspace_holder.pack_propagate(False)
+        self.workspace_buttons = ctk.CTkScrollableFrame(workspace_holder, fg_color="transparent", height=110, scrollbar_button_color="#333A50")
+        self.workspace_buttons.pack(fill="both", expand=True)
+        group_actions = ctk.CTkFrame(sidebar, fg_color="transparent")
+        group_actions.pack(fill="x", padx=14, pady=(8, 16))
+        ctk.CTkButton(group_actions, text="+ Workspace", width=120, height=30, fg_color="#302448", hover_color="#483B73", command=self.create_workspace).pack(side="left")
+        ctk.CTkButton(group_actions, text="Rename", width=78, height=30, fg_color="transparent", hover_color="#242038", command=self.rename_workspace).pack(side="right")
+        ctk.CTkFrame(sidebar, height=1, fg_color="#2B3247").pack(fill="x", padx=14)
+        library_bar = ctk.CTkFrame(sidebar, fg_color="transparent")
+        library_bar.pack(fill="x", padx=18, pady=(12, 6))
+        ctk.CTkLabel(library_bar, text="FILES", text_color=MUTED, font=("Segoe UI", 11, "bold")).pack(side="left")
+        ctk.CTkButton(library_bar, text="+ Add", width=64, height=28, fg_color="#241B45", command=self.open_files).pack(side="right")
+        library_frame = tk.Frame(sidebar, bg="#131722")
+        library_frame.pack(fill="both", expand=True, padx=12)
+        self.library = tk.Listbox(library_frame, bg="#131722", fg=FG, selectbackground="#302448", height=7,
+                                 font=("Segoe UI", 12), activestyle="none", bd=0, highlightthickness=0, exportselection=False)
+        library_scroll = ctk.CTkScrollbar(library_frame, command=self.library.yview, height=60, fg_color="#131722", button_color="#333A50")
+        library_scroll.pack(side="right", fill="y")
+        self.library.configure(yscrollcommand=library_scroll.set)
+        self.library.pack(fill="both", expand=True)
+        self.library.bind("<Double-Button-1>", self.open_library)
+        self.library.bind("<Return>", self.open_library)
+        ctk.CTkButton(sidebar, text="Remove selected from workspace", fg_color="transparent", hover_color="#242038", text_color=MUTED, height=26,
+                      command=self.remove_library_file).pack(fill="x", padx=12, pady=(2, 10))
+        self.folder_label = ctk.CTkLabel(sidebar, text="Browse a folder", text_color=MUTED, anchor="w", wraplength=220)
+        self.folder_label.pack(fill="x", padx=16)
+        actions = ctk.CTkFrame(sidebar, fg_color="transparent")
+        actions.pack(fill="x", padx=12, pady=6)
+        for label, command in (("Folder", self.open_folder), ("Up", self.parent_folder), ("Refresh", self.refresh_folder)):
+            ctk.CTkButton(actions, text=label, command=command, fg_color="#1E2333", hover_color="#483B73", width=68, height=28).pack(side="left", padx=2)
+        self.files = tk.Listbox(sidebar, bg="#131722", fg=MUTED, selectbackground="#302448", height=4,
+                               font=("Segoe UI", 11), activestyle="none", bd=0, highlightthickness=0, exportselection=False)
+        self.files.pack(fill="x", padx=16, pady=(0, 14))
         self.files.bind("<Double-Button-1>", self.open_selected)
         self.files.bind("<Return>", self.open_selected)
         style = ttk.Style(self)
@@ -372,7 +390,44 @@ class CodeWorkspace(ctk.CTkFrame):
             ("Notebook.padding", {"side": "top", "sticky": "nswe", "children": [
                 ("Notebook.label", {"side": "top", "sticky": ""})]})]})])
         editor_area = tk.Frame(body, bg=BG)
-        self.notebook = ttk.Notebook(editor_area, style="Code.TNotebook")
+        toolbar = ctk.CTkFrame(editor_area, fg_color="#171B28", corner_radius=0)
+        toolbar.pack(fill="x")
+        for label, command in (("+ New file", self.new), ("Open", self.open_files),
+                               ("Save", self.save), ("Save as", lambda: self.save(save_as=True)),
+                               ("Save all", self.save_all), ("Close tab", self.close_tab)):
+            ctk.CTkButton(toolbar, text=label, command=command, width=82, height=34,
+                          fg_color=PURPLE if label == "Save" else "transparent", text_color=BG if label == "Save" else FG,
+                          hover_color="#483B73", font=("Segoe UI", 13)).pack(side="left", padx=3, pady=10)
+        self.font_menu = ctk.CTkOptionMenu(toolbar, values=["12", "14", "16", "18", "20"], width=66,
+                                         fg_color="#242A3D", button_color="#242A3D", command=self.change_font_size)
+        self.font_menu.set(str(self.font_size))
+        self.font_menu.pack(side="right", padx=12)
+        ctk.CTkLabel(toolbar, text="Text size", text_color=MUTED).pack(side="right")
+        search = ctk.CTkFrame(editor_area, fg_color=BG, corner_radius=0)
+        search.pack(fill="x", pady=(1, 8))
+        self.query = ctk.CTkEntry(search, placeholder_text="Find in file · Ctrl+F", width=260, height=32, fg_color="#131722", border_color="#2B3247")
+        self.query.pack(side="left", padx=(12, 6), pady=8)
+        self.query.bind("<Return>", lambda e: self.find_next())
+        ctk.CTkButton(search, text="Next", width=64, height=30, fg_color="#241B45", command=self.find_next).pack(side="left")
+        self.find_result = ctk.CTkLabel(search, text="", text_color=MUTED)
+        self.find_result.pack(side="left", padx=8)
+        self.language_menu = ctk.CTkOptionMenu(search, values=LANGUAGES, command=self.change_language, width=130,
+                                              fg_color="#171B28", button_color="#242A3D")
+        self.language_menu.pack(side="right", padx=12)
+        self.editor_content = tk.Frame(editor_area, bg=BG)
+        self.editor_content.pack(fill="both", expand=True)
+        self.empty_state = ctk.CTkFrame(self.editor_content, fg_color=BG, corner_radius=0)
+        center = ctk.CTkFrame(self.empty_state, fg_color="transparent")
+        center.place(relx=0.5, rely=0.45, anchor="center")
+        ctk.CTkLabel(center, text="{  }", text_color=PURPLE, font=("Consolas", 42, "bold")).pack(pady=(0, 16))
+        ctk.CTkLabel(center, text="A home for your scripts", text_color=FG, font=("Segoe UI", 24, "bold")).pack()
+        ctk.CTkLabel(center, text="Add files to this workspace or start a new draft.\nYour tabs and drafts will be here when you return.",
+                     text_color=MUTED, font=("Segoe UI", 14), justify="center").pack(pady=(8, 24))
+        ctk.CTkButton(center, text="+ Add files", width=190, height=42, fg_color=PURPLE, text_color=BG,
+                      hover_color="#B49EFF", command=self.open_files).pack()
+        ctk.CTkButton(center, text="Start a blank draft", width=190, height=34, fg_color="transparent",
+                      hover_color="#242038", command=self.new).pack(pady=8)
+        self.notebook = ttk.Notebook(self.editor_content, style="Code.TNotebook")
         self.notebook.pack(fill="both", expand=True)
         problems_panel = ctk.CTkFrame(editor_area, fg_color="#131722", corner_radius=0, height=120)
         problems_panel.pack(fill="x", pady=(1, 0))
@@ -391,11 +446,11 @@ class CodeWorkspace(ctk.CTkFrame):
         self.problem_detail = ctk.CTkLabel(problems_panel, text="", text_color=MUTED, anchor="w",
                                           justify="left", wraplength=680)
         self.problem_detail.pack(fill="x", padx=14, pady=(0, 6))
-        body.add(sidebar, width=230, minsize=160)
+        body.add(sidebar, width=270, minsize=250)
         body.add(editor_area, minsize=400, stretch="always")
-        self.notebook.bind("<<NotebookTabChanged>>", lambda e: self.update_status())
+        self.notebook.bind("<<NotebookTabChanged>>", lambda e: self.tab_changed())
         self.status = ctk.CTkLabel(self, text="", anchor="w", text_color=MUTED)
-        self.status.pack(fill="x", padx=24, pady=8)
+        self.status.pack(side="bottom", fill="x", padx=24, pady=8, before=body)
         self.commands = (("<Control-n>", self.new), ("<Control-o>", self.open_files),
                                   ("<Control-s>", self.save),
                                   ("<Control-Shift-S>", lambda: self.save(save_as=True)),
@@ -403,10 +458,231 @@ class CodeWorkspace(ctk.CTkFrame):
                                   ("<Control-f>", self.query.focus_set))
         for sequence, command in self.commands:
             self.winfo_toplevel().bind(sequence, lambda e, fn=command: self.shortcut(fn), add="+")
-        self.new()
-        self.after(100, self.poll_analysis)
+        self.restore_workspace()
+        self.poll_job = self.after(100, self.poll_analysis)
+
+    def load_session(self):
+        try:
+            data = json.loads(self.session_path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict) or not isinstance(data.get("workspaces"), dict) or not data["workspaces"]:
+                raise ValueError("Invalid workspace file")
+            for name, group in data["workspaces"].items():
+                if not isinstance(name, str) or not isinstance(group, dict):
+                    raise ValueError("Invalid workspace entry")
+                if not isinstance(group.get("tabs", []), list) or not isinstance(group.get("files", []), list):
+                    raise ValueError("Invalid workspace files")
+                if any(not isinstance(item, dict) for item in group.get("tabs", [])):
+                    raise ValueError("Invalid tab record")
+                if any(not isinstance(item, str) for item in group.get("files", [])):
+                    raise ValueError("Invalid file path")
+            return data
+        except FileNotFoundError:
+            return {"active": "My scripts", "workspaces": {"My scripts": {"tabs": [], "files": []}}}
+        except (OSError, ValueError) as error:
+            self.session_load_error = str(error)
+            return {"active": "Recovered workspace", "workspaces": {"Recovered workspace": {"tabs": [], "files": []}}}
+
+    def capture_workspace(self):
+        group = self.session["workspaces"][self.workspace_name]
+        records = []
+        for tab in self.tabs.values():
+            doc = tab.document
+            entry = {"path": str(doc.path) if doc.path else None, "title": tab.title,
+                     "language": tab.language, "cursor": tab.text.index("insert"),
+                     "scroll": tab.text.yview()[0]}
+            if doc.path is None or tab.has_changes():
+                entry["draft"] = tab.content()
+                entry["baseline"] = doc.text
+                entry["encoding"] = doc.encoding
+                entry["bom"] = doc.bom.hex()
+                entry["newline"] = doc.newline
+                entry["original"] = base64.b64encode(doc.original).decode("ascii") if doc.original is not None else None
+            records.append(entry)
+        records.extend(record for record in self.unrestored_tabs
+                       if record.get("path") not in [str(t.document.path) for t in self.tabs.values()])
+        group.update(tabs=records, folder=str(self.folder) if self.folder else None,
+                     selected=list(self.tabs).index(self.notebook.select()) if self.active() else 0)
+        self.session["active"] = self.workspace_name
+        self.session["font_size"] = self.font_size
+
+    def persist_session(self, notify=False):
+        if self.restoring or self.closing:
+            return True
+        if self.session_job:
+            self.after_cancel(self.session_job)
+            self.session_job = None
+        self.capture_workspace()
+        try:
+            if self.session_load_error:
+                # Preserve an unreadable session before creating a new one.
+                backup = self.session_path.with_name(self.session_path.name + ".unreadable-" + str(time.time_ns()))
+                if self.session_path.exists():
+                    self.session_path.rename(backup)
+                self.session_load_error = None
+            self.session_path.parent.mkdir(parents=True, exist_ok=True)
+            Document().save(json.dumps(self.session, ensure_ascii=True), self.session_path, overwrite=True)
+            self.session_label.configure(text="●  Workspace saved locally", text_color="#43D9AC")
+            return True
+        except (OSError, ValueError) as error:
+            self.session_label.configure(text="Workspace could not be saved", text_color="#FB7185")
+            if notify:
+                messagebox.showerror("Workspace not saved", "Your tabs are still open. Save your files before exiting.\n\n" + str(error), parent=self)
+            return False
+
+    def schedule_session(self):
+        if self.restoring or self.closing:
+            return
+        self.session_label.configure(text="Saving workspace…", text_color=MUTED)
+        if self.session_job:
+            self.after_cancel(self.session_job)
+        self.session_job = self.after(800, self.persist_session)
+
+    def restore_workspace(self):
+        self.restoring = True
+        group = self.session["workspaces"][self.workspace_name]
+        self.folder = Path(group["folder"]) if group.get("folder") else None
+        missing = []
+        self.unrestored_tabs = []
+        for record in group.get("tabs", []):
+            try:
+                path = Path(record["path"]) if record.get("path") else None
+                if "draft" in record:
+                    original = base64.b64decode(record["original"]) if record.get("original") is not None else None
+                    doc = Document(path, record.get("baseline", ""), record.get("encoding", "utf-8"),
+                                   bytes.fromhex(record.get("bom", "")), record.get("newline", "\n"), original)
+                elif path:
+                    doc = Document.open(path)
+                else:
+                    doc = Document()
+                title = record.get("title") or (path.name if path else "Untitled")
+                tab = EditorTab(self, doc, title)
+                self.tabs[str(tab.frame)] = tab
+                if "draft" in record:
+                    tab.text.delete("1.0", "end")
+                    tab.text.insert("1.0", record["draft"])
+                    tab.text.edit_reset()
+                    tab.dirty = tab.has_changes()
+                    self.notebook.tab(tab.frame, text=title + (" *" if tab.dirty else ""))
+                tab.text.edit_modified(False)
+                tab.language = record.get("language") if record.get("language") in LANGUAGES else language_for(path)
+                tab.text.mark_set("insert", record.get("cursor", "1.0"))
+                tab.text.yview_moveto(float(record.get("scroll", 0)))
+                tab.schedule_analysis()
+            except (OSError, ValueError, KeyError, TypeError, tk.TclError) as error:
+                self.unrestored_tabs.append(record)
+                missing.append(str(record.get("path", "Draft")) + ": " + str(error))
+        if self.tabs:
+            selected = min(max(0, int(group.get("selected", 0))), len(self.tabs) - 1)
+            self.notebook.select(list(self.tabs)[selected])
+        self.counter = max([int(t.title.split()[-1]) for t in self.tabs.values()
+                            if re.fullmatch(r"Untitled \d+", t.title)] + [0])
+        self.restoring = False
+        self.refresh_library()
+        self.refresh_folder()
+        self.render_workspaces()
+        self.update_status()
+        if missing:
+            self.session_label.configure(text="Some files are missing · select them in Files to retry", text_color="#F4BD6A")
+
+    def switch_workspace(self, name):
+        if name == self.workspace_name:
+            return
+        if not self.persist_session(notify=True):
+            return
+        self.restoring = True
+        for tab in list(self.tabs.values()):
+            if tab.analysis_job:
+                tab.text.after_cancel(tab.analysis_job)
+            self.notebook.forget(tab.frame)
+            tab.frame.destroy()
+        self.tabs.clear()
+        self.workspace_name = name
+        self.restore_workspace()
+        self.persist_session()
+
+    def create_workspace(self):
+        name = ctk.CTkInputDialog(text="Name your workspace (for example LT2 or Phantom Forces)", title="New workspace").get_input()
+        if name and name.strip():
+            name = name.strip()
+            if name in self.session["workspaces"]:
+                self.switch_workspace(name)
+                return
+            self.session["workspaces"][name] = {"tabs": [], "files": []}
+            self.switch_workspace(name)
+
+    def rename_workspace(self):
+        name = ctk.CTkInputDialog(text="New name for " + self.workspace_name, title="Rename workspace").get_input()
+        if not name or not name.strip() or name.strip() == self.workspace_name:
+            return
+        name = name.strip()
+        if name in self.session["workspaces"]:
+            messagebox.showerror("Name already used", "Choose a different workspace name.", parent=self)
+            return
+        self.capture_workspace()
+        self.session["workspaces"][name] = self.session["workspaces"].pop(self.workspace_name)
+        self.workspace_name = name
+        self.render_workspaces()
+        self.persist_session(notify=True)
+
+    def render_workspaces(self):
+        for child in self.workspace_buttons.winfo_children():
+            child.destroy()
+        for name in self.session["workspaces"]:
+            selected = name == self.workspace_name
+            ctk.CTkButton(self.workspace_buttons, text=name, anchor="w", height=38,
+                          fg_color="#302448" if selected else "transparent", text_color="#D5BCFF" if selected else MUTED,
+                          hover_color="#242038", font=("Segoe UI", 14, "bold" if selected else "normal"),
+                          command=lambda n=name: self.switch_workspace(n)).pack(fill="x", pady=3)
+        self.workspace_title.configure(text=self.workspace_name)
+
+    def pin_file(self, path):
+        paths = self.session["workspaces"][self.workspace_name].setdefault("files", [])
+        if str(path) not in paths:
+            paths.append(str(path))
+        self.refresh_library()
+        self.schedule_session()
+
+    def refresh_library(self):
+        self.library_paths = self.session["workspaces"][self.workspace_name].get("files", [])
+        self.library.delete(0, "end")
+        for path in self.library_paths:
+            self.library.insert("end", "  " + Path(path).name + ("  (missing)" if not Path(path).exists() else ""))
+
+    def open_library(self, event=None):
+        selected = self.library.curselection()
+        if selected:
+            self.open_path(self.library_paths[selected[0]])
+
+    def remove_library_file(self):
+        selected = self.library.curselection()
+        if selected:
+            del self.library_paths[selected[0]]
+            self.refresh_library()
+            self.schedule_session()
+
+    def change_font_size(self, value):
+        self.font_size = int(value)
+        for tab in self.tabs.values():
+            tab.text.configure(font=("Consolas", self.font_size))
+            tab.draw_lines()
+        self.schedule_session()
+
+    def tab_changed(self):
+        self.update_status()
+        self.schedule_session()
+
 
     def destroy(self):
+        if getattr(self, "poll_job", None):
+            self.after_cancel(self.poll_job)
+            self.poll_job = None
+        for tab in self.tabs.values():
+            if tab.analysis_job:
+                tab.text.after_cancel(tab.analysis_job)
+                tab.analysis_job = None
+        if self.session_job:
+            self.after_cancel(self.session_job)
+            self.session_job = None
         self.closing = True
         super().destroy()
 
@@ -423,7 +699,7 @@ class CodeWorkspace(ctk.CTkFrame):
                             self.update_status()
         except queue.Empty:
             pass
-        self.after(100, self.poll_analysis)
+        self.poll_job = self.after(100, self.poll_analysis)
 
     def check_now(self):
         tab = self.active()
@@ -465,6 +741,7 @@ class CodeWorkspace(ctk.CTkFrame):
         if tab:
             tab.language = language
             tab.schedule_analysis()
+            self.schedule_session()
             self.update_status()
 
     def jump_problem(self, event=None):
@@ -490,6 +767,7 @@ class CodeWorkspace(ctk.CTkFrame):
         tab = EditorTab(self, Document(), "Untitled %d" % self.counter)
         self.tabs[str(tab.frame)] = tab
         self.update_status()
+        self.schedule_session()
         return tab
 
     def open_files(self):
@@ -504,6 +782,7 @@ class CodeWorkspace(ctk.CTkFrame):
             if tab.document.path == path:
                 self.notebook.select(tab.frame)
                 tab.text.focus_set()
+                self.pin_file(path)
                 return tab
         try:
             document = Document.open(path)
@@ -512,6 +791,7 @@ class CodeWorkspace(ctk.CTkFrame):
             return None
         tab = EditorTab(self, document, path.name)
         self.tabs[str(tab.frame)] = tab
+        self.pin_file(path)
         self.update_status()
         return tab
 
@@ -553,6 +833,7 @@ class CodeWorkspace(ctk.CTkFrame):
         self.notebook.tab(tab.frame, text=tab.title)
         self.update_status()
         self.refresh_folder()
+        self.pin_file(path)
         return True
 
     def save_all(self):
@@ -569,7 +850,7 @@ class CodeWorkspace(ctk.CTkFrame):
         return answer is False or (answer is True and self.save(tab))
 
     def can_close(self):
-        return all(self.confirm_close(tab) for tab in list(self.tabs.values()))
+        return self.persist_session(notify=True)
 
     def close_tab(self):
         tab = self.active()
@@ -580,12 +861,14 @@ class CodeWorkspace(ctk.CTkFrame):
                 tab.text.after_cancel(tab.analysis_job)
             tab.frame.destroy()
             self.update_status()
+            self.persist_session()
 
     def open_folder(self):
         chosen = filedialog.askdirectory(parent=self, title="Browse a local code folder")
         if chosen:
             self.folder = Path(chosen)
             self.refresh_folder()
+            self.schedule_session()
 
     def parent_folder(self):
         if self.folder:
@@ -594,6 +877,8 @@ class CodeWorkspace(ctk.CTkFrame):
 
     def refresh_folder(self):
         if self.folder is None:
+            self.files.delete(0, "end")
+            self.folder_label.configure(text="Browse a folder")
             return
         try:
             entries = sorted(self.folder.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
@@ -639,11 +924,15 @@ class CodeWorkspace(ctk.CTkFrame):
             return
         tab = self.active()
         if not tab:
+            self.notebook.pack_forget()
+            self.empty_state.pack(fill="both", expand=True)
             self.problem_list.delete(0, "end")
             self.problem_heading.configure(text="PROBLEMS · Open a file to check syntax", text_color=MUTED)
             self.problem_detail.configure(text="")
             self.status.configure(text="New or Open files to start editing · Ctrl+N / Ctrl+O")
             return
+        self.empty_state.pack_forget()
+        self.notebook.pack(fill="both", expand=True)
         self.language_menu.set(tab.language)
         unavailable = "unavailable" in tab.notice.lower()
         if unavailable:

@@ -10,7 +10,10 @@ import queue
 import threading
 import time
 import tkinter as tk
-from tkinter import messagebox
+from tkinter import messagebox, filedialog
+from pathlib import Path
+import tempfile
+import math
 from api import ApiError, KeyApi
 from code_workspace import CodeWorkspace
 import customtkinter as ctk
@@ -107,6 +110,9 @@ class App:
         self.root.configure(bg=BG_MAIN)
 
         self.build_ui()
+        if self.cfg.get("page") == "Code Workspace":
+            self.show_page("Code Workspace")
+        self.root.after(300, self.apply_app_icon)
 
         self.root.protocol("WM_DELETE_WINDOW", self.close)
         self.root.bind("<F5>", lambda e: self.refresh())
@@ -130,6 +136,8 @@ class App:
             "remember": bool(self.remember_var.get()),
             "auto_refresh": bool(self.auto_var.get()),
             "auto_copy": bool(self.copy_var.get()),
+            "icon_path": self.cfg.get("icon_path", ""),
+            "page": self.navigation.get(),
         }
         if data["remember"]:
             data["token"] = self.token_var.get().strip()
@@ -189,11 +197,12 @@ class App:
         bar.pack(fill="x")
         bar.pack_propagate(False)
 
-        brand = ctk.CTkFrame(bar, fg_color="transparent")
+        brand = self.brand_frame = ctk.CTkFrame(bar, fg_color="transparent")
         brand.pack(side="left", padx=26)
         ctk.CTkLabel(brand, text="S / SOLOS", font=(FONT, 21, "bold"),
                      text_color=ACCENT_PURPLE, anchor="w").pack(anchor="w", pady=(11, 0))
         self.label(brand, "ACCESS MANAGEMENT", 10, False).pack(anchor="w")
+        self.brand_icon = tk.Label(bar, bg=BG_SIDEBAR)
 
         self.navigation = ctk.CTkSegmentedButton(
             bar, values=["Key Manager", "Code Workspace"], command=self.show_page,
@@ -217,6 +226,57 @@ class App:
             fg_color=CARD_SURFACE, border_color=BORDER_TINT, border_width=1,
             hover_color=BORDER_TINT, font=(FONT, 12), command=self.toggle_conn_strip)
         self.conn_toggle_btn.pack(side="left")
+        ctk.CTkButton(right, text="App icon", width=90, height=32, corner_radius=16,
+                      fg_color=CARD_SURFACE, hover_color=BORDER_TINT,
+                      command=self.choose_app_icon).pack(side="left", padx=(8, 0))
+
+    def apply_app_icon(self):
+        path = self.cfg.get("icon_path")
+        if not path or not Path(path).is_file():
+            return
+        try:
+            if Path(path).suffix.lower() == ".ico":
+                self.root.iconbitmap(path)
+                self.brand_icon.pack_forget()
+            else:
+                self._icon_image = tk.PhotoImage(master=self.root, file=path)
+                self.root.iconphoto(True, self._icon_image)
+                factor = max(1, math.ceil(max(self._icon_image.width(), self._icon_image.height()) / 40))
+                self._brand_image = self._icon_image.subsample(factor, factor)
+                self.brand_icon.configure(image=self._brand_image)
+                self.brand_icon.pack(side="left", before=self.brand_frame, padx=(20, 0))
+        except tk.TclError:
+            # A missing/unsupported icon must not prevent app startup.
+            pass
+
+    def choose_app_icon(self):
+        selected = filedialog.askopenfilename(parent=self.root, title="Choose your Solos icon",
+                     filetypes=[("App icon", "*.png *.gif *.ico"), ("PNG image", "*.png"), ("Windows icon", "*.ico")])
+        if not selected:
+            return
+        source = Path(selected)
+        try:
+            if source.suffix.lower() == ".ico":
+                if os.name != "nt":
+                    raise ValueError("Choose a PNG image on this operating system.")
+                self.root.iconbitmap(str(source))
+            else:
+                # Decode before storing; the file stays local.
+                tk.PhotoImage(master=self.root, file=str(source))
+            target = Path(CONFIG_PATH).parent / (".solos_app_icon" + source.suffix.lower())
+            fd, temporary = tempfile.mkstemp(prefix=".solos-icon-", dir=target.parent)
+            try:
+                with os.fdopen(fd, "wb") as stream:
+                    stream.write(source.read_bytes())
+                os.replace(temporary, target)
+            finally:
+                if os.path.exists(temporary):
+                    os.unlink(temporary)
+            self.cfg["icon_path"] = str(target)
+            self.save_config()
+            self.apply_app_icon()
+        except (OSError, ValueError, tk.TclError) as error:
+            messagebox.showerror("Cannot use this icon", str(error), parent=self.root)
 
     def build_connection_strip(self):
         self.conn_strip = ctk.CTkFrame(self.key_page, fg_color="transparent", corner_radius=0)
@@ -815,8 +875,8 @@ class App:
 
     def close(self):
         if self.editor is not None:
-            self.show_page("Code Workspace")
             if not self.editor.can_close():
+                self.show_page("Code Workspace")
                 return
         self.save_config()
         self.root.destroy()
@@ -828,6 +888,11 @@ def main():
         ctypes.windll.shcore.SetProcessDpiAwareness(1)
     except Exception:
         pass
+    if os.name == "nt":
+        try:
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Solos.KeyManager.Desktop")
+        except Exception:
+            pass
     root = ctk.CTk()
     App(root)
     root.mainloop()

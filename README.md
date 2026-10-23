@@ -57,21 +57,48 @@ installed for a different Python interpreter.
 
 **Save**, **Save as**, and **Save all**
 write to your computer. Files are not uploaded, synced to GitHub, or executed.
-Reopen saved files through Open files or the folder browser next time.
+Use **+ Workspace** to create a named group such as LT2 or Phantom Forces.
+Select a group in the sidebar, then **+ Add** to keep local files in its Files
+list. Closing an editor tab keeps the file in that list; double-click to reopen
+it. Removing a file from the list does not delete it from disk. **Rename** changes
+the group's name. Each group remembers its own open tabs, selected tab, languages,
+cursor positions, folder, and drafts. The Text size menu changes the editor font.
+
+Workspace data and draft copies are stored locally in
+`~/.solos_code_workspace.json`. Edits are backed up after a short pause and on
+normal app exit. Switching groups also saves their state. **Save** still writes
+to the original script file; workspace draft storage is separate. On restart,
+clean files are read from disk and drafts recover the previous text. Saving a
+recovered draft still detects external changes before replacing the original.
+Keep this local session file if you move the app to another computer; file paths
+may need to be reopened on that computer. Abrupt shutdown can lose edits made
+since the last successful workspace save.
 
 Shortcuts: Ctrl+N new, Ctrl+O open, Ctrl+S save, Ctrl+Shift+S save as,
 Ctrl+W close tab, Ctrl+F find, Ctrl+Z undo, Ctrl+Shift+Z redo. Find next wraps
 around and matches literal text without case sensitivity.
 
-A `*` marks edited tabs. Closing a changed tab or exiting prompts to save,
-discard, or cancel. Files changed by another program prompt before replacement.
+A `*` marks edits not yet saved to the original file. Closing a changed tab
+prompts to save, discard, or cancel. Exiting keeps tabs and drafts for the next
+launch without those prompts. A workspace-save failure blocks normal exit so
+you can save your files. Files changed by another program prompt before replacement.
 Saves preserve UTF encoding/BOM and the detected newline style; edited files
 with mixed newline styles are normalized to that style. Save failures leave
-the tab open. Unsaved tabs are kept while switching to Key Manager, but are
-not automatically recovered after a crash.
+the tab open. The app also remembers whether you last used Key Manager or Code Workspace.
 
 Run the editor checks with `python -m unittest discover -s tests -p test_code_workspace.py`.
 GUI checks require a display (for example Xvfb on headless Linux).
+
+## App icon
+
+Click **App icon** in the top bar and choose a PNG/GIF image or, on Windows,
+an ICO file. The app keeps a local copy beside its settings and reapplies it
+on launch. PNG/GIF images also appear in the header. PNG is the simplest choice
+for an existing script logo. Icon selection does not upload the image.
+
+This changes the running app's window icon. Windows taskbar display also depends
+on Windows and any pinned shortcut; a Python script's Explorer file icon or a
+separate shortcut/executable icon is not changed by this setting.
 
 ## Solos Hub scripts
 
