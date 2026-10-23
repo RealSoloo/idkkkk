@@ -1,9 +1,9 @@
 -- Solos Hub game module: pf.lua
--- ESP revision: pf-esp-4 (shared team resolution + per-character rendering recovery)
+-- ESP revision: pf-esp-5 (shared team resolution + per-character rendering recovery)
 -- Loaded by the main hub script (picker -> loadstring). Do not run this file on its own.
 --
 -- Built to be low-profile: no teleporting, no speed, no hitboxes, no remote/metatable hooks, no getgc.
--- Aim assist moves the mouse like a human (mousemoverel) with smoothing + reaction delay; ESP is drawn locally.
+-- Aim assist supports camera tracking or mouse movement; ESP is drawn locally.
 -- Nothing here can be guaranteed undetectable - the game has its own anti-cheat, so use an alt account.
 
 local Hub, S, T, C = ...
@@ -45,7 +45,7 @@ TabButtons["Phantom Forces"].Btn.LayoutOrder = -19
 filterTabs({ "Phantom Forces", "Dashboard", "Hub Chat", "Theme", "Settings" })
 
 local P = {
-	aim = false, mode = 1, key = Enum.KeyCode.Unknown, part = 1, fov = 110, showFov = true, strength = 0.16, maxStep = 16,
+	aim = false, mode = 1, aimMethod = 1, teamCheck = true, key = Enum.KeyCode.Unknown, part = 1, fov = 110, showFov = true, strength = 0.16, maxStep = 16,
 	deadzone = 2, scale = 1, wall = true, maxDist = 700, sticky = true, humanize = true, delay = 0.12, jitter = 3,
 	trig = false, trigAds = true, trigMin = 0.05, trigMax = 0.12,
 	esp = false, box = true, names = true, dist = true, chams = false, tracers = false, showTeam = false, visColor = true, espMax = 1200,
@@ -87,8 +87,30 @@ local function firstPart(m)
 	return nil
 end
 local HEAD_NAMES, TORSO_NAMES = { "Head", "head" }, { "Torso", "UpperTorso", "HumanoidRootPart", "torso", "Chest" }
-local function headOf(m) return findPart(m, HEAD_NAMES) or firstPart(m) end
-local function torsoOf(m) return findPart(m, TORSO_NAMES) or firstPart(m) end
+local function headOf(m)
+	local named = findPart(m, HEAD_NAMES)
+	if named then return named end
+	-- Randomized PF models still keep their direct body parts. The highest
+	-- body-part center is a usable head fallback without matching weapon parts.
+	local best
+	for _, part in ipairs(m:GetChildren()) do
+		if part:IsA("BasePart") and (not best or part.Position.Y > best.Position.Y) then best = part end
+	end
+	return best or firstPart(m)
+end
+local function torsoOf(m)
+	local named = findPart(m, TORSO_NAMES)
+	if named then return named end
+	local best, volume = nil, -1
+	for _, part in ipairs(m:GetChildren()) do
+		if part:IsA("BasePart") then
+			local size = part.Size
+			local v = size.X * size.Y * size.Z
+			if v > volume then best, volume = part, v end
+		end
+	end
+	return best or firstPart(m)
+end
 local function teamKey(value)
 	return tostring(value or ""):lower():gsub("[%s_%-]", "")
 end
@@ -131,7 +153,8 @@ local function playerFaction(pl)
 			if faction then return faction end
 		end
 	end
-	if not pl.Neutral and pl.TeamColor then return factionOf(pl.TeamColor.Name) end
+	-- PF can leave Neutral true and Team nil while still publishing its faction color.
+	if pl.TeamColor then return factionOf(pl.TeamColor.Name) end
 	return nil
 end
 local function folderFaction(m, root)
@@ -185,22 +208,54 @@ end
 -- scan result is cached (refreshed by the loop below) so the per-frame code stays cheap.
 -- Team is taken from the Workspace.Players team folder (own team folder = teammates); falls back to the player's team.
 local cache, cacheSet = {}, {}
+local function groupOf(m)
+	local root, cur = playersRoot(), m
+	if not root then return nil end
+	while cur.Parent and cur.Parent ~= root do cur = cur.Parent end
+	if cur.Parent == root and cur ~= m and cur:IsA("Folder") then return cur end
+	return nil
+end
+local function calibratedEnemy(group)
+	local root = playersRoot()
+	if P.myGroup and P.myGroup.Parent ~= root then P.myGroup = nil end
+	if P.enemyGroup and P.enemyGroup.Parent ~= root then P.enemyGroup = nil end
+	if not group then return nil end
+	if group == P.myGroup then return false end
+	if group == P.enemyGroup then return true end
+	-- A complementary team is certain only when there are exactly two groups.
+	local groups = {}
+	if root then
+		for _, child in ipairs(root:GetChildren()) do
+			if child:IsA("Folder") then table.insert(groups, child) end
+		end
+	end
+	if #groups == 2 and (group == groups[1] or group == groups[2]) then
+		if P.myGroup then return true end
+		if P.enemyGroup then return false end
+	end
+	return nil
+end
 local function scan(loose)
 	P.scanErr = nil
 	local root, mine = playersRoot(), myTeamNames()
 	local faction, source = myFaction()
 	P.teamFaction, P.teamSource = faction, source
 	if loose and not root then return end
-	local base = root or Workspace
+	local bases = {}
+	if root then table.insert(bases, root) end
+	local roots = Workspace:FindFirstChild("Roots")
+	if roots and not loose then table.insert(bases, roots) end
+	if #bases == 0 then table.insert(bases, Workspace) end
 	local found, set, hasMine = {}, {}, false
 	if root then
 		for _, f in ipairs(root:GetChildren()) do
 			if mine[teamKey(f.Name)] then hasMine = true end
 		end
 	end
+	for _, base in ipairs(bases) do
 	for _, d in ipairs(base:GetDescendants()) do
 		local ok, err = pcall(function()
-			if d.Name == LocalPlayer.Name or not looksLikeChar(d, loose) then return end
+			if set[d] or d.Name == LocalPlayer.Name or not looksLikeChar(d, loose) then return end
 			if d.Parent and d.Parent:IsA("Model") and looksLikeChar(d.Parent, loose) then return end
 			local top = d
 			while top.Parent and top.Parent ~= base do top = top.Parent end
@@ -214,18 +269,23 @@ local function scan(loose)
 			-- unset, and does not need our faction's folder to contain a player.
 			local same = nil
 			if pl then same = sameKnownTeam(pl) end
-			if same ~= nil then
+			local group = groupOf(d)
+			local calibrated = calibratedEnemy(group)
+			if calibrated ~= nil then
+				enemy = calibrated
+			elseif same ~= nil then
 				enemy = not same
 			elseif faction and modelFaction then
 				enemy = faction ~= modelFaction
 			elseif hasMine then
 				enemy = not mine[teamKey(folderName)]
 			end
-			local e = { m = d, enemy = enemy, player = pl, folder = folderName }
+			local e = { m = d, enemy = enemy, player = pl, folder = folderName, group = group }
 			table.insert(found, e)
 			set[d] = e
 		end)
 		if not ok then P.scanErr = tostring(err) end
+	end
 	end
 	cache, cacheSet = found, set
 end
@@ -235,6 +295,44 @@ local function collect(includeTeam, includeUnknown)
 		if e.m.Parent and (e.enemy or includeTeam or P.allEnemy or (includeUnknown and e.enemy == nil)) then table.insert(out, e) end
 	end
 	return out
+end
+local function collectEsp()
+	local out = {}
+	for _, e in ipairs(cache) do
+		if e.m.Parent and (not P.teamCheck or e.enemy == true) then
+			table.insert(out, e)
+		end
+	end
+	return out
+end
+local function calibrateTeam(isEnemy)
+	local c = cam()
+	if not c then return notify("Camera is not ready", T.Warn) end
+	scan(false)
+	if #cache == 0 then scan(true) end
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	local ignore = { c }
+	local ignored = Workspace:FindFirstChild("Ignore")
+	if ignored then table.insert(ignore, ignored) end
+	if LocalPlayer.Character then table.insert(ignore, LocalPlayer.Character) end
+	params.FilterDescendantsInstances = ignore
+	local hit = Workspace:Raycast(c.CFrame.Position, c.CFrame.LookVector * P.espMax, params)
+	local cur = hit and hit.Instance
+	local entry
+	while cur and cur ~= Workspace do
+		if cacheSet[cur] then entry = cacheSet[cur] break end
+		cur = cur.Parent
+	end
+	if not entry or not entry.group then
+		return notify("Aim directly at a visible player, then press the calibration key", T.Warn)
+	end
+	P.myGroup, P.enemyGroup = nil, nil
+	if isEnemy then P.enemyGroup = entry.group else P.myGroup = entry.group end
+	P.target = nil
+	scan(false)
+	if #cache == 0 then scan(true) end
+	notify(isEnemy and "Enemy group marked - team check updated" or "Teammate group marked - team check updated", T.Good)
 end
 local function enemyModelOf(inst)
 	local cur = inst
@@ -310,25 +408,33 @@ end
 local fovGui = new("Frame", { AnchorPoint = Vector2.new(0.5, 0.5), BackgroundTransparency = 1, BorderSizePixel = 0, Visible = false }, EspGui)
 round(fovGui, 999)
 local fovStroke = new("UIStroke", { Color = T.Accent, Thickness = 1, Transparency = 0.5 }, fovGui)
-bind(RunService.RenderStepped, function()
+local function updateAim(dt)
+	P.aimErr = nil
 	local c = cam()
-	if not c then return end
+	if not c then P.aimState = "waiting for camera" return end
 	local vp = c.ViewportSize
 	local center = Vector2.new(vp.X / 2, vp.Y / 2)
 	fovGui.Visible = P.showFov and P.aim
 	fovGui.Size = UDim2.fromOffset(P.fov * 2, P.fov * 2)
 	fovGui.Position = UDim2.fromOffset(center.X, center.Y)
 	fovStroke.Color = P.target and T.Good or T.Accent
-	if not P.aim or not aimActive() then P.target = nil return end
+	if not P.aim then P.target = nil P.aimState = "off" return end
+	if not aimActive() then P.target = nil P.aimState = "waiting for ADS / key" return end
 	refreshFilter()
 	local m, part
 	if P.sticky and P.target and P.target.Parent then
-		m = P.target
-		part = pickPart(m, center)
+		local entry = cacheSet[P.target]
+		if entry and (entry.enemy == true or P.allEnemy) then
+			m = P.target
+			part = pickPart(m, center)
+		end
 		local keep = false
 		if part then
 			local sp, on = c:WorldToViewportPoint(part.Position)
-			keep = on and (Vector2.new(sp.X, sp.Y) - center).Magnitude <= P.fov * 1.3 and (not P.wall or visibleModel(m, part))
+			local distance = (part.Position - c.CFrame.Position).Magnitude
+			keep = on and distance <= P.maxDist and
+				(Vector2.new(sp.X, sp.Y) - center).Magnitude <= P.fov * 1.3 and
+				(not P.wall or visibleModel(m, part))
 		end
 		if not keep then P.target, m, part = nil, nil, nil end
 	end
@@ -338,24 +444,61 @@ bind(RunService.RenderStepped, function()
 			P.target, P.targetSince = m, os.clock()
 			local j = P.jitter / 10
 			P.offset = Vector3.new((math.random() - 0.5) * 2 * j, (math.random() - 0.5) * 2 * j, (math.random() - 0.5) * 2 * j)
+		else
+			P.target = nil
 		end
 	end
-	if not (m and part) then return end
-	if P.humanize and os.clock() - P.targetSince < P.delay then return end
+	if not (m and part) then
+		local faction = myFaction()
+		if #cache == 0 then
+				P.aimState = "no character models found - copy diagnostic report"
+			else
+				local unresolved = false
+				for _, entry in ipairs(cache) do
+					if entry.enemy == nil then unresolved = true break end
+				end
+				P.aimState = unresolved and "mark teammate (F6) or enemy (F7) to calibrate team groups" or
+					(not faction and "select Your team on ESP tab" or "no confirmed visible enemy in FOV / range")
+			end
+		return
+	end
+	if P.humanize and os.clock() - P.targetSince < P.delay then P.aimState = "reaction delay" return end
 	local aimPos = part.Position
 	if P.humanize then aimPos = aimPos + P.offset end
 	local sp, on = c:WorldToViewportPoint(aimPos)
-	if not on then return end
+	if not on then P.aimState = "target off screen" return end
 	local delta = Vector2.new(sp.X, sp.Y) - center
-	if delta.Magnitude < P.deadzone then return end
-	local step = delta * P.strength
-	if step.Magnitude > P.maxStep then step = step.Unit * P.maxStep end
-	if type(env.mousemoverel) == "function" then
-		pcall(env.mousemoverel, step.X * P.scale, step.Y * P.scale)
+	if delta.Magnitude < P.deadzone then P.aimState = "on target" return end
+	if P.aimMethod == 1 then
+		-- Apply after the game's normal camera update so it cannot immediately
+		-- overwrite the CFrame in the same frame. No mouse API is required.
+		local alpha = 1 - (1 - math.clamp(P.strength, 0.01, 1)) ^ (math.min(dt or 1/60, 0.1) * 60)
+		c.CFrame = c.CFrame:Lerp(CFrame.lookAt(c.CFrame.Position, aimPos), alpha)
+		P.aimState = "tracking (camera)"
 	else
-		c.CFrame = c.CFrame:Lerp(CFrame.lookAt(c.CFrame.Position, aimPos), math.clamp(P.strength, 0.01, 1))
+		local move = env.mousemoverel or mousemoverel
+		if type(move) ~= "function" then
+			P.aimErr = "Mouse movement unavailable. Select Camera tracking."
+			P.aimState = "mouse API unavailable"
+			return
+		end
+		local step = delta * P.strength
+		if step.Magnitude > P.maxStep then step = step.Unit * P.maxStep end
+		local ok, err = pcall(move, step.X * P.scale, step.Y * P.scale)
+		if not ok then
+			P.aimErr = "Mouse movement failed: " .. tostring(err)
+			P.aimState = "mouse API failed"
+		else
+			P.aimState = "tracking (mouse)"
+		end
 	end
+end
+local aimBinding = "SolosHubPFAim_" .. tostring({})
+RunService:BindToRenderStep(aimBinding, Enum.RenderPriority.Camera.Value + 1, function(dt)
+	local ok, err = pcall(updateAim, dt)
+	if not ok then P.aimErr = tostring(err) P.aimState = "error" end
 end)
+onUnload(function() RunService:UnbindFromRenderStep(aimBinding) end)
 
 -- ---------------------------------------------------- triggerbot (human-like reaction + hold time)
 task.spawn(function()
@@ -470,7 +613,13 @@ local function drawModel(c, e)
 	local cx = (minX + maxX) / 2
 	local pl = e.player or modelPlayer(m)
 	o.name.Position = UDim2.fromOffset(cx, math.max(14, minY - 1))
-	o.name.Text, o.name.TextColor3, o.name.Visible = pl and pl.DisplayName or m.Name, col, P.names
+	local label = pl and pl.DisplayName
+	if not label then
+		if e.enemy == true then label = "Enemy"
+		elseif e.enemy == false then label = "Teammate"
+		else label = "Unknown player" end
+	end
+	o.name.Text, o.name.TextColor3, o.name.Visible = label, col, P.names
 	o.dist.Position = UDim2.fromOffset(cx, math.min(c.ViewportSize.Y - 12, maxY + 1))
 	o.dist.Text, o.dist.TextColor3, o.dist.Visible = math.floor(dist * 0.28) .. "m", col, P.dist
 	o.hl.Adornee, o.hl.OutlineColor, o.hl.Enabled = m, col, P.chams
@@ -493,7 +642,7 @@ local function updateEsp()
 	end
 	local seen = {}
 	if P.esp then
-		for _, e in ipairs(collect(P.showTeam, true)) do
+		for _, e in ipairs(collectEsp()) do
 			seen[e.m] = true
 			local ok, drawn = pcall(drawModel, c, e)
 			if ok then
@@ -582,10 +731,10 @@ end)
 task.spawn(function() -- keep the character list fresh
 	while Live.Running do
 		local ok, err = pcall(scan, false)
-		if not ok then P.err = tostring(err) end
+		if not ok then P.scanErr = tostring(err) end
 		if #cache == 0 then -- strict detection found nothing: accept any model inside Workspace.Players
 			local ok2, err2 = pcall(scan, true)
-			if not ok2 then P.err = tostring(err2) end
+			if not ok2 then P.scanErr = tostring(err2) end
 		end
 		task.wait(playersRoot() and 0.4 or 1.5)
 	end
@@ -595,18 +744,18 @@ task.spawn(function()
 	while Live.Running do
 		if teamRow then
 			local faction, source = myFaction()
-			teamRow.Text = "Your team: " .. (faction or "unknown") .. " | " .. source
+			teamRow.Text = (P.myGroup or P.enemyGroup) and "Team groups calibrated for this session" or
+				("Your team: " .. (faction or "unknown") .. " | " .. source)
 		end
 		if espRow then
 			local unknown = 0
 			for _, e in ipairs(cache) do if e.enemy == nil then unknown = unknown + 1 end end
 			local err = P.espErr or P.scanErr
-			espRow.Text = "pf-esp-4 | Found " .. #cache .. " models (" .. #collect(false) .. " enemy, " .. unknown .. " unknown) | drawn " .. tostring(P.drawn or 0) .. " | failed " .. tostring(P.renderFailed or 0) .. (err and (" | ERROR: " .. err) or "")
+			espRow.Text = "pf-esp-5 | Found " .. #cache .. " models (" .. #collect(false) .. " enemy, " .. unknown .. " unknown) | drawn " .. tostring(P.drawn or 0) .. " | failed " .. tostring(P.renderFailed or 0) .. (err and (" | ERROR: " .. err) or "")
 		end
 		if statusRow then
-			local state = "idle"
-			if P.aim then state = aimActive() and (P.target and "locked on target" or "active, no target in FOV") or "waiting for ADS / key" end
-			statusRow.Text = "Detected: " .. #collect(false) .. " enemies | mouse move: " .. (type(env.mousemoverel) == "function" and "ok" or "MISSING") .. " | aim: " .. state .. (P.err and (" | ERROR: " .. P.err) or "")
+			statusRow.Text = "Enemies: " .. #collect(false) .. " | " .. (P.aimState or "off") ..
+				(P.aimErr and (" | ERROR: " .. P.aimErr) or "")
 		end
 		task.wait(0.3)
 	end
@@ -614,10 +763,12 @@ end)
 local function report()
 	local out = {}
 	local function add(s) table.insert(out, s) end
-	add("ESP revision: pf-esp-4")
+	add("ESP revision: pf-esp-5")
 	local faction, source = myFaction()
+	add("calibrated teammate group=" .. tostring(P.myGroup and P.myGroup.Name) .. " enemy group=" .. tostring(P.enemyGroup and P.enemyGroup.Name))
 	add("selected team mode=" .. tostring(P.teamMode) .. " faction=" .. tostring(faction) .. " source=" .. source)
 	add("scan error=" .. tostring(P.scanErr) .. " render error=" .. tostring(P.espErr))
+	add("aim method=" .. tostring(P.aimMethod) .. " state=" .. tostring(P.aimState) .. " error=" .. tostring(P.aimErr) .. " ESP team check=" .. tostring(P.teamCheck))
 	add("enabled=" .. tostring(P.esp) .. " showTeam=" .. tostring(P.showTeam) .. " maxDistance=" .. tostring(P.espMax) .. " drawn=" .. tostring(P.drawn or 0))
 	add("PlaceId " .. game.PlaceId .. " | team " .. tostring(LocalPlayer.Team and LocalPlayer.Team.Name) .. " | teamcolor " .. LocalPlayer.TeamColor.Name)
 	add("mousemoverel=" .. tostring(type(env.mousemoverel)) .. " mouse1press=" .. tostring(type(env.mouse1press)) .. " mouse1click=" .. tostring(type(env.mouse1click)))
@@ -632,9 +783,9 @@ local function report()
 		table.insert(names, ch.Name .. "(" .. ch.ClassName .. ")")
 	end
 	add("Workspace children: " .. table.concat(names, ", "))
-	local root = playersRoot()
+	local function dumpRoot(root, label)
 	if root then
-		add("Workspace.Players exists, class " .. root.ClassName)
+		add(label .. " exists, class " .. root.ClassName .. " descendants=" .. #root:GetDescendants())
 		for i, f in ipairs(root:GetChildren()) do
 			if i > 6 then break end
 			add("  " .. f.Name .. " (" .. f.ClassName .. ") children=" .. #f:GetChildren())
@@ -649,8 +800,11 @@ local function report()
 			end
 		end
 	else
-		add("Workspace.Players does NOT exist")
+		add(label .. " does NOT exist")
 	end
+	end
+	dumpRoot(playersRoot(), "Workspace.Players")
+	dumpRoot(Workspace:FindFirstChild("Roots"), "Workspace.Roots")
 	local text = table.concat(out, "\n")
 	copyText(text)
 	notify("Diagnostic copied - paste it to me", T.Good)
@@ -669,8 +823,11 @@ onUnload(function()
 end)
 
 -- ====================================================== UI : Aim Assist tab
-local Aim = Section(AimTab, "Aim Assist", "Moves your mouse toward the enemy nearest your crosshair - hold right mouse (ADS) to use", "aimbot")
+local Aim = Section(AimTab, "Aim Assist", "Tracks the enemy nearest your crosshair - hold right mouse (ADS) to use", "aimbot")
 tog(Aim, "Aim Assist", false, function(v) P.aim = v if not v then P.target = nil end end)
+Dropdown(Aim, "Tracking method", { "Camera tracking", "Mouse movement" }, P.aimMethod, function(i)
+	P.aimMethod, P.target = i, nil
+end, nil, "Camera tracking works without mousemoverel. Mouse movement requires a supported mouse API.")
 Dropdown(Aim, "Activation", AIM_MODES, P.mode, function(i) P.mode = i end, nil, "When the aim assist pulls")
 Keybind(Aim, "Aim Key (activation: Hold Key)", P.key, function(k) P.key = k end, true)
 Dropdown(Aim, "Aim At", AIM_PARTS, P.part, function(i) P.part = i end, nil, "Which body part to aim at")
@@ -719,22 +876,39 @@ end)
 local TeamSetup = Section(EspTab3, "Team Detection", "Used by both ESP and aim assist", "players")
 Dropdown(TeamSetup, "Your team", { "Auto", "Phantoms", "Ghosts" }, P.teamMode, function(i)
 	P.teamMode = i
+	P.myGroup, P.enemyGroup = nil, nil
 	P.target, P.targetSince = nil, 0
 	scan(false)
 	if #cache == 0 then scan(true) end
 end, nil, "If Auto cannot detect your team, select the faction you are playing on. Update it when you switch teams.")
 teamRow = InfoRow(TeamSetup, "Your team: checking...")
-InfoRow(TeamSetup, "Gray ESP = unknown team. Unknown players are displayed but not aimed at.")
+InfoRow(TeamSetup, "Randomized team names? Aim at a known teammate and press F6, or an enemy and press F7.")
+P.markAllyKey, P.markEnemyKey = Enum.KeyCode.F6, Enum.KeyCode.F7
+Keybind(TeamSetup, "Mark teammate under crosshair", P.markAllyKey, function(k) P.markAllyKey = k end, true)
+Keybind(TeamSetup, "Mark enemy under crosshair", P.markEnemyKey, function(k) P.markEnemyKey = k end, true)
+Button(TeamSetup, "Clear team calibration", "Clear", function()
+	P.myGroup, P.enemyGroup, P.target = nil, nil, nil
+	scan(false)
+	if #cache == 0 then scan(true) end
+end)
+InfoRow(TeamSetup, "Recalibrate after switching teams or joining a different server.")
+bind(UIS.InputBegan, function(input, processed)
+	if processed or Live.BindingActive or not Live.Unlocked or UIS:GetFocusedTextBox() then return end
+	if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
+	if input.KeyCode == P.markAllyKey then calibrateTeam(false)
+	elseif input.KeyCode == P.markEnemyKey then calibrateTeam(true) end
+end)
+InfoRow(TeamSetup, "Team Check hides teammates and unknown teams. Select your faction if Auto is unresolved.")
 local E = Section(EspTab3, "Enemy ESP", "Drawn only on your screen", "esp")
 tog(E, "Enable ESP", false, function(v) P.esp = v if not v then clearEsp() end end)
 local EOpt = Collapse(E, "Options")
 tog(EOpt, "Boxes", true, function(v) P.box = v end)
-tog(EOpt, "Names", true, function(v) P.names = v end)
+tog(EOpt, "Names", true, function(v) P.names = v end, "Verified player names when available; otherwise Enemy / Teammate / Unknown player.")
 tog(EOpt, "Distance", true, function(v) P.dist = v end)
 tog(EOpt, "Outline Chams", false, function(v) P.chams = v end)
 tog(EOpt, "Tracers", false, function(v) P.tracers = v end)
 tog(EOpt, "Color By Visibility", true, function(v) P.visColor = v end, "Red = visible, amber = behind cover")
-tog(EOpt, "Show Teammates", false, function(v) P.showTeam = v end)
+tog(EOpt, "Team Check", true, function(v) P.teamCheck = v end, "On: show confirmed enemies only. Off: show everyone; unknown teams are gray.")
 Slider(EOpt, "Max ESP Distance (studs)", 100, 3000, 1200, function(v) P.espMax = v end, "pfespmax")
 
 local R = Section(EspTab3, "Radar & Alerts", "Awareness without drawing anything on enemies", "active")
