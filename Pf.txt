@@ -1,5 +1,5 @@
 -- Solos Hub game module: pf.lua
--- ESP revision: pf-esp-6 (shared team resolution + per-character rendering recovery)
+-- ESP revision: pf-esp-7 (shared team resolution + per-character rendering recovery)
 -- Loaded by the main hub script (picker -> loadstring). Do not run this file on its own.
 --
 -- Built to be low-profile: no teleporting, no speed, no hitboxes, no remote/metatable hooks, no getgc.
@@ -18,6 +18,7 @@ local InfoRow = API.InfoRow
 local Keybind = API.Keybind
 local LocalPlayer = API.LocalPlayer
 local Players = API.Players
+local PlayerGui = API.PlayerGui
 local RunService = API.RunService
 local Section = API.Section
 local Slider = API.Slider
@@ -144,7 +145,154 @@ local function factionOf(value)
 	end
 	return nil
 end
+-- Read the game's own leaderboard; never use this hub's labels as evidence.
+local roster, rosterAt, rosterChecked = {}, -math.huge, -math.huge
+local owners = setmetatable({}, { __mode = "k" })
+local replication, replicationChecked = nil, -math.huge
+local function plainText(value)
+	return tostring(value or ""):gsub("<[^>]*>", ""):match("^%s*(.-)%s*$"):lower()
+end
+local function gameGui(node)
+	local cur = node
+	while cur and cur ~= PlayerGui do
+		if cur.Name:sub(1, 5) == "Solos" then return false end
+		if cur:IsA("GuiObject") and not cur.Visible then return false end
+		if cur:IsA("ScreenGui") and not cur.Enabled then return false end
+		cur = cur.Parent
+	end
+	return cur == PlayerGui
+end
+local function commonParent(a, b)
+	local cur = a.Parent
+	while cur and cur ~= PlayerGui do
+		if b:IsDescendantOf(cur) then return cur end
+		cur = cur.Parent
+	end
+	return nil
+end
+local function headerBranch(header, root)
+	local cur = header
+	while cur.Parent and cur.Parent ~= root do cur = cur.Parent end
+	return cur
+end
+local function readScoreboard()
+	if not PlayerGui then return end
+	local now = os.clock()
+	if now - rosterChecked < 0.75 then return end
+	rosterChecked = now
+	local phantoms, ghosts, labels = {}, {}, {}
+	local playersByText, ambiguous = {}, {}
+	for _, pl in ipairs(Players:GetPlayers()) do
+		playersByText[plainText(pl.Name)] = pl
+	end
+	for _, pl in ipairs(Players:GetPlayers()) do
+		local key = plainText(pl.DisplayName)
+		if playersByText[key] and playersByText[key] ~= pl then ambiguous[key] = true
+		elseif not ambiguous[key] then playersByText[key] = pl end
+	end
+	for key in pairs(ambiguous) do playersByText[key] = nil end
+	for _, node in ipairs(PlayerGui:GetDescendants()) do
+		if (node:IsA("TextLabel") or node:IsA("TextButton")) and gameGui(node) then
+			local text = plainText(node.Text)
+			if text == "phantoms" then table.insert(phantoms, node)
+			elseif text == "ghosts" then table.insert(ghosts, node)
+			elseif playersByText[text] then table.insert(labels, { node = node, player = playersByText[text] }) end
+		end
+	end
+	for _, ph in ipairs(phantoms) do
+		for _, gh in ipairs(ghosts) do
+			local root = commonParent(ph, gh)
+			if root then
+				local left, right = headerBranch(ph, root), headerBranch(gh, root)
+				local found, conflicts = {}, {}
+				for _, row in ipairs(labels) do
+					local node, faction = row.node, nil
+					if node:IsDescendantOf(root) then
+						if left ~= right and node:IsDescendantOf(left) then faction = "phantoms"
+						elseif left ~= right and node:IsDescendantOf(right) then faction = "ghosts"
+						else
+							-- Some scoreboards keep the header and row containers separate.
+							local a, b, n = ph.AbsolutePosition, gh.AbsolutePosition, node.AbsolutePosition
+							if math.abs(a.Y - b.Y) <= 48 and math.abs(a.X - b.X) > 100 and
+								n.Y > math.max(a.Y, b.Y) and n.X >= math.min(a.X, b.X) then
+								local split = (a.X + b.X) / 2
+								faction = (n.X < split) == (a.X < b.X) and "phantoms" or "ghosts"
+							end
+						end
+					end
+					if faction then
+						if found[row.player] and found[row.player] ~= faction then conflicts[row.player] = true end
+						found[row.player] = faction
+					end
+				end
+				for pl in pairs(conflicts) do found[pl] = nil end
+				if next(found) then
+					roster, rosterAt = found, now
+					local n = 0 for _ in pairs(found) do n = n + 1 end
+					P.rosterStatus = "leaderboard: " .. n .. " players"
+					return
+				end
+			end
+		end
+	end
+	P.rosterStatus = now - rosterAt <= 20 and "leaderboard cached (20s maximum)" or "open the game's leaderboard to read teams"
+end
+local function rosterFaction(pl)
+	if os.clock() - rosterAt <= 20 then return roster[pl] end
+	return nil
+end
+local function getReplication()
+	if replication then return replication end
+	if os.clock() - replicationChecked < 5 then return nil end
+	replicationChecked = os.clock()
+	local sources = {}
+	local function add(value) if type(value) == "table" then table.insert(sources, value) end end
+	add(shared)
+	add(env.shared)
+	local getRuntime = env.getrenv or getrenv
+	if type(getRuntime) == "function" then
+		local ok, runtime = pcall(getRuntime)
+		if ok and type(runtime) == "table" then add(runtime.shared) end
+	end
+	for _, source in ipairs(sources) do
+		local loader = rawget(source, "require")
+		if type(loader) == "function" then
+			local ok, module = pcall(loader, "ReplicationInterface")
+			if ok and type(module) == "table" and type(module.getEntry) == "function" then
+				replication = module
+				return module
+			end
+		end
+	end
+	P.ownerStatus = "replication interface unavailable; randomized bodies cannot be linked to usernames"
+	return nil
+end
+local function replicationModel(entry)
+	if type(entry) ~= "table" then return nil end
+	local third = entry._thirdPersonObject
+	if type(entry.getThirdPersonObject) == "function" then third = entry:getThirdPersonObject() end
+	if type(third) ~= "table" then return nil end
+	local model = third._character or third._characterModel
+	if type(third.getCharacterModel) == "function" then model = third:getCharacterModel() end
+	if typeof(model) == "Instance" and model:IsA("Model") then return model end
+	return nil
+end
+local function refreshOwnership()
+	local fresh = setmetatable({}, { __mode = "k" })
+	local module = getReplication()
+	local count = 0
+	if module then
+		for _, pl in ipairs(Players:GetPlayers()) do
+			local ok, model = pcall(function() return replicationModel(module.getEntry(pl)) end)
+			if ok and model and model.Parent then fresh[model] = pl count = count + 1 end
+		end
+		P.ownerStatus = "replication interface: " .. count .. " model owners"
+	end
+	owners = fresh
+end
 local function playerFaction(pl)
+	local fromBoard = rosterFaction(pl)
+	if fromBoard then return fromBoard end
 	if pl.Team then
 		local faction = factionOf(pl.Team.Name)
 		if faction then return faction end
@@ -197,7 +345,7 @@ local function sameKnownTeam(pl)
 	return mine == theirs
 end
 local function modelPlayer(m)
-	local pl = Players:GetPlayerFromCharacter(m) or Players:FindFirstChild(m.Name)
+	local pl = owners[m] or Players:GetPlayerFromCharacter(m) or Players:FindFirstChild(m.Name)
 	return pl and pl:IsA("Player") and pl or nil
 end
 local function looksLikeChar(m, loose)
@@ -237,6 +385,10 @@ local function calibratedEnemy(group)
 end
 local function scan(loose)
 	P.scanErr = nil
+	local ok, err = pcall(readScoreboard)
+	if not ok then P.rosterStatus = "leaderboard read failed: " .. tostring(err) end
+	ok, err = pcall(refreshOwnership)
+	if not ok then P.ownerStatus = "owner lookup failed: " .. tostring(err) end
 	local root, mine = playersRoot(), myTeamNames()
 	local faction, source = myFaction()
 	P.teamFaction, P.teamSource = faction, source
@@ -286,6 +438,18 @@ local function scan(loose)
 		end)
 		if not ok then P.scanErr = tostring(err) end
 	end
+	end
+	local groupFactions, groupConflict = {}, {}
+	for _, entry in ipairs(found) do
+		local f = entry.player and playerFaction(entry.player)
+		if entry.group and f then
+			if groupFactions[entry.group] and groupFactions[entry.group] ~= f then groupConflict[entry.group] = true end
+			groupFactions[entry.group] = f
+		end
+	end
+	for _, entry in ipairs(found) do
+		local f = entry.group and not groupConflict[entry.group] and groupFactions[entry.group]
+		if entry.enemy == nil and faction and f then entry.enemy = faction ~= f end
 	end
 	cache, cacheSet = found, set
 end
@@ -787,9 +951,11 @@ task.spawn(function() -- keep the character list fresh
 		task.wait(playersRoot() and 0.4 or 1.5)
 	end
 end)
-local statusRow, espRow, teamRow
+local statusRow, espRow, teamRow, rosterRow, ownerRow
 task.spawn(function()
 	while Live.Running do
+		if rosterRow then rosterRow.Text = P.rosterStatus or "Open the game's leaderboard to read teams" end
+		if ownerRow then ownerRow.Text = P.ownerStatus or "Checking model ownership..." end
 		if teamRow then
 			local faction, source = myFaction()
 			teamRow.Text = (P.myGroup or P.enemyGroup) and "Team groups calibrated for this session" or
@@ -799,7 +965,7 @@ task.spawn(function()
 			local unknown = 0
 			for _, e in ipairs(cache) do if e.enemy == nil then unknown = unknown + 1 end end
 			local err = P.espErr or P.scanErr
-			espRow.Text = "pf-esp-6 | Found " .. #cache .. " models (" .. #collect(false) .. " enemy, " .. unknown .. " unknown) | drawn " .. tostring(P.drawn or 0) .. " | failed " .. tostring(P.renderFailed or 0) .. (err and (" | ERROR: " .. err) or "")
+			espRow.Text = "pf-esp-7 | Found " .. #cache .. " models (" .. #collect(false) .. " enemy, " .. unknown .. " unknown) | drawn " .. tostring(P.drawn or 0) .. " | failed " .. tostring(P.renderFailed or 0) .. (err and (" | ERROR: " .. err) or "")
 		end
 		if statusRow then
 			statusRow.Text = "Enemies: " .. #collect(false) .. " | " .. (P.aimState or "off") ..
@@ -811,7 +977,9 @@ end)
 local function report()
 	local out = {}
 	local function add(s) table.insert(out, s) end
-	add("ESP revision: pf-esp-6")
+	add("ESP revision: pf-esp-7")
+	add(tostring(P.rosterStatus))
+	add(tostring(P.ownerStatus))
 	local faction, source = myFaction()
 	add("calibrated teammate group=" .. tostring(P.myGroup and P.myGroup.Name) .. " enemy group=" .. tostring(P.enemyGroup and P.enemyGroup.Name))
 	add("selected team mode=" .. tostring(P.teamMode) .. " faction=" .. tostring(faction) .. " source=" .. source)
@@ -930,6 +1098,15 @@ Dropdown(TeamSetup, "Your team", { "Auto", "Phantoms", "Ghosts" }, P.teamMode, f
 	if #cache == 0 then scan(true) end
 end, nil, "If Auto cannot detect your team, select the faction you are playing on. Update it when you switch teams.")
 teamRow = InfoRow(TeamSetup, "Your team: checking...")
+rosterRow = InfoRow(TeamSetup, "Open the game's leaderboard to read teams")
+ownerRow = InfoRow(TeamSetup, "Checking model ownership...")
+InfoRow(TeamSetup, "Open the game leaderboard to refresh its team roster. Automatic names require a verified model-owner link.")
+Button(TeamSetup, "Refresh leaderboard teams", "Refresh", function()
+	rosterChecked = -math.huge
+	scan(false)
+	if #cache == 0 then scan(true) end
+	notify((P.rosterStatus or "No leaderboard found") .. " | " .. (P.ownerStatus or "No owners found"), T.Accent)
+end)
 InfoRow(TeamSetup, "Randomized teams? Center a known teammate on screen and press F6, or an enemy and press F7.")
 P.markAllyKey, P.markEnemyKey = Enum.KeyCode.F6, Enum.KeyCode.F7
 Keybind(TeamSetup, "Mark teammate under crosshair", P.markAllyKey, function(k) P.markAllyKey = k end, true)
