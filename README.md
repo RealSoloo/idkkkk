@@ -273,7 +273,7 @@ bundled sources match their originals and load without requesting the network.
 
 Open **Build A Boat → Build Library**. The existing hub layout and farming tools
 are unchanged. Files live in the executor's **SolosHub/Babft Builds** folder.
-Capture a source team's plot (your own or a build its creator has shared), enter
+Choose a **Source player** and capture their owned blocks, enter
 a name under **Save as**, and load it from **Saved builds** on a later session.
 Existing filenames are never overwritten. Shared files must use this library's
 versioned JSON format; arbitrary scripts and other hubs' save formats are not run.
@@ -305,7 +305,7 @@ Learning requires executor `hookmetamethod` and `getnamecallmethod` support, a
 `BuildingTool` RemoteFunction, readable unambiguous inventory values, and the
 recognized seven-argument native format. A different live format is rejected,
 not silently treated as compatible. Saving needs the normal executor file APIs.
-Capture recognizes block Models with a direct `PPart` on a team's named zone.
+Capture recognizes block Models with a direct `PPart`, using owner tags/attributes or player-named ancestor folders. Unknown or conflicting owners are skipped; sharing a team is never treated as ownership.
 Unrecognized structures and mesh geometry are rejected rather than approximated.
 Scaled/painted geometry may be previewed but cannot be built unless it matches a
 learned native block. Wiring, engines, constraints and tool settings are not saved.
@@ -315,3 +315,16 @@ This is a first standard-block builder, not a complete arbitrary-boat copier.
 services. It checks rotated-plot preview/build parity, corner bounds, JSON and
 path validation, native-call learning, inventory/shape checks, mismatch stopping,
 control locking, and cleanup. These checks do not verify the live game's API.
+
+Loading a saved file now opens its preview automatically; it does not place real
+blocks until **Build At Preview** is clicked. Saving selects the new filename and
+refresh preserves selection. Source players are shown by username (with display
+names) and remain individually selectable even on the same team. Legacy build
+JSON files remain readable. Ownership matching is covered with mocked Object/
+String/numeric identities and containers; live metadata still needs verification.
+
+The live game rejected the initial placement learner's expected format. The
+**Copy Placement Report** action captures argument types and simple values from
+one observed native placement so the actual protocol can be implemented. The
+learning UI is temporary development tooling; a no-learning native builder is
+still pending verification of that report. The report contains no repository URLs.

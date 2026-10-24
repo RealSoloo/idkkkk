@@ -36,7 +36,8 @@ function CF.__mul(a,b)
  return CFrame.new(table.unpack(c))
 end
 function CFrame.Angles(x,y,z) assert(x==0 and z==0);return CFrame.new(0,0,0,math.cos(y),0,math.sin(y),0,1,0,-math.sin(y),0,math.cos(y)) end
-function typeof(v) return getmetatable(v)==CF and 'CFrame' or type(v) end
+function typeof(v) return getmetatable(v)==CF and 'CFrame' or (type(v)=='table' and v.ClassName and 'Instance') or type(v) end
+UDim2={new=function(...) return {...} end}
 Enum={Material={Plastic={Name='Plastic'}},PartType={Block={Name='Block'},Ball={Name='Ball'},Cylinder={Name='Cylinder'}}}
 function signal()
  local s={fns={}};function s:Connect(fn) table.insert(self.fns,fn) end;function s:Fire(...) for _,f in ipairs(self.fns) do f(...) end end;return s
@@ -52,6 +53,7 @@ function node(name,kind,parent)
  table.insert(nodes,n);return n
 end
 function N:IsA(k) return self.ClassName==k or k=='BasePart' and (self.ClassName=='Part' or self.ClassName=='WedgePart' or self.ClassName=='MeshPart') end
+function N:GetAttributes() return self.attributes or {} end
 function N:GetChildren() local out={} for _,n in ipairs(nodes) do if n.Parent==self then table.insert(out,n) end end return out end
 function N:GetDescendants() local out={} for _,n in ipairs(self:GetChildren()) do table.insert(out,n);for _,c in ipairs(n:GetDescendants()) do table.insert(out,c) end end return out end
 function N:FindFirstChild(name,recursive) for _,n in ipairs(recursive and self:GetDescendants() or self:GetChildren()) do if n.Name==name then return n end end end
@@ -62,26 +64,29 @@ function N:IsDescendantOf(parent) local n=self.Parent while n do if n==parent th
 function N:Destroy() for _,n in ipairs(self:GetChildren()) do n:Destroy() end;self.Parent=nil;self.destroyed=true end
 Instance={new=function(kind) return node(kind,kind) end}
 Workspace=node('Workspace','Workspace');zone=node('WhiteZone','Part',Workspace);zone.Size=Vector3.new(40,2,40);zone.CFrame=CFrame.new(100,5,50)*CFrame.Angles(0,math.pi/2,0)
-LocalPlayer=node('Me','Player');LocalPlayer.Team={Name='White'};LocalPlayer.Character=node('Character','Model',Workspace);LocalPlayer.CharacterRemoving=signal();teamSignal=signal()
+LocalPlayer=node('Me','Player');LocalPlayer.UserId=1;LocalPlayer.DisplayName='Me';LocalPlayer.Team={Name='White'};LocalPlayer.Character=node('Character','Model',Workspace);LocalPlayer.CharacterRemoving=signal();teamSignal=signal()
 function LocalPlayer:GetPropertyChangedSignal() return teamSignal end
 backpack=node('Backpack','Backpack',LocalPlayer);tool=node('BuildingTool','Tool',backpack);remote=node('RF','RemoteFunction',tool);count=node('WoodBlock','IntValue',LocalPlayer);count.Value=30
 function makeBlock(cf,kind) local m=node(kind or 'WoodBlock','Model',Workspace);local p=node('PPart','Part',m);p.CFrame=cf;return m,p end
-original,primary=makeBlock(zone.CFrame*CFrame.new(3,2,0))
+original,primary=makeBlock(zone.CFrame*CFrame.new(3,2,0));original.attributes={OwnerUserId=1}
+Players={list={LocalPlayer},PlayerAdded=signal(),PlayerRemoving=signal()}
+function Players:GetPlayers() return self.list end
+function Players:GetPlayerByUserId(id) for _,p in ipairs(self.list) do if p.UserId==id then return p end end end
 Teams={GetTeams=function() return {LocalPlayer.Team} end}
 Http={JSONEncode=function(_,v) return encode(v) end,JSONDecode=function(_,v) return decode(v) end}
-game={GetService=function(_,name) if name=='HttpService' then return Http elseif name=='Teams' then return Teams end end}
+game={GetService=function(_,name) if name=='HttpService' then return Http elseif name=='Players' then return Players elseif name=='Teams' then return Teams end end}
 Hub={dir='SolosHub'};API={env={}};Panel={Sub=function() return {} end};T={Warn='warning',Text='text'};Live={Running=true};RunService={Heartbeat=signal()}
 function getHum() return {Health=100} end
 controls={};cleanups={};infos={}
 function Section() return {} end
-function InfoRow(_,text) local row={Text=text};table.insert(infos,row);return row end
+function InfoRow(_,text) local row={Text=text,Parent={}};table.insert(infos,row);return row end
 function bind(s,f) s:Connect(f) end
 function onUnload(f) table.insert(cleanups,f) end
 function Button(_,name,_,cb) controls[name]={Fire=cb} end
 function Input(_,name,_,_,cb) controls[name]={Fire=cb} end
 function Toggle(_,name,initial,cb) local o={value=initial};function o.Set(v) o.value=v end;function o.Fire(v) o.value=v;cb(v) end;controls[name]=o;return o end
 function Slider(_,name,_,_,initial,cb) local o={value=initial};function o.SetSilent(v) o.value=v end;function o.Fire(v) o.value=v;cb(v) end;controls[name]=o;return o end
-function Dropdown(_,name,options,initial,cb) local o={options=options,i=initial};function o.SetOptions(opts) o.options=opts;o.i=1 end;function o.Set(i) o.i=i end;function o.Get() return o.i end;controls[name]=o;return o end
+function Dropdown(_,name,options,initial,cb) local o={options=options,i=initial};function o.SetOptions(opts) o.options=opts;o.i=1 end;function o.Set(i,silent) o.i=i;if cb and not silent then cb(i) end end;function o.Get() return o.i end;controls[name]=o;return o end
 files={};folders={}
 function isfolder(p) return folders[p] or false end
 function makefolder(p) folders[p]=true end
@@ -109,7 +114,7 @@ function learn()
  local m,extra=remote:InvokeServer('WoodBlock',count.Value,zone,zone.CFrame*CFrame.new(-6,2,-6),true,1,zone.CFrame*CFrame.new(-6,2,-6))
  assert(extra=='native return');pump()
 end
-function capture() controls['Capture Selected Plot'].Fire() end
+function capture() controls['Capture Player Build'].Fire() end
 function preview() controls['Show Preview'].Fire(true) end
 '''
 
@@ -196,7 +201,7 @@ class BuildTests(unittest.TestCase):
         self.lua.execute('''capture();local data=Test.state.data;table.insert(data.blocks,data.blocks[1]);learn();preview()
         controls['Build At Preview'].Fire();pump(1);assert(sent==2)
         controls['Exact offset'].Fire('4,0,0');controls['Offset X (x0.1 studs)'].Fire(40);assert(Test.state.x==0)
-        controls['Build At Preview'].Fire();controls['Capture Selected Plot'].Fire();assert(Test.state.data==data)
+        controls['Build At Preview'].Fire();controls['Capture Player Build'].Fire();assert(Test.state.data==data)
         controls['Stop Building'].Fire();pump();assert(sent==2 and not Test.state.busy)
         ''')
 
@@ -244,9 +249,33 @@ class BuildTests(unittest.TestCase):
     def test_removed_plot_and_loaded_build_reset_preview_controls(self):
         self.lua.execute('''capture();controls['Save as'].Fire('A');preview()
         controls['Exact offset'].Fire('5, 1, 2');controls['Load Selected Build'].Fire()
-        assert(Test.state.x==0 and not Test.state.preview and controls['Offset X (x0.1 studs)'].value==0)
+        assert(Test.state.x==0 and Test.state.preview and controls['Offset X (x0.1 studs)'].value==0)
         preview();local folder=Test.state.preview;zone:Destroy();RunService.Heartbeat:Fire(.5)
         assert(folder.destroyed and not Test.state.preview)
+        ''')
+
+    def test_selected_player_filters_shared_plot_and_unknown_blocks(self):
+        self.lua.execute('''local other=node('Other','Player');other.UserId=2;other.DisplayName='Me';other.Team=LocalPlayer.Team
+        Players.list={LocalPlayer,other};controls['Refresh Players'].Fire()
+        local b,p=makeBlock(zone.CFrame*CFrame.new(6,2,0));local tag=node('Tag','StringValue',b);tag.Value='Other'
+        makeBlock(zone.CFrame*CFrame.new(9,2,0))
+        controls['Source player'].Set(2);capture();assert(#Test.state.data.blocks==1 and Test.state.data.source.userId==2)
+        controls['Source player'].Set(1);capture();assert(#Test.state.data.blocks==1 and Test.state.data.source.userId==1)
+        ''')
+
+    def test_player_folder_and_departure_preserve_selection(self):
+        self.lua.execute('''local other=node('Other','Player');other.UserId=2;other.DisplayName='Other';other.Team=LocalPlayer.Team
+        Players.list={LocalPlayer,other};controls['Refresh Players'].Fire()
+        local folder=node('Other','Folder',Workspace);local b=makeBlock(zone.CFrame*CFrame.new(6,2,0));b.Parent=folder
+        controls['Source player'].Set(2);capture();assert(Test.state.data.source.userId==2)
+        local old=Test.state.data;Players.list={LocalPlayer};controls['Refresh Players'].Fire();capture();assert(Test.state.data==old)
+        ''')
+
+    def test_save_selects_new_file_and_load_shows_preview(self):
+        self.lua.execute('''capture();controls['Save as'].Fire('Alpha');controls['Save as'].Fire('Zulu')
+        assert(Test.state.files[controls['Saved builds'].Get()]=='Zulu')
+        controls['Refresh Saved Builds'].Fire();assert(Test.state.files[controls['Saved builds'].Get()]=='Zulu')
+        controls['Load Selected Build'].Fire();assert(Test.state.shown and #Test.state.ghosts==1 and sent==0)
         ''')
 
 if __name__ == '__main__':
