@@ -286,45 +286,39 @@ at least one corner is outside the plot or below the surface, and prevents build
 The preview clears on respawn, team/plot change or unload. Limits: 3,000 parts,
 8 MB per file, and ±100 studs of horizontal offset / 0–100 studs of added height.
 
-The initial auto-builder supports **standard, unscaled, unpainted block geometry**.
-It is **not live verified**. Because no known working building source was supplied,
-it learns a restricted native placement call instead of sending guessed requests:
+The auto-builder now uses the reported **eight-argument BuildingTool.RF** format.
+**Learn Building Tool**, **Cancel Learning**, hooks and per-type recipes have been
+removed. Load/capture a build, adjust the preview, run **Check Build**, then
+**Build At Preview**. Inventory is checked before starting and before every block.
 
-1. Click **Learn Building Tool** and place one plain, anchored block with the
-   game's normal building tool. It must report **Learned <block type>**. Repeat
-   for each required type; learning is session-local.
-2. Capture/load a build, show its preview, and adjust its placement.
-3. **Check Build** verifies learned shapes, inventory counts and plot bounds.
-4. **Build At Preview** sends one placement at a time using the observed format,
-   then verifies the new block's position, orientation, size and appearance.
-   A rejection or mismatch stops the job without retries. **Stop Building** stops
-   subsequent placements; already placed blocks remain, and an in-flight remote
-   call cannot be recalled. Placement controls are frozen while a job runs.
+The BoatMotor and GoldBlock reports have the same transform between argument 4
+and argument 6, including the rotated motor. The builder verifies that transform
+against the live WhiteZone CFrame (or its inverse) to identify which argument is
+plot-local and which is world-space. It computes placement from the current
+team's actual zone, including rotated zones; the report offset is never added to
+the requested target. Arguments 5/7/8 are `true, false, true`, as reported.
+If the live zone does not confirm either interpretation, it sends no requests.
+**Copy Build Report** then provides current zone frames for development without
+requiring normal users to learn blocks or hooking their tools.
 
-Learning requires executor `hookmetamethod` and `getnamecallmethod` support, a
-`BuildingTool` RemoteFunction, readable unambiguous inventory values, and the
-recognized seven-argument native format. A different live format is rejected,
-not silently treated as compatible. Saving needs the normal executor file APIs.
-Capture recognizes block Models with a direct `PPart`, using owner tags/attributes or player-named ancestor folders. Unknown or conflicting owners are skipped; sharing a team is never treated as ownership.
-Unrecognized structures and mesh geometry are rejected rather than approximated.
-Scaled/painted geometry may be previewed but cannot be built unless it matches a
-learned native block. Wiring, engines, constraints and tool settings are not saved.
-This is a first standard-block builder, not a complete arbitrary-boat copier.
+Each request is followed by a check that a newly replicated block matches the
+preview's position, orientation, geometry and appearance. Rejection or mismatch
+stops the job without retrying. **Stop Building** prevents subsequent placements;
+an in-flight call cannot be recalled, and already placed blocks remain.
+Custom scaling, painting, meshes and wiring are not restored. Without native
+block templates, shape/appearance cannot be confirmed before the first placement;
+a modified build may place one mismatching block and then stop. The product UI
+states this limitation. This is not a complete arbitrary-boat copier.
 
-`tests/test_bab_builds.py` runs the actual library in mocked Roblox/file/tool
-services. It checks rotated-plot preview/build parity, corner bounds, JSON and
-path validation, native-call learning, inventory/shape checks, mismatch stopping,
-control locking, and cleanup. These checks do not verify the live game's API.
+Capture recognizes Models with a direct `PPart`, using owner attributes/value tags
+or player-named ancestor folders. Sharing a team is never treated as ownership;
+unknown or conflicting owners are skipped. Selected players remain selected
+across refreshes; departed players cannot silently switch capture to someone else.
+Loading opens a preview automatically without sending building requests. Saving
+selects the new filename; refreshing preserves selection. Existing JSON files
+remain compatible. Local file APIs are still required for saved builds.
 
-Loading a saved file now opens its preview automatically; it does not place real
-blocks until **Build At Preview** is clicked. Saving selects the new filename and
-refresh preserves selection. Source players are shown by username (with display
-names) and remain individually selectable even on the same team. Legacy build
-JSON files remain readable. Ownership matching is covered with mocked Object/
-String/numeric identities and containers; live metadata still needs verification.
-
-The live game rejected the initial placement learner's expected format. The
-**Copy Placement Report** action captures argument types and simple values from
-one observed native placement so the actual protocol can be implemented. The
-learning UI is temporary development tooling; a no-learning native builder is
-still pending verification of that report. The report contains no repository URLs.
+`tests/test_bab_builds.py` checks the two supplied argument sets, rotated destination
+plots, operation without learning/hooks, inventory and coordinate rejection,
+preview/build parity, file operations, ownership filters, cancellation and cleanup.
+These tests use mock services; actual server acceptance remains unverified here.

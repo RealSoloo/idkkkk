@@ -12624,8 +12624,8 @@ end)]==],
 -- for where your character is, which is why this style of farm works at all. Every name above is looked up defensively;
 -- if the game changed, the Status row tells you which part it could not find instead of erroring.
 --
--- v3: local build library, plot-relative placement preview, observed-tool auto-build.
---     Standard block support only; live placement must be learned and is not pre-verified here.
+-- v3: local build library, plot-relative placement preview, native eight-argument auto-build.
+--     Standard block support only; live placement is checked against the supplied format and replicated blocks.
 -- v2: farm movement types (Teleport / Tween / Step Hop), speed + easing, presets, noclip, wiggle + touch assist,
 --     stage range, chest-only mode, lap timeout, run/time limits, lap stats, float platform, safe spot, anti-AFK.
 
@@ -14478,29 +14478,14 @@ do
 	end))
 	Button(preview, "Reset Placement", "Reset", guarded(function() state.x, state.y, state.z, state.angle = 0, 0, 0, 0; sync() end))
 	Button(preview, "Clear Preview", "Clear", guarded(function() clearPreview(); previewToggle.Set(false); positionRow.Text = "Preview cleared" end))
-	-- Learn the native placement call instead of guessing a game's remote contract.
-	-- Only a BuildingTool RemoteFunction, seven typed arguments, the local plot and
-	-- a newly replicated block can establish a recipe. No arbitrary remote replay.
-	local building = Section(page, "Auto Build", "Learn a block with the normal building tool, then build from the preview", "tools")
-	local buildRow = InfoRow(building, "No block types learned in this session")
-	local recipes, learning, hooked, hookActive, replaying = {}, false, false, true, false
-	local learnToken = 0
-	local placementReport = "No placement observed yet. Click Learn, then place one normal block."
-	local function describePlacement(remote, args)
-		local lines = {"BABFT placement report v1", "remote=" .. remote.Name, "arguments=" .. args.n}
-		for i = 1, args.n do
-			local value = args[i]
-			local kind = typeof(value)
-			local detail = ""
-			if kind == "CFrame" then detail = table.concat(frame(value), ", ")
-			elseif kind == "Vector3" then detail = table.concat(vector(value), ", ")
-			elseif kind == "Instance" then detail = value.ClassName .. ":" .. value.Name
-			elseif kind == "string" or kind == "number" or kind == "boolean" then detail = tostring(value):sub(1, 120) end
-			lines[#lines + 1] = i .. ": " .. kind .. " " .. detail
-		end
-		placementReport = table.concat(lines, "\n")
-	end
-	local job = 0
+	-- Native eight-argument protocol reported from BoatMotor and GoldBlock.
+	-- The two reported frames alone do not identify their coordinate spaces:
+	-- confirm the relationship against the live WhiteZone before sending anything.
+	local building = Section(page, "Auto Build", "Build the saved blocks at the preview position", "tools")
+	local buildRow = InfoRow(building, "Ready to check your build; no learning required")
+	buildRow.TextWrapped = true
+	buildRow.Parent.Size = UDim2.new(1, 0, 0, 64)
+	local active, job = true, 0
 	local function buildSay(text) buildRow.Text = text end
 	local function inventory(kind)
 		local match
@@ -14573,70 +14558,42 @@ do
 			task.wait(0.15)
 		until os.clock() > deadline
 	end
-	local function learnCall(remote, args)
-		if not buildingTool(remote) or args.n ~= 7 or not zoneFor(LocalPlayer.Team) then return nil end
-		if type(args[1]) ~= "string" or type(args[2]) ~= "number" or args[3] ~= zoneFor(LocalPlayer.Team) or typeof(args[4]) ~= "CFrame" or args[5] ~= true or args[6] ~= 1 or typeof(args[7]) ~= "CFrame" then return nil end
-		if not cfNear(args[4], args[7]) then return nil end
-		local count = inventory(args[1])
-		if not count or args[2] ~= count.Value then return nil end
-		return {item = args[1], flag = args[5], remote = remote, target = args[4], before = models(), zone = args[3]}
+	local function nativeSpace()
+		local white
+		for _, child in ipairs(Workspace:GetChildren()) do
+			if child.Name:lower() == "whitezone" and child:IsA("BasePart") then white = child; break end
+		end
+		-- Both supplied samples give this same transform (arg6 * arg4^-1),
+		-- despite different block rotations. Verify it; never use it as a target offset.
+		local reference = CFrame.new(-53.565689086914062, -17.999992370605469, -345.5068664550781)
+		if white and cfNear(white.CFrame, reference) then return "local4" end
+		if white and cfNear(white.CFrame:Inverse(), reference) then return "world4" end
+		error("Could not verify placement coordinates against WhiteZone. Copy Build Report; no blocks sent.")
 	end
-	local function hook()
-		if hooked then return true end
-		local hookFn = hookmetamethod or API.env.hookmetamethod
-		local methodFn = getnamecallmethod or API.env.getnamecallmethod
-		local wrap = newcclosure or API.env.newcclosure or function(f) return f end
-		if type(hookFn) ~= "function" or type(methodFn) ~= "function" then error("Learning needs hookmetamethod and getnamecallmethod support in your executor") end
-		local previous
-		previous = hookFn(game, "__namecall", wrap(function(remote, ...)
-			local sample
-			if hookActive and learning and not replaying and methodFn() == "InvokeServer" then
-				local args = table.pack(...)
-				if buildingTool(remote) then pcall(describePlacement, remote, args) end
-				local ok, result = pcall(learnCall, remote, args)
-				if ok then sample = result end
-				if not sample and buildingTool(remote) then task.defer(function() if hookActive then buildSay("Placement format not supported yet. Copy Placement Report for the developer.") end end) end
-				if sample then learning = false; sample.token = learnToken end
-			end
-			-- Preserve the native call and its returns exactly. The observer cannot break it.
-			local result
-			if sample then
-				local call = table.pack(pcall(previous, remote, ...))
-				if not call[1] then task.defer(function() if hookActive then buildSay("Native placement failed; learn again") end end); error(call[2], 0) end
-				result = {n = call.n - 1}; for i = 2, call.n do result[i-1] = call[i] end
-			else result = table.pack(previous(remote, ...)) end
-			if sample and hookActive and result[1] == false then
-				task.defer(function() if hookActive then buildSay("The game rejected that placement; learn again") end end)
-			elseif sample and hookActive then
-				task.defer(function()
-					if not hookActive or sample.token ~= learnToken then return end
-					local ok, err = pcall(function()
-						buildSay("Waiting for the block you placed...")
-						local model, parts = arrived(sample.before, nil, sample.target, nil, function() return sample.token == learnToken and hookActive and Live.Running and zoneFor(LocalPlayer.Team) == sample.zone end)
-						if not hookActive or sample.token ~= learnToken then return end
-						if not model then buildSay("Could not verify that placement; learn again with one plain block") return end
-						recipes[model.Name] = {item = sample.item, flag = sample.flag, remoteName = sample.remote.Name, parts = parts}
-						buildSay("Learned " .. model.Name .. ". Repeat for other block types you need.")
-					end)
-					if not ok and hookActive then buildSay("Learning failed: " .. tostring(err)) end
-				end)
-			end
-			return table.unpack(result, 1, result.n)
-		end))
-		hooked = true
+	local function placementArgs(kind, amount, zone, target, space)
+		local relative = zone.CFrame:ToObjectSpace(target)
+		if space == "local4" then return kind, amount, zone, relative, true, target, false, true end
+		if space == "world4" then return kind, amount, zone, target, true, relative, false, true end
+		error("Unknown placement coordinate format")
 	end
-	Button(building, "Learn Building Tool", "Learn", guarded(function()
-		if state.busy then error("Stop the current build first") end
-		hook(); learnToken = learnToken + 1; learning = true
-		buildSay("Place ONE plain block normally on your plot. Keep it anchored.")
-	end), nil, "Observe your normal tool once per required block type; no building requests are sent while learning")
-	Button(building, "Copy Placement Report", "Copy", function() copyText(placementReport); buildSay("Placement report copied. This setup step is temporary while the native builder is developed.") end)
-	Button(building, "Cancel Learning", "Cancel", function() learning = false; learnToken = learnToken + 1; buildSay("Learning cancelled") end)
-	local function remoteFor(recipe)
+	Button(building, "Copy Build Report", "Copy", function()
+		local out = {"BABFT native builder v2"}
+		for _, part in ipairs(Workspace:GetChildren()) do
+			if part:IsA("BasePart") and part.Name:lower():find("zone", 1, true) then
+				out[#out+1] = part.Name .. " CFrame=" .. table.concat(frame(part.CFrame), ", ")
+			end
+		end
+		local root = getRoot()
+		if root then out[#out+1] = "Character CFrame=" .. table.concat(frame(root.CFrame), ", ") end
+		local ok, space = pcall(nativeSpace)
+		out[#out+1] = "coordinate check=" .. (ok and space or tostring(space))
+		copyText(table.concat(out, "\n")); buildSay("Build report copied")
+	end)
+	local function remoteFor()
 		for _, container in pairs({LocalPlayer.Character, LocalPlayer:FindFirstChildOfClass("Backpack")}) do
 			if container then
 				local tool = container:FindFirstChild("BuildingTool")
-				local remote = tool and tool:FindFirstChild(recipe.remoteName, true)
+				local remote = tool and tool:FindFirstChild("RF", true)
 				if remote and buildingTool(remote) then return remote end
 			end
 		end
@@ -14645,47 +14602,40 @@ do
 		if not state.data or not state.shown or not state.preview then error("Show and position the preview first") end
 		updatePreview()
 		if not state.preview or not state.inside then error("Keep every preview part inside your plot and above the ground") end
+		local space = nativeSpace()
+		if not remoteFor() then error("Your BuildingTool RF is unavailable; equip the building tool") end
 		local counts = {}
-		for _, block in ipairs(state.data.blocks) do
-			local recipe = recipes[block.kind]
-			if not recipe then error("Learn " .. block.kind .. " using the normal building tool first") end
-			if not sameParts(recipe.parts, block.parts) then error(block.kind .. " differs from the learned block. Scaled, repainted and custom blocks need additional tool support.") end
-			if not remoteFor(recipe) then error("Equip your building tool first") end
-			counts[recipe.item] = (counts[recipe.item] or 0) + 1
-		end
+		for _, block in ipairs(state.data.blocks) do counts[block.kind] = (counts[block.kind] or 0) + 1 end
 		for item, need in pairs(counts) do
 			local count = inventory(item)
 			if not count then error("Could not read inventory for " .. item) end
 			if count.Value < need then error("Not enough " .. item .. ": need " .. need .. ", available " .. count.Value) end
 		end
-		return state.origin, state.zone, state.data
+		return state.origin, state.zone, state.data, space
 	end
 	Button(building, "Check Build", "Check", guarded(function()
-		preflight(); buildSay("Ready: inventory and learned block shapes match the preview")
+		preflight(); buildSay("Ready: inventory and placement coordinates checked. Each placed block will be verified against the preview.")
 	end))
 	Button(building, "Build At Preview", "Build", guarded(function()
 		if state.busy then error("A build is already running") end
-		local origin, zone, data = preflight()
+		local origin, zone, data, space = preflight()
 		local zoneStart, teamStart = zone.CFrame, LocalPlayer.Team
-		state.busy, learning = true, false; learnToken = learnToken + 1
+		state.busy = true
 		job = job + 1; local current = job
 		local function running()
-			return current == job and hookActive and Live.Running and LocalPlayer.Team == teamStart and zone.Parent and zoneFor(LocalPlayer.Team) == zone and state.preview and cfNear(zone.CFrame, zoneStart) and getHum() and getHum().Health > 0
+			return current == job and active and Live.Running and LocalPlayer.Team == teamStart and zone.Parent and zoneFor(LocalPlayer.Team) == zone and state.preview and cfNear(zone.CFrame, zoneStart) and getHum() and getHum().Health > 0
 		end
 		task.spawn(function()
 			local completed = 0
 			local ok, err = pcall(function()
 				for _, block in ipairs(data.blocks) do
 					if not running() then error("Stopped") end
-					local recipe = recipes[block.kind]
-					local remote, count = remoteFor(recipe), inventory(recipe.item)
+					local remote, count = remoteFor(), inventory(block.kind)
 					if not remote or not count or count.Value < 1 then error("Building tool or inventory became unavailable") end
 					local target = origin * CFrame.new(table.unpack(block.cf))
 					local before = models()
 					buildSay("Building " .. (completed + 1) .. " / " .. #data.blocks)
-					replaying = true
-					local sent, reason = pcall(function() return remote:InvokeServer(recipe.item, count.Value, zone, target, recipe.flag, 1, target) end)
-					replaying = false
+					local sent, reason = pcall(function() return remote:InvokeServer(placementArgs(block.kind, count.Value, zone, target, space)) end)
 					if not sent or reason == false then error("Game rejected placement; stopped without retrying") end
 					local model = arrived(before, block.kind, target, block.parts, running)
 					if not model then error("Placement did not match the preview; stopped without retrying") end
@@ -14694,19 +14644,19 @@ do
 					task.wait(0.25)
 				end
 			end)
-			state.busy, replaying = false, false
-			if hookActive then buildSay((ok and "Finished" or tostring(err):gsub("^.-:%d+: ", "")) .. " | verified " .. completed .. " / " .. #data.blocks .. " blocks") end
+			state.busy = false
+			if active then buildSay((ok and "Finished" or tostring(err):gsub("^.-:%d+: ", "")) .. " | verified " .. completed .. " / " .. #data.blocks .. " blocks") end
 		end)
 	end))
 	Button(building, "Stop Building", "Stop", function()
-		job = job + 1; learning = false; learnToken = learnToken + 1
+		job = job + 1
 		buildSay(state.busy and "Stopping after the in-flight placement returns; existing blocks stay" or "Stopped")
 	end)
-	InfoRow(building, "Standard learned blocks only. Scaling, painting, meshes and wiring are not supported yet.")
-	onUnload(function() hookActive = false; learning = false; job = job + 1 end)
+	InfoRow(building, "Native blocks only. Custom size/paint may fail verification after the first placement; scaling and wiring are not restored.")
+	onUnload(function() active = false; job = job + 1 end)
 	-- A team switch, removed zone or respawn must never leave a preview on the old plot.
-	bind(LocalPlayer:GetPropertyChangedSignal("Team"), function() job = job + 1; learning = false; learnToken = learnToken + 1; clearPreview(); previewToggle.Set(false); say("Team changed; show preview again on your new plot") end)
-	bind(LocalPlayer.CharacterRemoving, function() job = job + 1; learning = false; learnToken = learnToken + 1; clearPreview(); previewToggle.Set(false) end)
+	bind(LocalPlayer:GetPropertyChangedSignal("Team"), function() job = job + 1; clearPreview(); previewToggle.Set(false); say("Team changed; show preview again on your new plot") end)
+	bind(LocalPlayer.CharacterRemoving, function() job = job + 1; clearPreview(); previewToggle.Set(false) end)
 	local elapsed = 0
 	bind(RunService.Heartbeat, function(dt)
 		if not state.preview then return end

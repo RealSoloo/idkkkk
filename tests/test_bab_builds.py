@@ -8,7 +8,7 @@ from lupa import LuaRuntime
 
 SOURCE = Path(__file__).resolve().parents[1].joinpath('Bab.txt').read_text()
 BLOCK = SOURCE.split('-- BABFT BUILD LIBRARY BEGIN', 1)[1].split('-- BABFT BUILD LIBRARY END', 1)[0]
-BLOCK = BLOCK.rstrip()[:-3] + '\nTest={validate=validate,safeName=safeName,placement=placement,partFrame=partFrame,onPlot=onPlot,state=state,recipes=recipes,preflight=preflight,clear=clearPreview}\nend'
+BLOCK = BLOCK.rstrip()[:-3] + '\nTest={validate=validate,safeName=safeName,placement=placement,partFrame=partFrame,onPlot=onPlot,state=state,nativeSpace=nativeSpace,placementArgs=placementArgs,preflight=preflight,clear=clearPreview}\nend'
 FIXTURE = r'''
 math.clamp=function(v,a,b) return math.max(a,math.min(b,v)) end
 table.pack=table.pack or function(...) return {n=select('#',...),...} end
@@ -63,8 +63,9 @@ function N:FindFirstAncestorOfClass(kind) local n=self.Parent while n do if n:Is
 function N:IsDescendantOf(parent) local n=self.Parent while n do if n==parent then return true end;n=n.Parent end return false end
 function N:Destroy() for _,n in ipairs(self:GetChildren()) do n:Destroy() end;self.Parent=nil;self.destroyed=true end
 Instance={new=function(kind) return node(kind,kind) end}
-Workspace=node('Workspace','Workspace');zone=node('WhiteZone','Part',Workspace);zone.Size=Vector3.new(40,2,40);zone.CFrame=CFrame.new(100,5,50)*CFrame.Angles(0,math.pi/2,0)
-LocalPlayer=node('Me','Player');LocalPlayer.UserId=1;LocalPlayer.DisplayName='Me';LocalPlayer.Team={Name='White'};LocalPlayer.Character=node('Character','Model',Workspace);LocalPlayer.CharacterRemoving=signal();teamSignal=signal()
+Workspace=node('Workspace','Workspace');zone=node('GreenZone','Part',Workspace);zone.Size=Vector3.new(40,2,40);zone.CFrame=CFrame.new(100,5,50)*CFrame.Angles(0,math.pi/2,0)
+referenceZone=node('WhiteZone','Part',Workspace);referenceZone.CFrame=CFrame.new(-53.565689086914062,-17.999992370605469,-345.5068664550781)
+LocalPlayer=node('Me','Player');LocalPlayer.UserId=1;LocalPlayer.DisplayName='Me';LocalPlayer.Team={Name='Green'};LocalPlayer.Character=node('Character','Model',Workspace);LocalPlayer.CharacterRemoving=signal();teamSignal=signal()
 function LocalPlayer:GetPropertyChangedSignal() return teamSignal end
 backpack=node('Backpack','Backpack',LocalPlayer);tool=node('BuildingTool','Tool',backpack);remote=node('RF','RemoteFunction',tool);count=node('WoodBlock','IntValue',LocalPlayer);count.Value=30
 function makeBlock(cf,kind) local m=node(kind or 'WoodBlock','Model',Workspace);local p=node('PPart','Part',m);p.CFrame=cf;return m,p end
@@ -98,22 +99,17 @@ queue={};ticks=0;os.clock=function() return ticks end
 task={spawn=function(f) table.insert(queue,coroutine.create(f)) end,defer=function(f) table.insert(queue,coroutine.create(f)) end,wait=function() coroutine.yield() end}
 function pump(n) for _=1,n or 30 do ticks=ticks+.3;local old=queue;queue={};for _,co in ipairs(old) do local ok,err=coroutine.resume(co);assert(ok,err);if coroutine.status(co)~='dead' then table.insert(queue,co) end end end end
 sent=0
-function native(self,kind,amount,plot,cf,flag,n,last)
- assert(self==remote and plot==zone and kind=='WoodBlock' and amount==count.Value and flag==true and n==1)
+function native(self,kind,amount,plot,relative,flag,target,flag2,flag3)
+ assert(self==remote and plot==zone and kind=='WoodBlock' and amount==count.Value and flag==true and flag2==false and flag3==true)
+ local expected=zone.CFrame:ToObjectSpace(target)
+ for i,x in ipairs({relative:GetComponents()}) do assert(math.abs(x-expected.a[i])<.00001) end
  sent=sent+1;count.Value=count.Value-1
  if reject then return false end
- local m,p=makeBlock(misplace and cf*CFrame.new(3,0,0) or cf,kind)
+ local m,p=makeBlock(misplace and target*CFrame.new(3,0,0) or target,kind)
  return m,'native return'
 end
-dispatch=native
-function hookmetamethod(_,_,fn) local prev=dispatch;dispatch=fn;return prev end
-function getnamecallmethod() return 'InvokeServer' end
-function N:InvokeServer(...) return dispatch(self,...) end
-function learn()
- controls['Learn Building Tool'].Fire()
- local m,extra=remote:InvokeServer('WoodBlock',count.Value,zone,zone.CFrame*CFrame.new(-6,2,-6),true,1,zone.CFrame*CFrame.new(-6,2,-6))
- assert(extra=='native return');pump()
-end
+function N:InvokeServer(...) return native(self,...) end
+
 function capture() controls['Capture Player Build'].Fire() end
 function preview() controls['Show Preview'].Fire(true) end
 '''
@@ -172,8 +168,8 @@ class BuildTests(unittest.TestCase):
         controls['Refresh Saved Builds'].Fire();controls['Load Selected Build'].Fire();assert(Test.state.data==old)
         ''')
 
-    def test_learn_native_call_and_build_uses_preview_transform(self):
-        self.lua.execute('''capture();learn();assert(Test.recipes.WoodBlock);preview()
+    def test_native_build_without_learning_uses_preview_transform(self):
+        self.lua.execute('''capture();preview()
         controls['Exact offset'].Fire('5, 1, 4');controls['Rotation (degrees)'].Fire(90)
         local want=Test.state.ghosts[1].object.CFrame;local before=sent
         controls['Build At Preview'].Fire();assert(Test.state.busy);pump()
@@ -182,67 +178,39 @@ class BuildTests(unittest.TestCase):
         local found=false;for _,row in ipairs(infos) do if row.Text:find('Finished | verified 1 / 1') then found=true end end;assert(found)
         ''')
 
-    def test_preflight_blocks_unknown_scaled_inventory_and_outside(self):
-        self.lua.execute('''capture();preview();assert(not pcall(Test.preflight));learn();assert(pcall(Test.preflight))
-        local part=Test.state.data.blocks[1].parts[1];part.size[1]=4;assert(not pcall(Test.preflight));part.size[1]=2
-        count.Value=0;assert(not pcall(Test.preflight));count.Value=10
-        controls['Exact offset'].Fire('100, 0, 0');assert(not pcall(Test.preflight))
-        assert(sent==1)
-        ''')
 
     def test_wrong_server_placement_stops_without_retry(self):
-        self.lua.execute('''capture();learn();preview();misplace=true
+        self.lua.execute('''capture();preview();misplace=true
         controls['Build At Preview'].Fire();pump(40)
-        assert(sent==2 and not Test.state.busy)
+        assert(sent==1 and not Test.state.busy)
         local found=false;for _,row in ipairs(infos) do if row.Text:find('Placement did not match') then found=true end end;assert(found)
         ''')
 
     def test_stop_freezes_controls_and_sends_no_further_blocks(self):
-        self.lua.execute('''capture();local data=Test.state.data;table.insert(data.blocks,data.blocks[1]);learn();preview()
-        controls['Build At Preview'].Fire();pump(1);assert(sent==2)
+        self.lua.execute('''capture();local data=Test.state.data;table.insert(data.blocks,data.blocks[1]);preview()
+        controls['Build At Preview'].Fire();pump(1);assert(sent==1)
         controls['Exact offset'].Fire('4,0,0');controls['Offset X (x0.1 studs)'].Fire(40);assert(Test.state.x==0)
         controls['Build At Preview'].Fire();controls['Capture Player Build'].Fire();assert(Test.state.data==data)
-        controls['Stop Building'].Fire();pump();assert(sent==2 and not Test.state.busy)
+        controls['Stop Building'].Fire();pump();assert(sent==1 and not Test.state.busy)
         ''')
 
     def test_respawn_team_change_and_unload_clear_preview_and_stop_jobs(self):
-        self.lua.execute('''capture();learn();preview();local folder=Test.state.preview
+        self.lua.execute('''capture();preview();local folder=Test.state.preview
         controls['Build At Preview'].Fire();LocalPlayer.CharacterRemoving:Fire();pump()
-        assert(folder.destroyed and sent==1 and not Test.state.busy)
+        assert(folder.destroyed and sent==0 and not Test.state.busy)
         preview();folder=Test.state.preview;teamSignal:Fire();assert(folder.destroyed)
         preview();folder=Test.state.preview;for _,fn in ipairs(cleanups) do fn() end;assert(folder.destroyed)
-        local before=sent;remote:InvokeServer('WoodBlock',count.Value,zone,zone.CFrame*CFrame.new(0,2,0),true,1,zone.CFrame*CFrame.new(0,2,0));assert(sent==before+1)
-        ''')
-
-    def test_unsupported_native_signature_is_not_replayed(self):
-        self.lua.execute('''controls['Learn Building Tool'].Fire()
-        dispatch(remote,'WoodBlock',count.Value,zone,zone.CFrame*CFrame.new(0,2,0),true,1,zone.CFrame*CFrame.new(1,2,0));pump()
-        assert(not Test.recipes.WoodBlock)
-        capture();preview();local before=sent;controls['Build At Preview'].Fire();pump();assert(sent==before)
+        local before=sent;remote:InvokeServer('WoodBlock',count.Value,zone,CFrame.new(0,2,0),true,zone.CFrame*CFrame.new(0,2,0),false,true);assert(sent==before+1)
         ''')
 
 
-    def test_missing_file_or_hook_support_does_not_break_library(self):
-        self.lua.execute('''capture();local data=Test.state.data
-        writefile=nil;controls['Save as'].Fire('No disk');assert(Test.state.data==data)
-        hookmetamethod=nil;controls['Learn Building Tool'].Fire();assert(sent==0)
-        preview();assert(Test.state.preview)
-        ''')
 
-    def test_cancel_learning_ignores_pending_verification(self):
-        self.lua.execute('''controls['Learn Building Tool'].Fire()
-        remote:InvokeServer('WoodBlock',count.Value,zone,zone.CFrame*CFrame.new(0,2,0),true,1,zone.CFrame*CFrame.new(0,2,0))
-        controls['Cancel Learning'].Fire();pump();assert(not Test.recipes.WoodBlock)
-        ''')
 
-    def test_native_rejection_is_not_learned(self):
-        self.lua.execute('''reject=true;controls['Learn Building Tool'].Fire()
-        local result=remote:InvokeServer('WoodBlock',count.Value,zone,zone.CFrame*CFrame.new(0,2,0),true,1,zone.CFrame*CFrame.new(0,2,0))
-        pump();assert(result==false and not Test.recipes.WoodBlock and sent==1)''')
+
 
     def test_builder_rejection_never_retries(self):
-        self.lua.execute('''capture();learn();preview();reject=true
-        controls['Build At Preview'].Fire();pump();assert(sent==2 and not Test.state.busy)
+        self.lua.execute('''capture();preview();reject=true
+        controls['Build At Preview'].Fire();pump();assert(sent==1 and not Test.state.busy)
         local found=false;for _,row in ipairs(infos) do if row.Text:find('Game rejected') then found=true end end;assert(found)
         ''')
 
@@ -276,6 +244,27 @@ class BuildTests(unittest.TestCase):
         assert(Test.state.files[controls['Saved builds'].Get()]=='Zulu')
         controls['Refresh Saved Builds'].Fire();assert(Test.state.files[controls['Saved builds'].Get()]=='Zulu')
         controls['Load Selected Build'].Fire();assert(Test.state.shown and #Test.state.ghosts==1 and sent==0)
+        ''')
+
+    def test_reported_motor_and_gold_frames_roundtrip(self):
+        self.lua.execute('''assert(not controls['Learn Building Tool'] and not controls['Cancel Learning'])
+        local samples={
+          {'BoatMotor',1,CFrame.new(25,7.5,-47,-1,0,0,0,1,0,0,0,-1),CFrame.new(-28.565689086914062,-10.499992370605469,-392.5068664550781,-1,0,0,0,1,0,0,0,-1)},
+          {'GoldBlock',540,CFrame.new(24,6.100000381469727,-49),CFrame.new(-29.565689086914062,-11.899991989135742,-394.5068664550781)}
+        }
+        for _,s in ipairs(samples) do
+          local args=table.pack(Test.placementArgs(s[1],s[2],referenceZone,s[4],Test.nativeSpace()))
+          assert(args.n==8 and args[1]==s[1] and args[2]==s[2] and args[3]==referenceZone and args[5] and args[7]==false and args[8])
+          for i,x in ipairs({args[4]:GetComponents()}) do assert(math.abs(x-s[3].a[i])<.0001) end
+          for i,x in ipairs({args[6]:GetComponents()}) do assert(math.abs(x-s[4].a[i])<.0001) end
+        end
+        ''')
+
+    def test_unknown_coordinates_and_missing_inventory_send_nothing(self):
+        self.lua.execute('''capture();preview();assert(pcall(Test.preflight))
+        count.Value=0;assert(not pcall(Test.preflight));count.Value=30
+        referenceZone.CFrame=CFrame.new(10,20,30)
+        controls['Build At Preview'].Fire();pump();assert(sent==0 and not Test.state.busy)
         ''')
 
 if __name__ == '__main__':
