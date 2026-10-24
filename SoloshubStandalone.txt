@@ -12614,7 +12614,7 @@ Button(Tpd, "Teleport", "Go", function()
 	end
 end)]==],
 		bab = [==[
--- Solos Hub game module: bab.lua  (Build A Boat For Treasure)  -- v2
+-- Solos Hub game module: bab.lua  (Build A Boat For Treasure)  -- v3
 -- Loaded by the main hub script (picker -> loadstring). Do not run this file on its own.
 --
 -- Written from memory of how the game is laid out, UNTESTED in game:
@@ -12624,6 +12624,8 @@ end)]==],
 -- for where your character is, which is why this style of farm works at all. Every name above is looked up defensively;
 -- if the game changed, the Status row tells you which part it could not find instead of erroring.
 --
+-- v3: local build library, plot-relative placement preview, observed-tool auto-build.
+--     Standard block support only; live placement must be learned and is not pre-verified here.
 -- v2: farm movement types (Teleport / Tween / Step Hop), speed + easing, presets, noclip, wiggle + touch assist,
 --     stage range, chest-only mode, lap timeout, run/time limits, lap stats, float platform, safe spot, anti-AFK.
 
@@ -14120,6 +14122,497 @@ do
 	LVclean = function() clearEsp() end
 end
 
+-- BABFT BUILD LIBRARY BEGIN
+-- Local data only: saved JSON is never evaluated as Lua.
+do
+	local Http = game:GetService("HttpService")
+	local dir = Hub.dir .. "/Babft Builds"
+	local MAX_PARTS, MAX_BYTES = 3000, 8 * 1024 * 1024
+	local function finite(n, limit)
+		return type(n) == "number" and n == n and math.abs(n) <= limit
+	end
+	local function vector(v) return { v.X, v.Y, v.Z } end
+	local function frame(cf) return { cf:GetComponents() } end
+	local function array(t, count, limit)
+		if type(t) ~= "table" or #t ~= count then return false end
+		for i = 1, count do if not finite(t[i], limit) then return false end end
+		return true
+	end
+	local function validFrame(t)
+		if not array(t, 12, 100000) then return false end
+		-- Reject malformed rotations instead of drawing distorted/out-of-bounds previews.
+		for row = 0, 2 do
+			local sum = 0
+			for col = 1, 3 do sum = sum + t[3 + row * 3 + col]^2 end
+			if math.abs(sum - 1) > 0.001 then return false end
+		end
+		for a = 0, 1 do
+			for b = a + 1, 2 do
+				local dot = 0
+				for col = 1, 3 do dot = dot + t[3 + a * 3 + col] * t[3 + b * 3 + col] end
+				if math.abs(dot) > 0.001 then return false end
+			end
+		end
+		local det = t[4]*(t[8]*t[12]-t[9]*t[11]) - t[5]*(t[7]*t[12]-t[9]*t[10]) + t[6]*(t[7]*t[11]-t[8]*t[10])
+		return math.abs(det - 1) <= 0.001
+	end
+	local function safeName(name)
+		if type(name) ~= "string" then return nil end
+		name = name:match("^%s*(.-)%s*$")
+		if #name < 1 or #name > 60 or name:find("[^%w _%-]") then return nil end
+		local reserved = name:upper():match("^([^ .]+)")
+		if reserved == "CON" or reserved == "PRN" or reserved == "AUX" or reserved == "NUL" or reserved:match("^COM%d$") or reserved:match("^LPT%d$") then return nil end
+		return name
+	end
+	local classes = { Part = true, WedgePart = true, CornerWedgePart = true }
+	local shapes = { Block = true, Ball = true, Cylinder = true }
+	local function validate(data)
+		if type(data) ~= "table" or data.format ~= "SolosHub.Babft" or data.version ~= 1 then return false, "Unsupported build file" end
+		if type(data.blocks) ~= "table" or #data.blocks == 0 or #data.blocks > MAX_PARTS then return false, "Invalid block count" end
+		local count = 0
+		for _, block in ipairs(data.blocks) do
+			if type(block) ~= "table" or type(block.kind) ~= "string" or #block.kind < 1 or #block.kind > 100 or not validFrame(block.cf) then return false, "Invalid block record" end
+			if type(block.parts) ~= "table" or #block.parts == 0 then return false, "Block has no geometry" end
+			for _, p in ipairs(block.parts) do
+				count = count + 1
+				if count > MAX_PARTS then return false, "Build exceeds 3000 preview parts" end
+				if type(p) ~= "table" or not classes[p.class] or not shapes[p.shape] or not validFrame(p.cf) or not array(p.size, 3, 2048) or not array(p.color, 3, 1) then return false, "Unsupported part geometry" end
+				for i = 1, 3 do if p.size[i] <= 0 or p.color[i] < 0 then return false, "Invalid size/color" end end
+				if type(p.material) ~= "string" or not Enum.Material[p.material] or not finite(p.alpha, 1) or p.alpha < 0 then return false, "Invalid appearance" end
+			end
+		end
+		return true, count
+	end
+	local function plotFrame(zone)
+		return zone.CFrame * CFrame.new(0, zone.Size.Y / 2, 0)
+	end
+	local function placement(zone, x, y, z, angle)
+		return plotFrame(zone) * CFrame.new(x, y, z) * CFrame.Angles(0, math.rad(angle), 0)
+	end
+	local function partFrame(origin, block, part)
+		return origin * CFrame.new(table.unpack(block.cf)) * CFrame.new(table.unpack(part.cf))
+	end
+	local function onPlot(zone, cf, size)
+		-- All eight corners: rotated blocks near plot edges must fit too.
+		for _, x in ipairs({-1, 1}) do
+			for _, y in ipairs({-1, 1}) do
+				for _, z in ipairs({-1, 1}) do
+					local point = zone.CFrame:PointToObjectSpace(cf:PointToWorldSpace(Vector3.new(x * size.X / 2, y * size.Y / 2, z * size.Z / 2)))
+					if math.abs(point.X) > zone.Size.X / 2 + 0.01 or math.abs(point.Z) > zone.Size.Z / 2 + 0.01 or point.Y < zone.Size.Y / 2 - 0.01 then return false end
+				end
+			end
+		end
+		return true
+	end
+	-- BABFT BUILD CORE END
+	local state = { data = nil, preview = nil, ghosts = {}, x = 0, y = 0, z = 0, angle = 0, shown = false, files = {}, teams = {}, busy = false }
+	local page = Panel.Sub("Build Library", "loot", "Save builds locally and preview their placement on your plot.")
+	local library = Section(page, "Babft Builds", "Local files in SolosHub / Babft Builds", "loot")
+	local status = InfoRow(library, "Choose a plot to capture, or load a saved build")
+	local function say(text, bad) status.Text = text; status.TextColor3 = bad and T.Warn or T.Text end
+	local function guarded(fn)
+		return function(...)
+			if state.busy then say("Stop the current build before changing it", true); return end
+			local ok, err = pcall(fn, ...)
+			if not ok then say(tostring(err):gsub("^.-:%d+: ", ""), true) end
+		end
+	end
+	local function storage()
+		if not (type(makefolder) == "function" and type(isfolder) == "function" and type(readfile) == "function" and type(writefile) == "function" and type(isfile) == "function" and type(listfiles) == "function") then error("This executor does not support local build files") end
+		if not isfolder(Hub.dir) then makefolder(Hub.dir) end
+		if not isfolder(dir) then makefolder(dir) end
+	end
+	local function zoneFor(team)
+		if not team then return nil end
+		local key = team.Name:lower():gsub("[^%w]", "")
+		for _, object in ipairs(Workspace:GetChildren()) do
+			if object.Name:lower():gsub("[^%w]", "") == key .. "zone" then
+				if object:IsA("BasePart") then return object end
+				return object:FindFirstChildWhichIsA("BasePart", true)
+			end
+		end
+	end
+	local function clearPreview()
+		if state.preview then state.preview:Destroy() end
+		state.preview, state.ghosts, state.shown = nil, {}, false
+	end
+	local positionRow, previewToggle
+	local function updatePreview()
+		if not state.preview then return end
+		local zone = zoneFor(LocalPlayer.Team)
+		if not zone then clearPreview(); if previewToggle then previewToggle.Set(false) end; say("Your team plot is not available", true); return end
+		local origin = placement(zone, state.x, state.y, state.z, state.angle)
+		local outside = 0
+		for _, ghost in ipairs(state.ghosts) do
+			local cf = partFrame(origin, ghost.block, ghost.part)
+			ghost.object.CFrame = cf
+			local valid = onPlot(zone, cf, ghost.object.Size)
+			if not valid then outside = outside + 1 end
+			ghost.object.Color = valid and Color3.new(table.unpack(ghost.part.color)) or Color3.fromRGB(255, 75, 90)
+		end
+		state.origin, state.zone, state.zoneCF, state.inside = origin, zone, zone.CFrame, outside == 0
+		if positionRow then positionRow.Text = string.format("X %.1f   Y %.1f   Z %.1f   Turn %.0f°  |  %s", state.x, state.y, state.z, state.angle, outside == 0 and "Inside your plot" or (outside .. " parts outside plot / below ground")) end
+	end
+	local function showPreview()
+		if not state.data then error("Capture or load a build first") end
+		if not zoneFor(LocalPlayer.Team) then error("Join a team with a plot first") end
+		clearPreview()
+		local folder = Instance.new("Folder"); folder.Name = "SolosBabftPreview"; folder.Parent = Workspace
+		state.preview, state.shown = folder, true
+		local ok, err = pcall(function()
+			for _, block in ipairs(state.data.blocks) do
+				for _, p in ipairs(block.parts) do
+					local object = Instance.new(p.class)
+					object.Name = "Preview"; object.Anchored = true
+					object.CanCollide, object.CanTouch, object.CanQuery = false, false, false
+					object.CastShadow = false; object.Size = Vector3.new(table.unpack(p.size))
+					if p.class == "Part" then object.Shape = Enum.PartType[p.shape] end
+					object.Material = Enum.Material[p.material]
+					object.Transparency = math.max(p.alpha, 0.45)
+					object.Parent = folder
+					table.insert(state.ghosts, {object = object, block = block, part = p})
+				end
+			end
+			updatePreview()
+		end)
+		if not ok then clearPreview(); error(err) end
+		if previewToggle then previewToggle.Set(true) end
+	end
+	local syncControls
+	local function install(data)
+		local ok, why = validate(data)
+		if not ok then error(why) end
+		clearPreview(); state.data = data
+		state.x, state.y, state.z, state.angle = 0, 0, 0, 0
+		if syncControls then syncControls() end
+		if previewToggle then previewToggle.Set(false) end
+		say(#data.blocks .. " blocks loaded; show the preview to position them")
+	end
+	local sourceDd = Dropdown(library, "Source plot", {}, 1)
+	local function refreshTeams()
+		state.teams = game:GetService("Teams"):GetTeams()
+		table.sort(state.teams, function(a, b) return a.Name < b.Name end)
+		local names, selected = {}, 1
+		for i, team in ipairs(state.teams) do names[i] = team.Name; if team == LocalPlayer.Team then selected = i end end
+		sourceDd.SetOptions(names); sourceDd.Set(selected, true)
+	end
+	Button(library, "Refresh Plots", "Refresh", guarded(refreshTeams))
+	-- Captures standard block models only. Unknown mesh geometry fails the entire capture
+	-- rather than saving an inaccurate approximation and calling it an exact preview.
+	Button(library, "Capture Selected Plot", "Capture", guarded(function()
+		if state.busy then return end
+		local zone = zoneFor(state.teams[sourceDd.Get()])
+		if not zone then error("Selected plot was not found") end
+		local origin = plotFrame(zone)
+		local data = {format = "SolosHub.Babft", version = 1, blocks = {}}
+		local total = 0
+		for _, model in ipairs(Workspace:GetDescendants()) do
+			if model:IsA("Model") and not (state.preview and model:IsDescendantOf(state.preview)) then
+				local primary = model:FindFirstChild("PPart")
+				if primary and primary:IsA("BasePart") then
+					local pos = zone.CFrame:PointToObjectSpace(primary.Position)
+					if math.abs(pos.X) <= zone.Size.X/2 and math.abs(pos.Z) <= zone.Size.Z/2 and pos.Y >= zone.Size.Y/2 then
+						local block = {kind = model.Name, cf = frame(origin:ToObjectSpace(primary.CFrame)), parts = {}}
+						for _, p in ipairs(model:GetDescendants()) do
+							if p:IsA("BasePart") then
+								if not classes[p.ClassName] or p:FindFirstChildWhichIsA("DataModelMesh") then error("Cannot accurately save " .. model.Name .. ": mesh geometry needs game templates") end
+								total = total + 1
+								if total > MAX_PARTS then error("Build exceeds 3000 parts") end
+								table.insert(block.parts, {class = p.ClassName, shape = p:IsA("Part") and p.Shape.Name or "Block", cf = frame(primary.CFrame:ToObjectSpace(p.CFrame)), size = vector(p.Size), color = {p.Color.R, p.Color.G, p.Color.B}, material = p.Material.Name, alpha = p.Transparency})
+							end
+						end
+						table.insert(data.blocks, block)
+					end
+				end
+			end
+		end
+		if #data.blocks == 0 then error("No standard PPart blocks found on that plot") end
+		install(data)
+	end), nil, "Save your builds or builds their creator has shared with you")
+	local savedDd = Dropdown(library, "Saved builds", {}, 1)
+	local function refreshFiles()
+		storage()
+		local names, seen = {}, {}
+		for _, path in ipairs(listfiles(dir)) do
+			local name = path:gsub("\\", "/"):match("([^/]+)%.json$")
+			if safeName(name) and not seen[name] then seen[name] = true; table.insert(names, name) end
+		end
+		table.sort(names); state.files = names; savedDd.SetOptions(names)
+	end
+	Input(library, "Save as", "Build name (new file)", "Save", guarded(function(name)
+		name = safeName(name)
+		if not name then error("Use 1-60 letters, numbers, spaces, underscores or hyphens") end
+		if not state.data then error("Capture or load a build first") end
+		storage()
+		local path = dir .. "/" .. name .. ".json"
+		if isfile(path) then error("That build name already exists; use a new name") end
+		local text = Http:JSONEncode(state.data)
+		if #text > MAX_BYTES then error("Build file is too large") end
+		writefile(path, text)
+		if readfile(path) ~= text then error("Could not verify the saved file") end
+		refreshFiles(); say("Saved " .. name .. " locally")
+	end))
+	Button(library, "Refresh Saved Builds", "Refresh", guarded(refreshFiles))
+	Button(library, "Load Selected Build", "Load", guarded(function()
+		storage()
+		local name = state.files[savedDd.Get()]
+		if not name then error("Select a saved build first") end
+		local text = readfile(dir .. "/" .. name .. ".json")
+		if #text > MAX_BYTES then error("Build file exceeds 8 MB") end
+		install(Http:JSONDecode(text))
+	end))
+	local preview = Section(page, "Placement Preview", "A translucent, non-colliding copy on your current team's plot", "magnet")
+	previewToggle = Toggle(preview, "Show Preview", false, function(value)
+		if state.busy then previewToggle.Set(state.shown); say("Stop building before changing the preview", true); return end
+		if value then
+			local ok, err = pcall(showPreview)
+			if not ok then clearPreview(); previewToggle.Set(false); say(tostring(err), true) end
+		else clearPreview() end
+	end)
+	positionRow = InfoRow(preview, "Load a build, then show its preview")
+	local controls = {}
+	local function sync()
+		for key, control in pairs(controls) do control.SetSilent(key == "angle" and state[key] or state[key] * 10) end
+		updatePreview()
+	end
+	syncControls = sync
+	for _, axis in ipairs({"x", "y", "z"}) do
+		controls[axis] = Slider(preview, "Offset " .. axis:upper() .. " (x0.1 studs)", axis == "y" and 0 or -1000, 1000, 0, function(v) if state.busy then sync(); return end; state[axis] = v / 10; updatePreview() end)
+	end
+	controls.angle = Slider(preview, "Rotation (degrees)", -180, 180, 0, function(v) if state.busy then sync(); return end; state.angle = v; updatePreview() end)
+	Input(preview, "Exact offset", "X, Y, Z in studs", "Set", guarded(function(text)
+		local x, y, z = text:match("^%s*([^,]+),%s*([^,]+),%s*([^,]+)%s*$")
+		x, y, z = tonumber(x), tonumber(y), tonumber(z)
+		if not finite(x, 100) or not finite(y, 100) or not finite(z, 100) or y < 0 then error("Use X, Y, Z from -100 to 100; height must be 0 to 100") end
+		state.x, state.y, state.z = x, y, z; sync()
+	end))
+	Button(preview, "Reset Placement", "Reset", guarded(function() state.x, state.y, state.z, state.angle = 0, 0, 0, 0; sync() end))
+	Button(preview, "Clear Preview", "Clear", guarded(function() clearPreview(); previewToggle.Set(false); positionRow.Text = "Preview cleared" end))
+	-- Learn the native placement call instead of guessing a game's remote contract.
+	-- Only a BuildingTool RemoteFunction, seven typed arguments, the local plot and
+	-- a newly replicated block can establish a recipe. No arbitrary remote replay.
+	local building = Section(page, "Auto Build", "Learn a block with the normal building tool, then build from the preview", "tools")
+	local buildRow = InfoRow(building, "No block types learned in this session")
+	local recipes, learning, hooked, hookActive, replaying = {}, false, false, true, false
+	local learnToken = 0
+	local job = 0
+	local function buildSay(text) buildRow.Text = text end
+	local function inventory(kind)
+		local match
+		for _, v in ipairs(LocalPlayer:GetDescendants()) do
+			if v.Name == kind and (v:IsA("IntValue") or v:IsA("NumberValue")) and finite(v.Value, 10000000) and v.Value >= 0 then
+				if match and match ~= v then return nil end
+				match = v
+			end
+		end
+		return match
+	end
+	local function buildingTool(remote)
+		if not remote or not remote:IsA("RemoteFunction") then return nil end
+		local tool = remote:FindFirstAncestorOfClass("Tool")
+		local backpack = LocalPlayer:FindFirstChildOfClass("Backpack")
+		if tool and tool.Name == "BuildingTool" and (tool.Parent == LocalPlayer.Character or tool.Parent == backpack) then return tool end
+	end
+	local function cfNear(a, b)
+		local aa, bb = frame(a), frame(b)
+		for i = 1, 12 do if math.abs(aa[i] - bb[i]) > 0.025 then return false end end
+		return true
+	end
+	local function sameParts(a, b)
+		if #a ~= #b then return false end
+		local used = {}
+		for _, p in ipairs(a) do
+			local found
+			for i, q in ipairs(b) do
+				if not used[i] and p.class == q.class and p.shape == q.shape and p.material == q.material and math.abs(p.alpha - q.alpha) < 0.02 and cfNear(CFrame.new(table.unpack(p.cf)), CFrame.new(table.unpack(q.cf))) then
+					local equal = true
+					for axis = 1, 3 do if math.abs(p.size[axis] - q.size[axis]) > 0.025 or math.abs(p.color[axis] - q.color[axis]) > 0.01 then equal = false end end
+					if equal then found = i; break end
+				end
+			end
+			if not found then return false end
+			used[found] = true
+		end
+		return true
+	end
+	local function geometry(model)
+		local primary = model:FindFirstChild("PPart")
+		if not primary or not primary:IsA("BasePart") then return nil end
+		local parts = {}
+		for _, p in ipairs(model:GetDescendants()) do
+			if p:IsA("BasePart") then
+				if not classes[p.ClassName] or p:FindFirstChildWhichIsA("DataModelMesh") then return nil end
+				table.insert(parts, {class = p.ClassName, shape = p:IsA("Part") and p.Shape.Name or "Block", cf = frame(primary.CFrame:ToObjectSpace(p.CFrame)), size = vector(p.Size), color = {p.Color.R, p.Color.G, p.Color.B}, material = p.Material.Name, alpha = p.Transparency})
+			end
+		end
+		return parts, primary
+	end
+	local function models()
+		local set = {}
+		for _, d in ipairs(Workspace:GetDescendants()) do
+			if d:IsA("Model") and d:FindFirstChild("PPart") then set[d] = true end
+		end
+		return set
+	end
+	local function arrived(before, kind, target, parts, still)
+		local deadline = os.clock() + 6
+		repeat
+			if not still() then return nil end
+			for model in pairs(models()) do
+				if not before[model] and (not kind or model.Name == kind) then
+					local actual, primary = geometry(model)
+					if actual and cfNear(primary.CFrame, target) and (not parts or sameParts(parts, actual)) then return model, actual end
+				end
+			end
+			if not still() then return nil end
+			task.wait(0.15)
+		until os.clock() > deadline
+	end
+	local function learnCall(remote, args)
+		if not buildingTool(remote) or args.n ~= 7 or not zoneFor(LocalPlayer.Team) then return nil end
+		if type(args[1]) ~= "string" or type(args[2]) ~= "number" or args[3] ~= zoneFor(LocalPlayer.Team) or typeof(args[4]) ~= "CFrame" or args[5] ~= true or args[6] ~= 1 or typeof(args[7]) ~= "CFrame" then return nil end
+		if not cfNear(args[4], args[7]) then return nil end
+		local count = inventory(args[1])
+		if not count or args[2] ~= count.Value then return nil end
+		return {item = args[1], flag = args[5], remote = remote, target = args[4], before = models(), zone = args[3]}
+	end
+	local function hook()
+		if hooked then return true end
+		local hookFn = hookmetamethod or API.env.hookmetamethod
+		local methodFn = getnamecallmethod or API.env.getnamecallmethod
+		local wrap = newcclosure or API.env.newcclosure or function(f) return f end
+		if type(hookFn) ~= "function" or type(methodFn) ~= "function" then error("Learning needs hookmetamethod and getnamecallmethod support in your executor") end
+		local previous
+		previous = hookFn(game, "__namecall", wrap(function(remote, ...)
+			local sample
+			if hookActive and learning and not replaying and methodFn() == "InvokeServer" then
+				local ok, result = pcall(learnCall, remote, table.pack(...))
+				if ok then sample = result end
+				if not sample and buildingTool(remote) then task.defer(function() if hookActive then buildSay("Unsupported placement format. No recipe learned and no auto-build request sent.") end end) end
+				if sample then learning = false; sample.token = learnToken end
+			end
+			-- Preserve the native call and its returns exactly. The observer cannot break it.
+			local result
+			if sample then
+				local call = table.pack(pcall(previous, remote, ...))
+				if not call[1] then task.defer(function() if hookActive then buildSay("Native placement failed; learn again") end end); error(call[2], 0) end
+				result = {n = call.n - 1}; for i = 2, call.n do result[i-1] = call[i] end
+			else result = table.pack(previous(remote, ...)) end
+			if sample and hookActive and result[1] == false then
+				task.defer(function() if hookActive then buildSay("The game rejected that placement; learn again") end end)
+			elseif sample and hookActive then
+				task.defer(function()
+					if not hookActive or sample.token ~= learnToken then return end
+					local ok, err = pcall(function()
+						buildSay("Waiting for the block you placed...")
+						local model, parts = arrived(sample.before, nil, sample.target, nil, function() return sample.token == learnToken and hookActive and Live.Running and zoneFor(LocalPlayer.Team) == sample.zone end)
+						if not hookActive or sample.token ~= learnToken then return end
+						if not model then buildSay("Could not verify that placement; learn again with one plain block") return end
+						recipes[model.Name] = {item = sample.item, flag = sample.flag, remoteName = sample.remote.Name, parts = parts}
+						buildSay("Learned " .. model.Name .. ". Repeat for other block types you need.")
+					end)
+					if not ok and hookActive then buildSay("Learning failed: " .. tostring(err)) end
+				end)
+			end
+			return table.unpack(result, 1, result.n)
+		end))
+		hooked = true
+	end
+	Button(building, "Learn Building Tool", "Learn", guarded(function()
+		if state.busy then error("Stop the current build first") end
+		hook(); learnToken = learnToken + 1; learning = true
+		buildSay("Place ONE plain block normally on your plot. Keep it anchored.")
+	end), nil, "Observe your normal tool once per required block type; no building requests are sent while learning")
+	Button(building, "Cancel Learning", "Cancel", function() learning = false; learnToken = learnToken + 1; buildSay("Learning cancelled") end)
+	local function remoteFor(recipe)
+		for _, container in pairs({LocalPlayer.Character, LocalPlayer:FindFirstChildOfClass("Backpack")}) do
+			if container then
+				local tool = container:FindFirstChild("BuildingTool")
+				local remote = tool and tool:FindFirstChild(recipe.remoteName, true)
+				if remote and buildingTool(remote) then return remote end
+			end
+		end
+	end
+	local function preflight()
+		if not state.data or not state.shown or not state.preview then error("Show and position the preview first") end
+		updatePreview()
+		if not state.preview or not state.inside then error("Keep every preview part inside your plot and above the ground") end
+		local counts = {}
+		for _, block in ipairs(state.data.blocks) do
+			local recipe = recipes[block.kind]
+			if not recipe then error("Learn " .. block.kind .. " using the normal building tool first") end
+			if not sameParts(recipe.parts, block.parts) then error(block.kind .. " differs from the learned block. Scaled, repainted and custom blocks need additional tool support.") end
+			if not remoteFor(recipe) then error("Equip your building tool first") end
+			counts[recipe.item] = (counts[recipe.item] or 0) + 1
+		end
+		for item, need in pairs(counts) do
+			local count = inventory(item)
+			if not count then error("Could not read inventory for " .. item) end
+			if count.Value < need then error("Not enough " .. item .. ": need " .. need .. ", available " .. count.Value) end
+		end
+		return state.origin, state.zone, state.data
+	end
+	Button(building, "Check Build", "Check", guarded(function()
+		preflight(); buildSay("Ready: inventory and learned block shapes match the preview")
+	end))
+	Button(building, "Build At Preview", "Build", guarded(function()
+		if state.busy then error("A build is already running") end
+		local origin, zone, data = preflight()
+		local zoneStart, teamStart = zone.CFrame, LocalPlayer.Team
+		state.busy, learning = true, false; learnToken = learnToken + 1
+		job = job + 1; local current = job
+		local function running()
+			return current == job and hookActive and Live.Running and LocalPlayer.Team == teamStart and zone.Parent and zoneFor(LocalPlayer.Team) == zone and state.preview and cfNear(zone.CFrame, zoneStart) and getHum() and getHum().Health > 0
+		end
+		task.spawn(function()
+			local completed = 0
+			local ok, err = pcall(function()
+				for _, block in ipairs(data.blocks) do
+					if not running() then error("Stopped") end
+					local recipe = recipes[block.kind]
+					local remote, count = remoteFor(recipe), inventory(recipe.item)
+					if not remote or not count or count.Value < 1 then error("Building tool or inventory became unavailable") end
+					local target = origin * CFrame.new(table.unpack(block.cf))
+					local before = models()
+					buildSay("Building " .. (completed + 1) .. " / " .. #data.blocks)
+					replaying = true
+					local sent, reason = pcall(function() return remote:InvokeServer(recipe.item, count.Value, zone, target, recipe.flag, 1, target) end)
+					replaying = false
+					if not sent or reason == false then error("Game rejected placement; stopped without retrying") end
+					local model = arrived(before, block.kind, target, block.parts, running)
+					if not model then error("Placement did not match the preview; stopped without retrying") end
+					completed = completed + 1
+					if not running() then error("Stopped") end
+					task.wait(0.25)
+				end
+			end)
+			state.busy, replaying = false, false
+			if hookActive then buildSay((ok and "Finished" or tostring(err):gsub("^.-:%d+: ", "")) .. " | verified " .. completed .. " / " .. #data.blocks .. " blocks") end
+		end)
+	end))
+	Button(building, "Stop Building", "Stop", function()
+		job = job + 1; learning = false; learnToken = learnToken + 1
+		buildSay(state.busy and "Stopping after the in-flight placement returns; existing blocks stay" or "Stopped")
+	end)
+	InfoRow(building, "Standard learned blocks only. Scaling, painting, meshes and wiring are not supported yet.")
+	onUnload(function() hookActive = false; learning = false; job = job + 1 end)
+	-- A team switch, removed zone or respawn must never leave a preview on the old plot.
+	bind(LocalPlayer:GetPropertyChangedSignal("Team"), function() job = job + 1; learning = false; learnToken = learnToken + 1; clearPreview(); previewToggle.Set(false); say("Team changed; show preview again on your new plot") end)
+	bind(LocalPlayer.CharacterRemoving, function() job = job + 1; learning = false; learnToken = learnToken + 1; clearPreview(); previewToggle.Set(false) end)
+	local elapsed = 0
+	bind(RunService.Heartbeat, function(dt)
+		if not state.preview then return end
+		elapsed = elapsed + dt
+		if elapsed < 0.25 then return end
+		elapsed = 0
+		if not state.zone or not state.zone.Parent or zoneFor(LocalPlayer.Team) ~= state.zone or not cfNear(state.zone.CFrame, state.zoneCF) then job = job + 1; clearPreview(); previewToggle.Set(false); say("Plot changed; show preview again", true) end
+	end)
+	onUnload(clearPreview)
+	guarded(refreshTeams)()
+	guarded(refreshFiles)()
+end
+-- BABFT BUILD LIBRARY END
+
 -- ---------------------------------------------------- Teleports (shared Universal tab)
 local dest = { "Golden Chest", "My Team Zone" }
 for i = 10, 1, -1 do table.insert(dest, 1, "Stage " .. i) end
@@ -14459,16 +14952,7 @@ end)]==],
 			notify("Loading " .. pick.name .. "...", T.Sub)
 			local okm, errm = Hub.loadGameModule(pick)
 			if not okm then
-				notify("Couldn't load " .. pick.name .. ": " .. tostring(errm) .. " - using Universal", T.Bad)
-				if Tabs["Dashboard"] then
-					local report = "Game: " .. pick.name .. "\nURL: " .. tostring(Hub.ModuleURLs[pick.id]) .. "\n" .. tostring(errm)
-					local issue = Section(Tabs["Dashboard"], "Game Module Load Failed", "Copy the error below to identify why the selected game could not load.")
-					new("TextBox", { Size = UDim2.new(1, -20, 0, 110), BackgroundColor3 = T.Bg, TextColor3 = T.Text,
-						Text = report, TextSize = 12, Font = Enum.Font.Code, TextWrapped = true, MultiLine = true,
-						ClearTextOnFocus = false, TextEditable = false, TextXAlignment = Enum.TextXAlignment.Left,
-						TextYAlignment = Enum.TextYAlignment.Top }, issue)
-					Button(issue, "Copy Module Error", "Copy", function() copyText(report) end)
-				end
+				notify("Couldn't load " .. pick.name .. " - using Universal. Try again shortly.", T.Bad)
 				Hub.currentGame = "universal"
 				pick = Hub.Games[1]
 			end

@@ -6521,16 +6521,7 @@ do
 			notify("Loading " .. pick.name .. "...", T.Sub)
 			local okm, errm = Hub.loadGameModule(pick)
 			if not okm then
-				notify("Couldn't load " .. pick.name .. ": " .. tostring(errm) .. " - using Universal", T.Bad)
-				if Tabs["Dashboard"] then
-					local report = "Game: " .. pick.name .. "\nURL: " .. tostring(Hub.ModuleURLs[pick.id]) .. "\n" .. tostring(errm)
-					local issue = Section(Tabs["Dashboard"], "Game Module Load Failed", "Copy the error below to identify why the selected game could not load.")
-					new("TextBox", { Size = UDim2.new(1, -20, 0, 110), BackgroundColor3 = T.Bg, TextColor3 = T.Text,
-						Text = report, TextSize = 12, Font = Enum.Font.Code, TextWrapped = true, MultiLine = true,
-						ClearTextOnFocus = false, TextEditable = false, TextXAlignment = Enum.TextXAlignment.Left,
-						TextYAlignment = Enum.TextYAlignment.Top }, issue)
-					Button(issue, "Copy Module Error", "Copy", function() copyText(report) end)
-				end
+				notify("Couldn't load " .. pick.name .. " - using Universal. Try again shortly.", T.Bad)
 				Hub.currentGame = "universal"
 				pick = Hub.Games[1]
 			end

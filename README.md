@@ -245,14 +245,11 @@ Full hub Luau parsing passes; live Roblox behavior still needs verification.
 
 ### Game loading recovery
 
-The reported failure was an HTTP download error. The body editor is retained.
-The shared downloader now tries Roblox `HttpGet`
-if the executor request API fails or returns an empty/invalid response. All six
-game URLs remain unchanged. If download, compilation, or initialization fails,
-the Dashboard keeps a **Game Module Load Failed** card with **Copy Module Error**
-instead of relying only on a temporary notification. That report is needed to
-identify an executor-specific or live-game failure. Local checks cover both
-network methods and each failure stage; live loading remains unverified.
+The reported HTTP 404 was caused by the repository being private; making it
+public restored game loading. The shared downloader retains its request / HttpGet
+fallback. The temporary **Copy Module Error** card and visible URL report have
+been removed. Failures show a short notification; technical details stay in the
+console. Removing these links does not make a public repository's source private.
 
 ### Standalone hub for private repositories or blocked downloads
 
@@ -271,3 +268,50 @@ After editing the hub or any game module, run `python scripts/build_standalone.p
 to regenerate the standalone file, then download the new version. It does not
 fetch future module updates automatically. The loader tests verify that all six
 bundled sources match their originals and load without requesting the network.
+
+### Build a Boat: local build library and placement preview
+
+Open **Build A Boat → Build Library**. The existing hub layout and farming tools
+are unchanged. Files live in the executor's **SolosHub/Babft Builds** folder.
+Capture a source team's plot (your own or a build its creator has shared), enter
+a name under **Save as**, and load it from **Saved builds** on a later session.
+Existing filenames are never overwritten. Shared files must use this library's
+versioned JSON format; arbitrary scripts and other hubs' save formats are not run.
+
+**Show Preview** draws translucent, anchored, non-colliding parts on your own
+team's plot. X/Y/Z sliders or **Exact offset** move it; **Rotation** rotates the
+whole build around the source plot's origin. Both preview and building use the
+same plot-relative transforms, including the plot's rotation. Red geometry means
+at least one corner is outside the plot or below the surface, and prevents building.
+The preview clears on respawn, team/plot change or unload. Limits: 3,000 parts,
+8 MB per file, and ±100 studs of horizontal offset / 0–100 studs of added height.
+
+The initial auto-builder supports **standard, unscaled, unpainted block geometry**.
+It is **not live verified**. Because no known working building source was supplied,
+it learns a restricted native placement call instead of sending guessed requests:
+
+1. Click **Learn Building Tool** and place one plain, anchored block with the
+   game's normal building tool. It must report **Learned <block type>**. Repeat
+   for each required type; learning is session-local.
+2. Capture/load a build, show its preview, and adjust its placement.
+3. **Check Build** verifies learned shapes, inventory counts and plot bounds.
+4. **Build At Preview** sends one placement at a time using the observed format,
+   then verifies the new block's position, orientation, size and appearance.
+   A rejection or mismatch stops the job without retries. **Stop Building** stops
+   subsequent placements; already placed blocks remain, and an in-flight remote
+   call cannot be recalled. Placement controls are frozen while a job runs.
+
+Learning requires executor `hookmetamethod` and `getnamecallmethod` support, a
+`BuildingTool` RemoteFunction, readable unambiguous inventory values, and the
+recognized seven-argument native format. A different live format is rejected,
+not silently treated as compatible. Saving needs the normal executor file APIs.
+Capture recognizes block Models with a direct `PPart` on a team's named zone.
+Unrecognized structures and mesh geometry are rejected rather than approximated.
+Scaled/painted geometry may be previewed but cannot be built unless it matches a
+learned native block. Wiring, engines, constraints and tool settings are not saved.
+This is a first standard-block builder, not a complete arbitrary-boat copier.
+
+`tests/test_bab_builds.py` runs the actual library in mocked Roblox/file/tool
+services. It checks rotated-plot preview/build parity, corner bounds, JSON and
+path validation, native-call learning, inventory/shape checks, mismatch stopping,
+control locking, and cleanup. These checks do not verify the live game's API.
