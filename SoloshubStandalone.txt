@@ -14537,26 +14537,74 @@ do
 		end
 		return parts, primary
 	end
-	local function models()
-		local set = {}
-		for _, d in ipairs(Workspace:GetDescendants()) do
-			if d:IsA("Model") and d:FindFirstChild("PPart") then set[d] = true end
+	local lastAttempt = {"No build attempted yet"}
+	local watchers = {}
+	local function watchPlacement()
+		local watch = {models = {}, total = 0, closed = false, overflow = false}
+		local function observe(object)
+			if watch.closed or not object:IsA("Model") or watch.models[object] then return end
+			if state.preview and object:IsDescendantOf(state.preview) then return end
+			if watch.total >= 500 then watch.overflow = true; return end
+			watch.models[object] = true; watch.total = watch.total + 1
 		end
-		return set
+		watch.connection = Workspace.DescendantAdded:Connect(observe)
+		function watch.close()
+			if watch.closed then return end
+			watch.closed = true; watch.connection:Disconnect(); watchers[watch] = nil
+		end
+		watchers[watch] = true
+		return watch
 	end
-	local function arrived(before, kind, target, parts, still)
+	local function arrived(watch, kind, target, parts, still)
 		local deadline = os.clock() + 6
+		local detail
 		repeat
-			if not still() then return nil end
-			for model in pairs(models()) do
-				if not before[model] and (not kind or model.Name == kind) then
-					local actual, primary = geometry(model)
-					if actual and cfNear(primary.CFrame, target) and (not parts or sameParts(parts, actual)) then return model, actual end
+			if not still() then return nil, "Stopped" end
+			local typed, positioned, unsupported, different = 0, 0, 0, 0
+			local samples = {}
+			for model in pairs(watch.models) do
+				if model.Parent and model.Name == kind then
+					typed = typed + 1
+					local primary = model:FindFirstChild("PPart")
+					if primary and primary:IsA("BasePart") then
+						if #samples < 3 then samples[#samples+1] = "new " .. kind .. " CFrame=" .. table.concat(frame(primary.CFrame), ", ") end
+						if cfNear(primary.CFrame, target) then
+							positioned = positioned + 1
+							local actual = geometry(model)
+							if not actual then unsupported = unsupported + 1
+							elseif sameParts(parts, actual) then return model, "verified"
+							else different = different + 1 end
+						end
+					end
 				end
 			end
-			if not still() then return nil end
+			detail = string.format("new models=%d matching type=%d matching position=%d unsupported geometry=%d different appearance=%d", watch.total, typed, positioned, unsupported, different)
+			watch.detail = detail .. (#samples > 0 and ("\n" .. table.concat(samples, "\n")) or "")
+			if watch.overflow then return nil, "Too many new objects to verify placement; stopped" end
+			if typed == 0 then watch.failure = "No new " .. kind .. " replicated after the request"
+			elseif positioned == 0 then watch.failure = "New " .. kind .. " did not reach the preview position"
+			elseif unsupported > 0 then watch.failure = "Block appeared at the preview but its geometry could not be verified"
+			else watch.failure = "Block appeared at the preview but its size or appearance differs" end
 			task.wait(0.15)
 		until os.clock() > deadline
+		return nil, watch.failure
+	end
+	local function equipBuilder(remote, still)
+		local tool = buildingTool(remote)
+		local character, hum = LocalPlayer.Character, getHum()
+		if not tool or not character or not hum or hum.Health <= 0 then error("Building tool or character unavailable") end
+		if tool.Parent ~= character then
+			hum:EquipTool(tool)
+			task.wait(0.1) -- let Equipped handlers and replication process before the request
+			local deadline = os.clock() + 2
+			while tool.Parent ~= character and os.clock() < deadline do
+				if not still() then error("Stopped") end
+				task.wait(0.05)
+			end
+		end
+		if not still() then error("Stopped") end
+		if tool.Parent ~= character then error("Could not equip BuildingTool; no placement sent") end
+		return tool
 	end
 	local function nativeSpace()
 		local white
@@ -14577,7 +14625,7 @@ do
 		error("Unknown placement coordinate format")
 	end
 	Button(building, "Copy Build Report", "Copy", function()
-		local out = {"BABFT native builder v2"}
+		local out = {"BABFT native builder v3", "build status=" .. buildRow.Text, "library status=" .. status.Text}
 		for _, part in ipairs(Workspace:GetChildren()) do
 			if part:IsA("BasePart") and part.Name:lower():find("zone", 1, true) then
 				out[#out+1] = part.Name .. " CFrame=" .. table.concat(frame(part.CFrame), ", ")
@@ -14587,6 +14635,8 @@ do
 		if root then out[#out+1] = "Character CFrame=" .. table.concat(frame(root.CFrame), ", ") end
 		local ok, space = pcall(nativeSpace)
 		out[#out+1] = "coordinate check=" .. (ok and space or tostring(space))
+		out[#out+1] = "Last attempt:"
+		for _, line in ipairs(lastAttempt) do out[#out+1] = line end
 		copyText(table.concat(out, "\n")); buildSay("Build report copied")
 	end)
 	local function remoteFor()
@@ -14598,6 +14648,31 @@ do
 			end
 		end
 	end
+	local function checkOccupied(target)
+		local params = OverlapParams.new()
+		params.FilterType = Enum.RaycastFilterType.Exclude
+		local excluded = {}
+		if state.preview then excluded[#excluded+1] = state.preview end
+		if LocalPlayer.Character then excluded[#excluded+1] = LocalPlayer.Character end
+		params.FilterDescendantsInstances = excluded
+		params.MaxParts = 100
+		for _, part in ipairs(Workspace:GetPartBoundsInBox(target, Vector3.new(0.1, 0.1, 0.1), params)) do
+			local model = part.Parent
+			while model and model ~= Workspace do
+				if model:IsA("Model") then
+					local primary = model:FindFirstChild("PPart")
+					if primary and primary:IsA("BasePart") then
+						local actual, wanted = frame(primary.CFrame), frame(target)
+						if math.abs(actual[1]-wanted[1]) < 0.025 and math.abs(actual[2]-wanted[2]) < 0.025 and math.abs(actual[3]-wanted[3]) < 0.025 then
+							error("An existing " .. model.Name .. " occupies the preview position. Move the preview to an empty spot.")
+						end
+						break
+					end
+				end
+				model = model.Parent
+			end
+		end
+	end
 	local function preflight()
 		if not state.data or not state.shown or not state.preview then error("Show and position the preview first") end
 		updatePreview()
@@ -14605,7 +14680,10 @@ do
 		local space = nativeSpace()
 		if not remoteFor() then error("Your BuildingTool RF is unavailable; equip the building tool") end
 		local counts = {}
-		for _, block in ipairs(state.data.blocks) do counts[block.kind] = (counts[block.kind] or 0) + 1 end
+		for _, block in ipairs(state.data.blocks) do
+			checkOccupied(state.origin * CFrame.new(table.unpack(block.cf)))
+			counts[block.kind] = (counts[block.kind] or 0) + 1
+		end
 		for item, need in pairs(counts) do
 			local count = inventory(item)
 			if not count then error("Could not read inventory for " .. item) end
@@ -14632,13 +14710,28 @@ do
 					if not running() then error("Stopped") end
 					local remote, count = remoteFor(), inventory(block.kind)
 					if not remote or not count or count.Value < 1 then error("Building tool or inventory became unavailable") end
+					local tool = equipBuilder(remote, running)
 					local target = origin * CFrame.new(table.unpack(block.cf))
-					local before = models()
+					checkOccupied(target)
+					local amount = count.Value
+					if amount < 1 then error("Inventory became unavailable while equipping the tool") end
+					lastAttempt = {"block=" .. block.kind .. " amount=" .. amount,
+						"tool=" .. tool.Name .. " equipped=" .. tostring(tool.Parent == LocalPlayer.Character),
+						"target world=" .. table.concat(frame(target), ", "),
+						"target plot=" .. table.concat(frame(zone.CFrame:ToObjectSpace(target)), ", ")}
+					local watch = watchPlacement()
 					buildSay("Building " .. (completed + 1) .. " / " .. #data.blocks)
-					local sent, reason = pcall(function() return remote:InvokeServer(placementArgs(block.kind, count.Value, zone, target, space)) end)
-					if not sent or reason == false then error("Game rejected placement; stopped without retrying") end
-					local model = arrived(before, block.kind, target, block.parts, running)
-					if not model then error("Placement did not match the preview; stopped without retrying") end
+					local placed, issue = pcall(function()
+						local sent, result = pcall(function() return remote:InvokeServer(placementArgs(block.kind, amount, zone, target, space)) end)
+						lastAttempt[#lastAttempt+1] = "request ok=" .. tostring(sent) .. " return type=" .. typeof(result) .. " value=" .. tostring(result):sub(1, 240)
+						if not sent or result == false then error("Game rejected placement; stopped without retrying") end
+						local model, why = arrived(watch, block.kind, target, block.parts, running)
+						if not model then error(why .. "; stopped without retrying") end
+					end)
+					watch.close()
+					lastAttempt[#lastAttempt+1] = "inventory before=" .. amount .. " after=" .. tostring(count.Value)
+					lastAttempt[#lastAttempt+1] = watch.detail or ("new models=" .. watch.total)
+					if not placed then error(issue) end
 					completed = completed + 1
 					if not running() then error("Stopped") end
 					task.wait(0.25)
@@ -14653,7 +14746,10 @@ do
 		buildSay(state.busy and "Stopping after the in-flight placement returns; existing blocks stay" or "Stopped")
 	end)
 	InfoRow(building, "Native blocks only. Custom size/paint may fail verification after the first placement; scaling and wiring are not restored.")
-	onUnload(function() active = false; job = job + 1 end)
+	onUnload(function()
+		active = false; job = job + 1
+		for watch in pairs(watchers) do watch.close() end
+	end)
 	-- A team switch, removed zone or respawn must never leave a preview on the old plot.
 	bind(LocalPlayer:GetPropertyChangedSignal("Team"), function() job = job + 1; clearPreview(); previewToggle.Set(false); say("Team changed; show preview again on your new plot") end)
 	bind(LocalPlayer.CharacterRemoving, function() job = job + 1; clearPreview(); previewToggle.Set(false) end)

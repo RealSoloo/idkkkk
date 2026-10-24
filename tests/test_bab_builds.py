@@ -38,9 +38,10 @@ end
 function CFrame.Angles(x,y,z) assert(x==0 and z==0);return CFrame.new(0,0,0,math.cos(y),0,math.sin(y),0,1,0,-math.sin(y),0,math.cos(y)) end
 function typeof(v) return getmetatable(v)==CF and 'CFrame' or (type(v)=='table' and v.ClassName and 'Instance') or type(v) end
 UDim2={new=function(...) return {...} end}
-Enum={Material={Plastic={Name='Plastic'}},PartType={Block={Name='Block'},Ball={Name='Ball'},Cylinder={Name='Cylinder'}}}
+OverlapParams={new=function() return {} end}
+Enum={RaycastFilterType={Exclude='Exclude'},Material={Plastic={Name='Plastic'}},PartType={Block={Name='Block'},Ball={Name='Ball'},Cylinder={Name='Cylinder'}}}
 function signal()
- local s={fns={}};function s:Connect(fn) table.insert(self.fns,fn) end;function s:Fire(...) for _,f in ipairs(self.fns) do f(...) end end;return s
+ local s={fns={}};function s:Connect(fn) local on=true;table.insert(self.fns,function(...) if on then fn(...) end end);return {Disconnect=function() on=false end} end;function s:Fire(...) for _,f in ipairs(self.fns) do f(...) end end;return s
 end
 nodes={}
 local N={}
@@ -50,9 +51,10 @@ N.__index=function(self,k)
 end
 function node(name,kind,parent)
  local n=setmetatable({Name=name,ClassName=kind,Parent=parent,Size=Vector3.new(2,2,2),CFrame=CFrame.new(),Color=Color3.new(.5,.4,.3),Material=Enum.Material.Plastic,Shape=Enum.PartType.Block,Transparency=0,CanCollide=true},N)
- table.insert(nodes,n);return n
+ table.insert(nodes,n);if Workspace and Workspace.DescendantAdded and n:IsDescendantOf(Workspace) then Workspace.DescendantAdded:Fire(n) end;return n
 end
 function N:IsA(k) return self.ClassName==k or k=='BasePart' and (self.ClassName=='Part' or self.ClassName=='WedgePart' or self.ClassName=='MeshPart') end
+function N:GetPartBoundsInBox() return spatialHits or {} end
 function N:GetAttributes() return self.attributes or {} end
 function N:GetChildren() local out={} for _,n in ipairs(nodes) do if n.Parent==self then table.insert(out,n) end end return out end
 function N:GetDescendants() local out={} for _,n in ipairs(self:GetChildren()) do table.insert(out,n);for _,c in ipairs(n:GetDescendants()) do table.insert(out,c) end end return out end
@@ -63,7 +65,7 @@ function N:FindFirstAncestorOfClass(kind) local n=self.Parent while n do if n:Is
 function N:IsDescendantOf(parent) local n=self.Parent while n do if n==parent then return true end;n=n.Parent end return false end
 function N:Destroy() for _,n in ipairs(self:GetChildren()) do n:Destroy() end;self.Parent=nil;self.destroyed=true end
 Instance={new=function(kind) return node(kind,kind) end}
-Workspace=node('Workspace','Workspace');zone=node('GreenZone','Part',Workspace);zone.Size=Vector3.new(40,2,40);zone.CFrame=CFrame.new(100,5,50)*CFrame.Angles(0,math.pi/2,0)
+Workspace=node('Workspace','Workspace');Workspace.DescendantAdded=signal();zone=node('GreenZone','Part',Workspace);zone.Size=Vector3.new(40,2,40);zone.CFrame=CFrame.new(100,5,50)*CFrame.Angles(0,math.pi/2,0)
 referenceZone=node('WhiteZone','Part',Workspace);referenceZone.CFrame=CFrame.new(-53.565689086914062,-17.999992370605469,-345.5068664550781)
 LocalPlayer=node('Me','Player');LocalPlayer.UserId=1;LocalPlayer.DisplayName='Me';LocalPlayer.Team={Name='Green'};LocalPlayer.Character=node('Character','Model',Workspace);LocalPlayer.CharacterRemoving=signal();teamSignal=signal()
 function LocalPlayer:GetPropertyChangedSignal() return teamSignal end
@@ -77,7 +79,10 @@ Teams={GetTeams=function() return {LocalPlayer.Team} end}
 Http={JSONEncode=function(_,v) return encode(v) end,JSONDecode=function(_,v) return decode(v) end}
 game={GetService=function(_,name) if name=='HttpService' then return Http elseif name=='Players' then return Players elseif name=='Teams' then return Teams end end}
 Hub={dir='SolosHub'};API={env={}};Panel={Sub=function() return {} end};T={Warn='warning',Text='text'};Live={Running=true};RunService={Heartbeat=signal()}
-function getHum() return {Health=100} end
+equipCalls=0
+function getHum() return {Health=100,EquipTool=function(_,t) equipCalls=equipCalls+1;if not equipBlocked then t.Parent=LocalPlayer.Character end end} end
+function getRoot() return primary end
+function copyText(text) copied=text end
 controls={};cleanups={};infos={}
 function Section() return {} end
 function InfoRow(_,text) local row={Text=text,Parent={}};table.insert(infos,row);return row end
@@ -101,10 +106,12 @@ function pump(n) for _=1,n or 30 do ticks=ticks+.3;local old=queue;queue={};for 
 sent=0
 function native(self,kind,amount,plot,relative,flag,target,flag2,flag3)
  assert(self==remote and plot==zone and kind=='WoodBlock' and amount==count.Value and flag==true and flag2==false and flag3==true)
+ assert(tool.Parent==LocalPlayer.Character,'tool must be equipped')
  local expected=zone.CFrame:ToObjectSpace(target)
  for i,x in ipairs({relative:GetComponents()}) do assert(math.abs(x-expected.a[i])<.00001) end
  sent=sent+1;count.Value=count.Value-1
  if reject then return false end
+ if noReplication then return nil end
  local m,p=makeBlock(misplace and target*CFrame.new(3,0,0) or target,kind)
  return m,'native return'
 end
@@ -183,12 +190,12 @@ class BuildTests(unittest.TestCase):
         self.lua.execute('''capture();preview();misplace=true
         controls['Build At Preview'].Fire();pump(40)
         assert(sent==1 and not Test.state.busy)
-        local found=false;for _,row in ipairs(infos) do if row.Text:find('Placement did not match') then found=true end end;assert(found)
+        local found=false;for _,row in ipairs(infos) do if row.Text:find('did not reach the preview position') then found=true end end;assert(found)
         ''')
 
     def test_stop_freezes_controls_and_sends_no_further_blocks(self):
         self.lua.execute('''capture();local data=Test.state.data;table.insert(data.blocks,data.blocks[1]);preview()
-        controls['Build At Preview'].Fire();pump(1);assert(sent==1)
+        controls['Build At Preview'].Fire();pump(2);assert(sent==1)
         controls['Exact offset'].Fire('4,0,0');controls['Offset X (x0.1 studs)'].Fire(40);assert(Test.state.x==0)
         controls['Build At Preview'].Fire();controls['Capture Player Build'].Fire();assert(Test.state.data==data)
         controls['Stop Building'].Fire();pump();assert(sent==1 and not Test.state.busy)
@@ -200,7 +207,7 @@ class BuildTests(unittest.TestCase):
         assert(folder.destroyed and sent==0 and not Test.state.busy)
         preview();folder=Test.state.preview;teamSignal:Fire();assert(folder.destroyed)
         preview();folder=Test.state.preview;for _,fn in ipairs(cleanups) do fn() end;assert(folder.destroyed)
-        local before=sent;remote:InvokeServer('WoodBlock',count.Value,zone,CFrame.new(0,2,0),true,zone.CFrame*CFrame.new(0,2,0),false,true);assert(sent==before+1)
+        local before=sent;tool.Parent=LocalPlayer.Character;remote:InvokeServer('WoodBlock',count.Value,zone,CFrame.new(0,2,0),true,zone.CFrame*CFrame.new(0,2,0),false,true);assert(sent==before+1)
         ''')
 
 
@@ -265,6 +272,37 @@ class BuildTests(unittest.TestCase):
         count.Value=0;assert(not pcall(Test.preflight));count.Value=30
         referenceZone.CFrame=CFrame.new(10,20,30)
         controls['Build At Preview'].Fire();pump();assert(sent==0 and not Test.state.busy)
+        ''')
+
+    def test_automatic_equip_before_request_and_failure_sends_nothing(self):
+        self.lua.execute('''capture();preview();controls['Build At Preview'].Fire();pump()
+        assert(equipCalls==1 and tool.Parent==LocalPlayer.Character and sent==1)
+        tool.Parent=backpack;equipBlocked=true;controls['Build At Preview'].Fire();pump()
+        assert(sent==1 and not Test.state.busy)
+        ''')
+
+    def test_verification_does_not_scan_map_and_reports_missing_replication(self):
+        self.lua.execute('''capture();preview();noReplication=true
+        local old=Workspace.GetDescendants
+        function Workspace:GetDescendants() error('full-map scan during build') end
+        controls['Build At Preview'].Fire();pump(40)
+        assert(sent==1 and not Test.state.busy)
+        controls['Copy Build Report'].Fire()
+        assert(copied:find('BABFT native builder v3') and copied:find('return type=nil') and copied:find('matching type=0') and copied:find('inventory before='))
+        Workspace.GetDescendants=old
+        ''')
+
+    def test_new_geometry_mismatch_is_distinguished_from_no_block(self):
+        self.lua.execute('''capture();preview();Test.state.data.blocks[1].parts[1].color[1]=.9
+        controls['Build At Preview'].Fire();pump(40);controls['Copy Build Report'].Fire()
+        assert(sent==1 and copied:find('matching position=1') and copied:find('different appearance=1'))
+        ''')
+
+    def test_existing_block_at_preview_is_reported_before_request(self):
+        self.lua.execute('''capture();preview();spatialHits={primary}
+        controls['Build At Preview'].Fire();pump();assert(sent==0 and not Test.state.busy)
+        local found=false;for _,row in ipairs(infos) do if row.Text:find('Move the preview to an empty spot') then found=true end end;assert(found)
+        controls['Exact offset'].Fire('5,0,0');controls['Build At Preview'].Fire();pump();assert(sent==1)
         ''')
 
 if __name__ == '__main__':

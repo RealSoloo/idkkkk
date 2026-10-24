@@ -322,3 +322,28 @@ remain compatible. Local file APIs are still required for saved builds.
 plots, operation without learning/hooks, inventory and coordinate rejection,
 preview/build parity, file operations, ownership filters, cancellation and cleanup.
 These tests use mock services; actual server acceptance remains unverified here.
+
+#### Native builder v3: placement monitoring and tool readiness
+
+The supplied live report confirmed `local4` against WhiteZone, so the coordinate
+conversion is retained. Placement now equips BuildingTool through the Humanoid,
+allows its equipped handlers to run, and confirms it is in the current character
+before invoking RF. An equip failure sends no placement request.
+
+Verification listens for newly added Workspace Models during each request instead
+of repeatedly scanning all Workspace descendants. The listener starts before the
+request and disconnects on completion, rejection, timeout, error or unload. It
+waits for late PPart/geometry replication, caps candidates, and still verifies the
+actual placement rather than treating a successful RPC as a built block.
+
+A spatial query checks for an existing PPart block centered at the requested
+position before building. This catches copying an existing build onto itself and
+asks the user to move the preview. It is not a full collision solver for the boat.
+
+**Copy Build Report** v3 includes the last block type, amount, equipped state,
+world/plot target frames, RPC return type/value, inventory before/after, candidate
+counts and sample positions. Status distinguishes no matching block replicated,
+a wrong position, unsupported geometry, and changed size/appearance. This makes
+an unacknowledged request diagnosable without calling it a geometry mismatch.
+Live success is still unverified; the previous user's report established only
+that coordinates passed and the request had no verified resulting block.
